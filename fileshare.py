@@ -15,6 +15,7 @@ minishare —— 极简文件分享 / 接收服务
   SHARE_PORT        监听端口，默认 8080
   SHARE_DATA        数据目录，默认 ./data
   SHARE_MAX_UPLOAD  单次上传上限(字节)，默认 10GB
+  SHARE_MSS         TCP MSS 上限，默认 1220（防 PMTU 黑洞）；设 0 不限制
 """
 import os
 import sys
@@ -23,6 +24,7 @@ import json
 import time
 import hmac
 import html
+import socket
 import mimetypes
 import hashlib
 import secrets
@@ -41,6 +43,11 @@ PORT = int(os.environ.get("SHARE_PORT", "8080"))
 MAX_UPLOAD = int(os.environ.get("SHARE_MAX_UPLOAD", str(10 * 1024 ** 3)))
 SESSION_DAYS = 30
 CHUNK = 65536
+# TCP MSS 上限：某些链路存在 PMTU 黑洞——服务端发出的大包被中间
+# 环节静默丢弃，ICMP 分片通知又回不来，连接就会一直卡住（能握手、
+# 小包能过，只有大回复回不来）。把 MSS 钳小后服务端只发小包，
+# 这类链路也能正常工作；正常链路几乎无影响。设为 0 则不限制。
+MSS = int(os.environ.get("SHARE_MSS", "1220"))
 
 # ---------------- 数据库 ----------------
 def db():
@@ -552,6 +559,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
+    def address_string(self):
+        # 直接返回客户端 IP，不做反向 DNS 查询：
+        # 默认的 address_string() 会查 PTR 记录，某些 IP 查不到时
+        # 整个请求会卡在 send_response 之前，客户端一直收不到任何字节
+        return self.client_address[0]
+
     # ---- 小工具 ----
     def _cookie(self):
         c = {}
@@ -854,13 +867,29 @@ def _expiry_days(v):
 
 
 # ---------------- 主程序 ----------------
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # 在 listen 之前钳住 MSS：所有 accept 出来的子连接都会继承，
+        # 服务端只发小包。用于穿越 PMTU 黑洞链路（大包被中间环节静
+        # 默丢弃、ICMP 分片通知又回不来时，连接会一直卡住）。
+        # 注意：accept 之后再设 TCP_MAXSEG 是无效的，必须在 listen 前。
+        if MSS > 0:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_TCP,
+                                       socket.TCP_MAXSEG, MSS)
+            except OSError:
+                pass
+        super().server_bind()
+
+
 def main():
     init_db()
     cleanup_expired()
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv = Server((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print(f"minishare 启动：http://{HOST}:{PORT}  数据目录={DATA_DIR}", flush=True)
+    print(f"minishare 启动：http://{HOST}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
+          flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
