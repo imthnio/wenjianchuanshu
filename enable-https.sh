@@ -17,9 +17,13 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # ---- 只问 1 个问题：域名 ----
+echo "提示：建议用子域名，例如 suiji.deu.xx.kg；"
+echo "主域名（如 deu.xx.kg）留着以后做别的用，子域名可以建很多个、每个服务一个。"
+echo "（先去域名服务商把这个子域名的 A 记录指到这台 VPS，灰色云/仅 DNS）"
+echo ""
 DOMAIN=""
 while [ -z "$DOMAIN" ]; do
-  printf "你的域名是什么？（例如：share.example.com）\n> "
+  printf "你的域名是什么？（例如：suiji.deu.xx.kg）\n> "
   read DOMAIN
   DOMAIN="$(printf '%s' "$DOMAIN" | tr -d '[:space:]')"
 done
