@@ -9,7 +9,7 @@
    ```sh
    curl -fsSL -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh && sh /tmp/minishare-install.sh
    ```
-3. 按提示操作：只有 2 个问题，看不懂就一路回车用默认。
+3. 按提示操作：只有 3 个问题，看不懂就一路回车用默认。
 4. 装完会显示一个地址（比如 `http://1.2.3.4:8080`），浏览器打开它；第一次打开会让你设置管理员密码，设完就能用。
 
 ## 开启 HTTPS（可选，不用 Cloudflare）

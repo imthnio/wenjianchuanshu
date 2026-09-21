@@ -7,7 +7,7 @@
 #   curl -fsSL -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh && sh /tmp/minishare-install.sh
 #
 # 进阶：非交互安装可用环境变量预设
-#   APP_DIR / PORT / BIND / MINISHARE_REPO / NONINTERACTIVE=1
+#   APP_DIR / PORT / IPVER(4 或 6，默认 4) / BIND / MINISHARE_REPO / NONINTERACTIVE=1
 set -e
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -17,7 +17,8 @@ fi
 
 APP_DIR="${APP_DIR:-/opt/minishare}"
 PORT="${PORT:-8080}"
-BIND="${BIND:-0.0.0.0}"
+IPVER="${IPVER:-4}"
+BIND="${BIND:-}"
 MINISHARE_REPO="${MINISHARE_REPO:-imthnio/minishare}"
 
 # ---- 0. 准备安装文件（远程安装时自动从 GitHub 下载） ----
@@ -36,21 +37,33 @@ if [ ! -f fileshare.py ]; then
   cd "$TMPD/${MINISHARE_REPO##*/}-main"
 fi
 
-# ---- 1. 安装向导：只有 2 个问题，看不懂就直接回车 ----
+# ---- 1. 安装向导：只有 3 个问题，看不懂就直接回车 ----
 if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   echo "=== minishare 安装向导 ==="
-  echo "下面只有 2 个问题，看不懂就直接回车，用括号里的默认。"
-  printf "1/2 装到哪个目录？[%s]：" "$APP_DIR"
+  echo "下面只有 3 个问题，看不懂就直接回车，用括号里的默认。"
+  printf "1/3 装到哪个目录？[%s]：" "$APP_DIR"
   read -r ans; [ -n "$ans" ] && APP_DIR="$ans"
-  printf "2/2 网页用哪个端口？[%s]：" "$PORT"
+  printf "2/3 网页用哪个端口？[%s]：" "$PORT"
   read -r ans; [ -n "$ans" ] && PORT="$ans"
   case "$PORT" in
     ''|*[!0-9]*)
       echo "端口必须是数字，已恢复默认 8080"
       PORT=8080 ;;
   esac
+  printf "3/3 用 IPv4 还是 IPv6？（有的机器 IPv6 不好用，不确定就直接回车选 4）[4]："
+  read -r ans
+  case "$ans" in
+    6) IPVER=6 ;;
+    *) IPVER=4 ;;
+  esac
   echo ""
 fi
+
+# 按选择的 IP 版本决定监听地址
+case "$IPVER" in
+  6) BIND="${BIND:-::}" ;;
+  *) IPVER=4; BIND="${BIND:-0.0.0.0}" ;;
+esac
 
 # ---- 2. 安装 python3 ----
 if ! command -v python3 >/dev/null 2>&1; then
@@ -99,19 +112,28 @@ else
 fi
 
 # ---- 5. 收尾：告诉小白下一步做什么 ----
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [ "$IPVER" = "6" ]; then
+  IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep ':' | grep -vi '^fe80' | head -n 1)"
+  CURLVER="-6"
+else
+  IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n 1)"
+  CURLVER="-4"
+fi
 if [ -z "$IP" ]; then IP="<你的服务器IP>"; fi
 PUBIP=""
 if command -v curl >/dev/null 2>&1; then
-  PUBIP="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 api.ipify.org 2>/dev/null)"
+  # 强制用选定的 IP 版本查公网 IP，避免机器 IPv6 不好用却返回 v6 地址
+  PUBIP="$(curl $CURLVER -s --max-time 5 ifconfig.me 2>/dev/null || curl $CURLVER -s --max-time 5 api.ipify.org 2>/dev/null)"
 fi
+# IPv6 地址在网址里要加方括号
+url() { if [ "$IPVER" = "6" ]; then printf 'http://[%s]:%s' "$1" "$PORT"; else printf 'http://%s:%s' "$1" "$PORT"; fi; }
 echo ""
 echo "==================================="
 echo "安装完成！"
-echo "浏览器打开：http://$IP:$PORT"
+echo "浏览器打开：$(url "$IP")"
 if [ -n "$PUBIP" ] && [ "$PUBIP" != "$IP" ]; then
   echo "上面是内网地址，只能在机房内网打开。"
-  echo "从外网（手机/家里）打开用这个：http://$PUBIP:$PORT"
+  echo "从外网（手机/家里）打开用这个：$(url "$PUBIP")"
 fi
 echo "如果外网打不开，先在云服务器安全组/防火墙放行 TCP 端口 $PORT"
 echo "第一次打开会让你设置管理员密码，设完就能用。"

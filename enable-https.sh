@@ -19,7 +19,7 @@ fi
 # ---- 只问 1 个问题：域名 ----
 echo "提示：建议用子域名，例如 file.example.com；"
 echo "主域名（如 example.com）留着以后做别的用，子域名可以建很多个、每个服务一个。"
-echo "（先去域名服务商把这个子域名的 A 记录指到这台 VPS，灰色云/仅 DNS）"
+echo "（先去域名服务商把这个子域名的 A 记录指到这台 VPS，IPv6 则用 AAAA 记录，灰色云/仅 DNS）"
 echo ""
 DOMAIN=""
 while [ -z "$DOMAIN" ]; do
@@ -44,20 +44,41 @@ fi
 PORT="$(grep -o 'SHARE_PORT=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"' || true)"
 if [ -z "$PORT" ]; then PORT="8080"; fi
 echo "检测到 minishare 端口：$PORT"
-echo ""
+
+# ---- 再问 1 个：IPv4 还是 IPv6（默认跟随 minishare 的监听地址） ----
+SRV_HOST="$(grep -o 'SHARE_HOST=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"' || true)"
+DETECTED_VER=4
+case "$SRV_HOST" in *:*) DETECTED_VER=6 ;; esac
+IPVER="${IPVER:-$DETECTED_VER}"
+if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
+  printf "域名解析用 IPv4 还是 IPv6？（跟装 minishare 时保持一致）[%s]：" "$DETECTED_VER"
+  read -r ans
+  case "$ans" in
+    6) IPVER=6 ;;
+    4) IPVER=4 ;;
+  esac
+  echo ""
+fi
 
 # ---- [1/6] 检查域名解析 ----
 echo "[1/6] 检查域名解析…"
-PUBIP="$(curl -s --max-time 10 ifconfig.me 2>/dev/null || curl -s --max-time 10 api.ipify.org 2>/dev/null || true)"
-DNSIP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}')"
+if [ "$IPVER" = "6" ]; then
+  PUBIP="$(curl -6 -s --max-time 10 ifconfig.me 2>/dev/null || curl -6 -s --max-time 10 api.ipify.org 2>/dev/null || true)"
+  DNSIP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}')"
+  REC="AAAA"
+else
+  PUBIP="$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || curl -4 -s --max-time 10 api.ipify.org 2>/dev/null || true)"
+  DNSIP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}')"
+  REC="A"
+fi
 if [ -z "$DNSIP" ]; then
   echo "域名 $DOMAIN 解析不到任何 IP。"
-  echo "先去域名服务商把它的 A 记录指到这台 VPS，等生效后再运行。"
+  echo "先去域名服务商把它的 $REC 记录指到这台 VPS，等生效后再运行。"
   exit 1
 fi
 if [ -n "$PUBIP" ] && [ "$DNSIP" != "$PUBIP" ]; then
   echo "域名现在解析到 $DNSIP，但本机公网 IP 是 $PUBIP，对不上。"
-  echo "证书申请会失败。请先把 A 记录改成 $PUBIP，等生效后再运行。"
+  echo "证书申请会失败。请先把 $REC 记录改成 $PUBIP，等生效后再运行。"
   exit 1
 fi
 echo "域名解析正常（$DOMAIN -> $DNSIP）。"
