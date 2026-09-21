@@ -122,7 +122,22 @@ else
   echo "  cd $APP_DIR && SHARE_HOST=$BIND SHARE_PORT=$PORT nohup $PYTHON fileshare.py >/dev/null 2>&1 &"
 fi
 
-# ---- 5. 收尾：告诉小白下一步做什么 ----
+# ---- 5. 放行端口 ----
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "$PORT"/tcp >/dev/null
+  echo "ufw 已放行 $PORT。"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+  firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null
+  firewall-cmd --reload >/dev/null
+  echo "firewalld 已放行 $PORT。"
+elif command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+  echo "iptables 已放行 $PORT。"
+else
+  echo "没检测到防火墙工具：如果外网打不开，去云服务商安全组放行 TCP $PORT。"
+fi
+
+# ---- 6. 收尾：告诉小白下一步做什么 ----
 if [ "$IPVER" = "6" ]; then
   IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep ':' | grep -vi '^fe80' | head -n 1)"
   CURLVER="-6"
@@ -146,6 +161,6 @@ if [ -n "$PUBIP" ] && [ "$PUBIP" != "$IP" ]; then
   echo "上面是内网地址，只能在机房内网打开。"
   echo "从外网（手机/家里）打开用这个：$(url "$PUBIP")"
 fi
-echo "如果外网打不开，先在云服务器安全组/防火墙放行 TCP 端口 $PORT"
+echo "如果外网还是打不开，去云服务商控制台的安全组里放行 TCP 端口 $PORT"
 echo "第一次打开会让你设置管理员密码，设完就能用。"
 echo "==================================="
