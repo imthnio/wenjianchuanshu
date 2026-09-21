@@ -50,10 +50,10 @@ if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
       echo "端口必须是数字，已恢复默认 8080"
       PORT=8080 ;;
   esac
-  printf "3/3 用 IPv4 还是 IPv6？（有的机器 IPv6 不好用，不确定就直接回车选 4）[4]："
+  printf "3/3 用 IPv4 还是 IPv6？（输入1回车是ipv4,输入2回车是ipv6）："
   read -r ans
   case "$ans" in
-    6) IPVER=6 ;;
+    2) IPVER=6 ;;
     *) IPVER=4 ;;
   esac
   echo ""
