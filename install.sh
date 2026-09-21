@@ -101,9 +101,18 @@ fi
 # ---- 5. 收尾：告诉小白下一步做什么 ----
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 if [ -z "$IP" ]; then IP="<你的服务器IP>"; fi
+PUBIP=""
+if command -v curl >/dev/null 2>&1; then
+  PUBIP="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 api.ipify.org 2>/dev/null)"
+fi
 echo ""
 echo "==================================="
 echo "安装完成！"
 echo "浏览器打开：http://$IP:$PORT"
+if [ -n "$PUBIP" ] && [ "$PUBIP" != "$IP" ]; then
+  echo "上面是内网地址，只能在机房内网打开。"
+  echo "从外网（手机/家里）打开用这个：http://$PUBIP:$PORT"
+fi
+echo "如果外网打不开，先在云服务器安全组/防火墙放行 TCP 端口 $PORT"
 echo "第一次打开会让你设置管理员密码，设完就能用。"
 echo "==================================="
