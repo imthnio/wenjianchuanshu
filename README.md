@@ -20,7 +20,7 @@
 curl -fsSL -o /tmp/minishare-https.sh https://raw.githubusercontent.com/imthnio/minishare/main/enable-https.sh && sh /tmp/minishare-https.sh
 ```
 
-只问 1 个问题：你的域名是什么。之后自动安装 Caddy、申请 Let's Encrypt 证书、设置开机自启，证书自动续期。成功后用 `https://你的域名` 访问。
+只问 1 个问题：你的域名是什么。之后自动安装 Caddy、申请 Let's Encrypt 证书、设置开机自启，证书自动续期。成功后用 `https://你的域名`（如 `https://file.deu.xx.kg`）访问。
 
 ## 能做什么
 
