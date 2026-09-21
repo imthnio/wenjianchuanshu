@@ -50,7 +50,7 @@ SRV_HOST="$(grep -o 'SHARE_HOST=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut
 DETECTED_VER=4
 case "$SRV_HOST" in *:*) DETECTED_VER=6 ;; esac
 IPVER="${IPVER:-$DETECTED_VER}"
-if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
+if [ -t 0 ] && [ -z "${NONINTERACTIVE:-}" ]; then
   printf "域名解析用 IPv4 还是 IPv6？（跟装 minishare 时保持一致）[%s]：" "$DETECTED_VER"
   read -r ans
   case "$ans" in
