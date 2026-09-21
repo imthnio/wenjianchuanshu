@@ -4,7 +4,7 @@
 # 小白用法：SSH 连上服务器（root 用户）后，粘贴下面这一段，回车，
 # 然后按提示操作（看不懂就一路回车用默认）：
 #
-#   curl -fsSL -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh && sh /tmp/minishare-install.sh
+#   (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/minishare@main/install.sh) && sh /tmp/minishare-install.sh
 #
 # 进阶：非交互安装可用环境变量预设
 #   APP_DIR / PORT / IPVER(4 或 6，默认 4) / BIND / MINISHARE_REPO / NONINTERACTIVE=1
@@ -21,20 +21,31 @@ IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
 MINISHARE_REPO="${MINISHARE_REPO:-imthnio/minishare}"
 
-# ---- 0. 准备安装文件（远程安装时自动从 GitHub 下载） ----
-if [ ! -f fileshare.py ]; then
-  echo "正在从 GitHub 下载 minishare..."
-  TMPD="$(mktemp -d)"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://github.com/${MINISHARE_REPO}/archive/refs/heads/main.tar.gz" -o "$TMPD/ms.tar.gz"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMPD/ms.tar.gz" "https://github.com/${MINISHARE_REPO}/archive/refs/heads/main.tar.gz"
-  else
-    echo "需要 curl 或 wget 来下载，请先安装其一"
+# ---- 0. 准备安装文件（远程安装时自动下载） ----
+if [ ! -f fileshare.py ] || [ ! -f minishare.service ]; then
+  echo "正在下载 minishare..."
+  # 按顺序试多个下载地址：GitHub 官方 -> jsdelivr 镜像（部分网络连 GitHub 很慢或连不上）
+  MIRRORS="https://raw.githubusercontent.com/${MINISHARE_REPO}/main https://cdn.jsdelivr.net/gh/${MINISHARE_REPO}@main"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "需要 curl 或 wget 来下载，请先安装其一（比如 apt install -y curl）"
     exit 1
   fi
-  tar xzf "$TMPD/ms.tar.gz" -C "$TMPD"
-  cd "$TMPD/${MINISHARE_REPO##*/}-main"
+  dl() { # 用法: dl 文件名 —— 每个镜像都试一遍，成功就返回
+    for m in $MIRRORS; do
+      if command -v curl >/dev/null 2>&1; then
+        curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$1" "$m/$1" 2>/dev/null && return 0
+      else
+        wget -q --connect-timeout=15 --timeout=120 --tries=2 -O "$1" "$m/$1" 2>/dev/null && return 0
+      fi
+    done
+    return 1
+  }
+  TMPD="$(mktemp -d)"
+  cd "$TMPD"
+  for f in fileshare.py minishare.service minishare.openrc; do
+    dl "$f" || { echo ""; echo "下载 $f 失败：连不上 GitHub 和镜像站，请检查服务器网络后重试。"; exit 1; }
+  done
+  echo "下载完成。"
 fi
 
 # ---- 1. 安装向导：只有 3 个问题，看不懂就直接回车 ----
