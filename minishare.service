@@ -1,0 +1,16 @@
+[Unit]
+Description=minishare - 极简网页文件传送服务
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+ExecStart=@PYTHON@ @APP_DIR@/fileshare.py
+Environment=SHARE_HOST=@BIND@
+Environment=SHARE_PORT=@PORT@
+Environment=SHARE_DATA=@APP_DIR@/data
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

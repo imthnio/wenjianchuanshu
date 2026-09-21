@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# minishare OpenRC service (Alpine Linux)
+
+name="minishare"
+description="极简网页文件传送服务"
+
+command="@PYTHON@"
+command_args="@APP_DIR@/fileshare.py"
+command_background=true
+pidfile="/run/minishare.pid"
+
+export SHARE_HOST="@BIND@"
+export SHARE_PORT="@PORT@"
+export SHARE_DATA="@APP_DIR@/data"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    mkdir -p "@APP_DIR@/data/files"
+}
