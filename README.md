@@ -12,6 +12,16 @@
 3. 按提示操作：只有 2 个问题，看不懂就一路回车用默认。
 4. 装完会显示一个地址（比如 `http://1.2.3.4:8080`），浏览器打开它；第一次打开会让你设置管理员密码，设完就能用。
 
+## 开启 HTTPS（可选，不用 Cloudflare）
+
+需要一个已经解析到这台 VPS 的域名（A 记录指过来）。SSH 用 root 登录后粘贴：
+
+```sh
+curl -fsSL -o /tmp/minishare-https.sh https://raw.githubusercontent.com/imthnio/minishare/main/enable-https.sh && sh /tmp/minishare-https.sh
+```
+
+只问 1 个问题：你的域名是什么。之后自动安装 Caddy、申请 Let's Encrypt 证书、设置开机自启，证书自动续期。成功后用 `https://你的域名` 访问。
+
 ## 能做什么
 
 - **发文件**：你在网页上传文件，生成一个链接发给对方，对方打开就能下载。
@@ -20,7 +30,7 @@
 ## 常见问题
 
 - **装完浏览器打不开？** 云服务器要在安全组 / 防火墙里放行你设置的端口（默认 8080）。
-- **想用域名 + https？** 在前面加一层反代（Nginx / Caddy）就行，本程序只管 http。
+- **想用域名 + https？** 跑上面的"开启 HTTPS"一键脚本就行，不用 Cloudflare。
 - **文件存在哪？** `/opt/minishare/data`，备份时把这个目录拷走就行。
 - **怎么卸载？** `systemctl disable --now minishare`，再删掉 `/opt/minishare`。
 
