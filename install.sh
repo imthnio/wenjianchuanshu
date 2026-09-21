@@ -1,28 +1,27 @@
 #!/bin/sh
 # minishare 一键安装：Debian / Ubuntu / Alpine / CentOS / Arch 通用
-# 用法：
-#   本地安装：  git clone <repo> && cd minishare && sudo sh install.sh
-#   远程安装：  curl -fsSL <install.sh直链> | sudo MINISHARE_REPO=<user>/<repo> sh
-# 环境变量（非交互/预设）：APP_DIR / PORT / BIND / MINISHARE_REPO / NONINTERACTIVE=1
+#
+# 小白用法：SSH 连上服务器（root 用户）后，粘贴下面这一段，回车，
+# 然后按提示操作（看不懂就一路回车用默认）：
+#
+#   curl -fsSL -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh && sh /tmp/minishare-install.sh
+#
+# 进阶：非交互安装可用环境变量预设
+#   APP_DIR / PORT / BIND / MINISHARE_REPO / NONINTERACTIVE=1
 set -e
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "请用 root 运行：sudo sh install.sh"
+  echo "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
   exit 1
 fi
 
 APP_DIR="${APP_DIR:-/opt/minishare}"
 PORT="${PORT:-8080}"
 BIND="${BIND:-0.0.0.0}"
+MINISHARE_REPO="${MINISHARE_REPO:-imthnio/minishare}"
 
-# ---- 0. 准备安装文件（远程安装时自动下载） ----
+# ---- 0. 准备安装文件（远程安装时自动从 GitHub 下载） ----
 if [ ! -f fileshare.py ]; then
-  if [ -z "$MINISHARE_REPO" ]; then
-    echo "找不到 fileshare.py。"
-    echo "请在仓库目录运行，或用环境变量指定仓库："
-    echo "  curl -fsSL <install.sh直链> | sudo MINISHARE_REPO=<user>/<repo> sh"
-    exit 1
-  fi
   echo "正在从 GitHub 下载 minishare..."
   TMPD="$(mktemp -d)"
   if command -v curl >/dev/null 2>&1; then
@@ -37,11 +36,20 @@ if [ ! -f fileshare.py ]; then
   cd "$TMPD/${MINISHARE_REPO##*/}-main"
 fi
 
-# ---- 1. 交互式确认（可选） ----
+# ---- 1. 安装向导：只有 2 个问题，看不懂就直接回车 ----
 if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
-  printf "安装目录 [%s]: " "$APP_DIR"; read -r ans; [ -n "$ans" ] && APP_DIR="$ans"
-  printf "监听端口 [%s]: " "$PORT"; read -r ans; [ -n "$ans" ] && PORT="$ans"
-  printf "监听地址 [%s]: " "$BIND"; read -r ans; [ -n "$ans" ] && BIND="$ans"
+  echo "=== minishare 安装向导 ==="
+  echo "下面只有 2 个问题，看不懂就直接回车，用括号里的默认。"
+  printf "1/2 装到哪个目录？[%s]：" "$APP_DIR"
+  read -r ans; [ -n "$ans" ] && APP_DIR="$ans"
+  printf "2/2 网页用哪个端口？[%s]：" "$PORT"
+  read -r ans; [ -n "$ans" ] && PORT="$ans"
+  case "$PORT" in
+    ''|*[!0-9]*)
+      echo "端口必须是数字，已恢复默认 8080"
+      PORT=8080 ;;
+  esac
+  echo ""
 fi
 
 # ---- 2. 安装 python3 ----
@@ -76,7 +84,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       minishare.service > /etc/systemd/system/minishare.service
   systemctl daemon-reload
   systemctl enable --now minishare
-  echo "已通过 systemd 启动并设为开机自启"
+  echo "已设为开机自启并启动（systemd）"
 elif command -v rc-service >/dev/null 2>&1; then
   sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@BIND@|$BIND|g" \
       -e "s|@PORT@|$PORT|g" -e "s|@PYTHON@|$PYTHON|g" \
@@ -84,12 +92,18 @@ elif command -v rc-service >/dev/null 2>&1; then
   chmod +x /etc/init.d/minishare
   rc-update add minishare default
   rc-service minishare start
-  echo "已通过 OpenRC 启动并设为开机自启"
+  echo "已设为开机自启并启动（OpenRC）"
 else
-  echo "未检测到 systemd / OpenRC，请手动后台运行："
+  echo "没检测到 systemd / OpenRC，请手动后台运行："
   echo "  cd $APP_DIR && SHARE_HOST=$BIND SHARE_PORT=$PORT nohup $PYTHON fileshare.py >/dev/null 2>&1 &"
 fi
 
+# ---- 5. 收尾：告诉小白下一步做什么 ----
+IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [ -z "$IP" ]; then IP="<你的服务器IP>"; fi
 echo ""
-echo "完成！浏览器打开 http://<服务器IP>:$PORT"
-echo "首次打开会让你设置管理员密码，设置完就能发文件 / 建接收链接了。"
+echo "==================================="
+echo "安装完成！"
+echo "浏览器打开：http://$IP:$PORT"
+echo "第一次打开会让你设置管理员密码，设完就能用。"
+echo "==================================="
