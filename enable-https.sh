@@ -191,23 +191,8 @@ CERTDIR="/etc/letsencrypt/live/$DOMAIN"
 echo "证书就绪：$CERTDIR"
 echo ""
 
-# ---- [5] 把 minishare 收进内网，端口让给 Caddy ----
-echo "[5] 把 minishare 收进内网（127.0.0.1:$PORT），端口 $PORT 让给 Caddy…"
-case "$SRV_FILE" in
-  *.service)
-    sed -i 's/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=127.0.0.1/' "$SRV_FILE"
-    systemctl daemon-reload
-    systemctl restart minishare
-    ;;
-  *)
-    sed -i 's/^export SHARE_HOST=.*/export SHARE_HOST="127.0.0.1"/' "$SRV_FILE"
-    rc-service minishare restart
-    ;;
-esac
-echo ""
-
-# ---- [6] 安装 Caddy（官方二进制，单文件） ----
-echo "[6] 安装 Caddy…"
+# ---- [5] 安装 Caddy（官方二进制，单文件，先装好再动 minishare） ----
+echo "[5] 安装 Caddy…"
 if ! command -v caddy >/dev/null 2>&1; then
   command -v curl >/dev/null 2>&1 || { echo "需要 curl，请先安装 curl 再运行。"; exit 1; }
   command -v tar >/dev/null 2>&1 || { echo "需要 tar，请先安装 tar 再运行。"; exit 1; }
@@ -235,8 +220,8 @@ fi
 echo "Caddy 就绪：$(caddy version)"
 echo ""
 
-# ---- [7] 写 Caddy 配置 ----
-echo "[7] 配置反向代理（Caddy 监听 $PORT）…"
+# ---- [6] 写 Caddy 配置 ----
+echo "[6] 配置反向代理（Caddy 监听 $PORT）…"
 mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
 https://$DOMAIN:$PORT {
@@ -247,7 +232,23 @@ EOF
 echo "配置已写入 /etc/caddy/Caddyfile"
 echo ""
 
-# ---- [8] 设置开机自启并启动 ----
+# ---- [7] 把 minishare 收进内网，端口让给 Caddy ----
+echo "[7] 把 minishare 收进内网（127.0.0.1:$PORT），端口 $PORT 让给 Caddy…"
+ORIG_HOST="${SRV_HOST:-0.0.0.0}"
+case "$SRV_FILE" in
+  *.service)
+    sed -i 's/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=127.0.0.1/' "$SRV_FILE"
+    systemctl daemon-reload
+    systemctl restart minishare
+    ;;
+  *)
+    sed -i 's/^export SHARE_HOST=.*/export SHARE_HOST="127.0.0.1"/' "$SRV_FILE"
+    rc-service minishare restart
+    ;;
+esac
+echo ""
+
+# ---- [8] 设置开机自启并启动（启动失败则回滚 minishare，不让站点变砖） ----
 echo "[8] 设置开机自启…"
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   cat > /etc/systemd/system/caddy.service <<'EOF'
@@ -289,6 +290,38 @@ else
   echo "没检测到 systemd 或 OpenRC，请手动后台运行："
   echo "  nohup /usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/var/log/caddy.log 2>&1 &"
 fi
+
+# ---- [8b] 确认 Caddy 真的在跑，否则回滚 minishare ----
+CADDY_OK=0
+CADDY_MANAGED=1
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  sleep 3
+  systemctl is-active --quiet caddy && CADDY_OK=1
+elif command -v rc-service >/dev/null 2>&1; then
+  sleep 3
+  rc-service caddy status >/dev/null 2>&1 && CADDY_OK=1
+else
+  CADDY_MANAGED=0
+fi
+if [ "$CADDY_MANAGED" = "1" ] && [ "$CADDY_OK" != "1" ]; then
+  echo "Caddy 没能启动，回滚 minishare 到外网监听（$ORIG_HOST:$PORT），站点保持可用。"
+  case "$SRV_FILE" in
+    *.service)
+      sed -i "s/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=$ORIG_HOST/" "$SRV_FILE"
+      systemctl daemon-reload
+      systemctl restart minishare
+      ;;
+    *)
+      sed -i "s/^export SHARE_HOST=.*/export SHARE_HOST=\"$ORIG_HOST\"/" "$SRV_FILE"
+      rc-service minishare restart
+      ;;
+  esac
+  echo "已回滚。请先看 Caddy 日志再重试："
+  echo "  systemd: journalctl -u caddy -n 50"
+  echo "  OpenRC:  tail -n 50 /var/log/messages"
+  exit 1
+fi
+echo "Caddy 运行中。"
 echo ""
 
 # ---- [9] 放行防火墙 ----
