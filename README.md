@@ -10,7 +10,7 @@
    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then if command -v apk >/dev/null 2>&1; then apk add --no-cache curl; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y curl; fi; fi; (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh || wget -q -T 180 -O /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh || wget -q -T 180 -O /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh) && sh /tmp/minishare-install.sh
    ```
 3. 按提示操作：只有 3 个问题，看不懂就一路回车用默认。
-4. 装完会显示一个地址（比如 `http://1.2.3.4:8080`），浏览器打开它；第一次打开会让你设置管理员密码，设完就能用。
+4. 装完会显示一个地址（比如 `http://1.2.3.4:18080`），浏览器打开它；第一次打开会让你设置管理员密码，设完就能用。
 
 ## 开启 HTTPS（可选）
 
