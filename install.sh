@@ -16,7 +16,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 APP_DIR="${APP_DIR:-/opt/minishare}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-18080}"
 IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
 MINISHARE_REPO="${MINISHARE_REPO:-imthnio/wenjianchuanshu}"
@@ -76,8 +76,8 @@ if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   read -r ans; [ -n "$ans" ] && PORT="$ans"
   case "$PORT" in
     ''|*[!0-9]*)
-      echo "端口必须是数字，已恢复默认 8080"
-      PORT=8080 ;;
+      echo "端口必须是数字，已恢复默认 18080"
+      PORT=18080 ;;
   esac
   printf "3/3 用 IPv4 还是 IPv6？（输入1回车是ipv4,输入2回车是ipv6）："
   read -r ans
