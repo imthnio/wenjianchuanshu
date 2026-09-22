@@ -68,7 +68,7 @@ if [ -z "$SRV_FILE" ]; then
   exit 1
 fi
 PORT="$(grep -o 'SHARE_PORT=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"' || true)"
-if [ -z "$PORT" ]; then PORT="8080"; fi
+if [ -z "$PORT" ]; then PORT="18080"; fi
 echo "检测到 minishare 端口：$PORT（HTTPS 会跟随这个端口）"
 echo ""
 
