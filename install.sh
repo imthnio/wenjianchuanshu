@@ -4,7 +4,7 @@
 # 小白用法：SSH 连上服务器（root 用户）后，粘贴下面这一段，回车，
 # 然后按提示操作（看不懂就一路回车用默认）：
 #
-#   (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/minishare/main/install.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/minishare@main/install.sh) && sh /tmp/minishare-install.sh
+#   (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh) && sh /tmp/minishare-install.sh
 #
 # 进阶：非交互安装可用环境变量预设
 #   APP_DIR / PORT / IPVER(4 或 6，默认 4) / BIND / MINISHARE_REPO / NONINTERACTIVE=1
@@ -19,7 +19,7 @@ APP_DIR="${APP_DIR:-/opt/minishare}"
 PORT="${PORT:-8080}"
 IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
-MINISHARE_REPO="${MINISHARE_REPO:-imthnio/minishare}"
+MINISHARE_REPO="${MINISHARE_REPO:-imthnio/wenjianchuanshu}"
 
 # ---- 0. 准备安装文件（远程安装时自动下载） ----
 if [ ! -f fileshare.py ] || [ ! -f minishare.service ]; then
