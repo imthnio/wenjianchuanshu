@@ -23,19 +23,37 @@ MINISHARE_REPO="${MINISHARE_REPO:-imthnio/minishare}"
 
 # ---- 0. 准备安装文件（远程安装时自动下载） ----
 if [ ! -f fileshare.py ] || [ ! -f minishare.service ]; then
+  # 精简版 Alpine 常常 curl/wget 都没有（只有 busybox），先自己装一个，
+  # 跟下面自动装 python3 一个思路，保证"粘贴就行"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "正在安装 curl..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update && apt-get install -y curl
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache curl
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y curl
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm curl
+    fi
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "装不上 curl/wget，请手动安装其一后重试（比如 apt install -y curl）"
+    exit 1
+  fi
   echo "正在下载 minishare..."
   # 按顺序试多个下载地址：GitHub 官方 -> jsdelivr 镜像（部分网络连 GitHub 很慢或连不上）
   MIRRORS="https://raw.githubusercontent.com/${MINISHARE_REPO}/main https://cdn.jsdelivr.net/gh/${MINISHARE_REPO}@main"
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    echo "需要 curl 或 wget 来下载，请先安装其一（比如 apt install -y curl）"
-    exit 1
-  fi
   dl() { # 用法: dl 文件名 —— 每个镜像都试一遍，成功就返回
     for m in $MIRRORS; do
       if command -v curl >/dev/null 2>&1; then
         curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$1" "$m/$1" 2>/dev/null && return 0
       else
-        wget -q --connect-timeout=15 --timeout=120 --tries=2 -O "$1" "$m/$1" 2>/dev/null && return 0
+        # wget 参数必须同时兼容 GNU wget 和 busybox wget（精简 Alpine 只有后者，
+        # 它不支持 --connect-timeout，用了会直接报错退出）：-T 两边都是超时秒数
+        wget -q -T 120 --tries=2 -O "$1" "$m/$1" 2>/dev/null && return 0
       fi
     done
     return 1
@@ -144,6 +162,23 @@ if [ "$IPVER" = "6" ]; then
 else
   IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n 1)"
   CURLVER="-4"
+fi
+# busybox 的 hostname 不支持 -I（精简 Alpine 常见），拿不到就用 python 兜底，
+# 只是展示用，拿不到也不影响安装
+if [ -z "$IP" ] && command -v python3 >/dev/null 2>&1; then
+  IP="$(python3 - "$IPVER" 2>/dev/null <<'EOF'
+import socket, sys
+fam = socket.AF_INET6 if sys.argv[1] == "6" else socket.AF_INET
+try:
+    for a in socket.getaddrinfo(socket.gethostname(), None, fam, socket.SOCK_STREAM):
+        ip = a[4][0]
+        if not (ip.startswith("127.") or ip.startswith("fe80:") or ip == "::1"):
+            print(ip)
+            break
+except Exception:
+    pass
+EOF
+)"
 fi
 if [ -z "$IP" ]; then IP="<你的服务器IP>"; fi
 PUBIP=""

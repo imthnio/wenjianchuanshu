@@ -18,6 +18,30 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
+# 查域名解析到的 IP：精简版 Alpine 默认没有 getent（它在 musl-utils 包里，
+# 小鸡模板一般不装），getent 不可用就换 python3（装 minishare 时必装了 python3）
+dns_ip() { # 用法: dns_ip 域名 4|6
+  _di_domain="$1" _di_ver="$2"
+  if command -v getent >/dev/null 2>&1; then
+    if [ "$_di_ver" = "6" ]; then
+      getent hosts "$_di_domain" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}'
+    else
+      getent hosts "$_di_domain" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}'
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_di_domain" "$_di_ver" 2>/dev/null <<'EOF'
+import socket, sys
+fam = socket.AF_INET6 if sys.argv[2] == "6" else socket.AF_INET
+try:
+    for a in socket.getaddrinfo(sys.argv[1], None, fam, socket.SOCK_STREAM):
+        print(a[4][0])
+        break
+except Exception:
+    pass
+EOF
+  fi
+}
+
 # ---- 问 1：域名 ----
 echo "提示：建议用子域名，例如 file.example.com；"
 echo "主域名（如 example.com）留着以后做别的用，子域名可以建很多个、每个服务一个。"
@@ -69,6 +93,19 @@ NAT_DETECTED=0
 if [ "$IPVER" = "4" ]; then
   PUBIP_EARLY="$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || curl -4 -s --max-time 10 api.ipify.org 2>/dev/null || true)"
   SRCIP="$(ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | head -n 1 | awk '{print $2}' || true)"
+  if [ -z "$SRCIP" ] && command -v python3 >/dev/null 2>&1; then
+    # 精简系统可能没装 iproute2（没有 ip 命令），用 python 拿本机出口 IP
+    SRCIP="$(python3 - 2>/dev/null <<'EOF'
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("1.1.1.1", 80))
+    print(s.getsockname()[0])
+except Exception:
+    pass
+EOF
+)"
+  fi
   if [ -n "$PUBIP_EARLY" ] && [ -n "${SRCIP:-}" ] && [ "$PUBIP_EARLY" != "$SRCIP" ]; then
     NAT_DETECTED=1
   fi
@@ -102,11 +139,11 @@ echo ""
 echo "[1] 检查域名解析…"
 if [ "$IPVER" = "6" ]; then
   PUBIP="$(curl -6 -s --max-time 10 ifconfig.me 2>/dev/null || curl -6 -s --max-time 10 api.ipify.org 2>/dev/null || true)"
-  DNSIP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}')"
+  DNSIP="$(dns_ip "$DOMAIN" 6)"
   REC="AAAA"
 else
   PUBIP="$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || curl -4 -s --max-time 10 api.ipify.org 2>/dev/null || true)"
-  DNSIP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}')"
+  DNSIP="$(dns_ip "$DOMAIN" 4)"
   REC="A"
 fi
 if [ -z "$DNSIP" ]; then
@@ -194,7 +231,21 @@ echo ""
 # ---- [5] 安装 Caddy（官方二进制，单文件，先装好再动 minishare） ----
 echo "[5] 安装 Caddy…"
 if ! command -v caddy >/dev/null 2>&1; then
-  command -v curl >/dev/null 2>&1 || { echo "需要 curl，请先安装 curl 再运行。"; exit 1; }
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "正在安装 curl..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update && apt-get install -y curl
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache curl
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y curl
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm curl
+    fi
+  fi
+  command -v curl >/dev/null 2>&1 || { echo "装不上 curl，请手动安装后重试。"; exit 1; }
   command -v tar >/dev/null 2>&1 || { echo "需要 tar，请先安装 tar 再运行。"; exit 1; }
   ARCH="$(uname -m)"
   case "$ARCH" in
@@ -279,7 +330,7 @@ command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
 command_background=true
 pidfile="/run/caddy.pid"
 depend() {
-	need net
+	use net
 	after minishare
 }
 EOF
@@ -349,6 +400,21 @@ else
     (crontab -l 2>/dev/null || true; echo "17 3 * * * certbot renew -q") | crontab -
     echo "已添加每天自动续期任务。"
   fi
+  # OpenRC 系统上 cron 守护进程默认可能没进开机启动，任务加了也白加；尽量把它拉起来
+  _CRON_OK=""
+  if command -v rc-update >/dev/null 2>&1; then
+    for _cs in crond dcron cron; do
+      if [ -f "/etc/init.d/$_cs" ]; then
+        rc-update add "$_cs" default >/dev/null 2>&1
+        if rc-service "$_cs" start >/dev/null 2>&1; then _CRON_OK="yes"; fi
+        break
+      fi
+    done
+  fi
+  if [ -z "$_CRON_OK" ]; then
+    echo "提醒：这台机器上没找到运行中的 cron 服务，证书到期不会自动续期。"
+    echo "Alpine 上可执行 apk add --no-cache dcron 后重新运行本脚本。"
+  fi
 fi
 echo ""
 
@@ -384,21 +450,42 @@ else
 
 # ---- [2] 检查 80/443 是否被占用 ----
 echo "[2] 检查 80/443 端口…"
+# ss 在精简系统上可能没有（iproute2 没装），用 busybox 自带的 netstat 兜底；
+# 两个都没有就跳过检查（后面 Caddy 起不来会有明确报错）
 if command -v ss >/dev/null 2>&1; then
-  for p in 80 443; do
-    if ss -ltn 2>/dev/null | grep -q ":$p "; then
-      echo "端口 $p 已被占用。HTTPS 需要 80 和 443，请先停掉占用它们的程序（如 nginx / apache），再重新运行。"
-      exit 1
-    fi
-  done
+  _LISTEN="$(ss -ltn 2>/dev/null)"
+elif command -v netstat >/dev/null 2>&1; then
+  _LISTEN="$(netstat -ltn 2>/dev/null)"
+else
+  _LISTEN=""
 fi
-echo "80/443 端口空闲。"
+for p in 80 443; do
+  if [ -n "$_LISTEN" ] && printf '%s\n' "$_LISTEN" | grep -q ":$p "; then
+    echo "端口 $p 已被占用。HTTPS 需要 80 和 443，请先停掉占用它们的程序（如 nginx / apache），再重新运行。"
+    exit 1
+  fi
+done
+echo "80/443 端口空闲."
 echo ""
 
 # ---- [3] 安装 Caddy（官方二进制，单文件） ----
 echo "[3] 安装 Caddy…"
 if ! command -v caddy >/dev/null 2>&1; then
-  command -v curl >/dev/null 2>&1 || { echo "需要 curl，请先安装 curl 再运行。"; exit 1; }
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "正在安装 curl..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update && apt-get install -y curl
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache curl
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y curl
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm curl
+    fi
+  fi
+  command -v curl >/dev/null 2>&1 || { echo "装不上 curl，请手动安装后重试。"; exit 1; }
   command -v tar >/dev/null 2>&1 || { echo "需要 tar，请先安装 tar 再运行。"; exit 1; }
   ARCH="$(uname -m)"
   case "$ARCH" in
@@ -466,7 +553,7 @@ command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
 command_background=true
 pidfile="/run/caddy.pid"
 depend() {
-	need net
+	use net
 	after minishare
 }
 EOF

@@ -14,7 +14,9 @@ export SHARE_PORT="@PORT@"
 export SHARE_DATA="@APP_DIR@/data"
 
 depend() {
-    need net
+    # 用 use 而不用 need：net 在某些精简系统上没有提供者，need 会导致服务起不来；
+    # use 只保证"如果有 net 就排在它后面"，没有也不报错，各发行版都安全
+    use net
     after firewall
 }
 
