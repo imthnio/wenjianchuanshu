@@ -16,7 +16,9 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 APP_DIR="${APP_DIR:-/opt/minishare}"
-PORT="${PORT:-18080}"
+# 注意：PORT 没有默认值，安装时必须由用户输入（向导第 2 问），
+# 或非交互安装时用环境变量 PORT 指定。
+PORT="${PORT:-}"
 IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
 MINISHARE_REPO="${MINISHARE_REPO:-imthnio/wenjianchuanshu}"
@@ -66,19 +68,24 @@ if [ ! -f fileshare.py ] || [ ! -f minishare.service ]; then
   echo "下载完成。"
 fi
 
-# ---- 1. 安装向导：只有 3 个问题，看不懂就直接回车 ----
+# ---- 1. 安装向导：只有 3 个问题 ----
 if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   echo "=== minishare 安装向导 ==="
-  echo "下面只有 3 个问题，看不懂就直接回车，用括号里的默认。"
+  echo "下面只有 3 个问题，第 2 问（端口）没有默认值，必须自己输入。"
   printf "1/3 装到哪个目录？[%s]：" "$APP_DIR"
   read -r ans; [ -n "$ans" ] && APP_DIR="$ans"
-  printf "2/3 网页用哪个端口？[%s]：" "$PORT"
-  read -r ans; [ -n "$ans" ] && PORT="$ans"
-  case "$PORT" in
-    ''|*[!0-9]*)
-      echo "端口必须是数字，已恢复默认 18080"
-      PORT=18080 ;;
-  esac
+  if [ -z "$PORT" ]; then
+    while :; do
+      printf "2/3 网页用哪个端口？（必须输入，例如 18080）："
+      read -r PORT || { echo ""; echo "未输入端口，安装已取消。"; exit 1; }
+      case "$PORT" in
+        ''|*[!0-9]*) echo "端口必须是纯数字，请重新输入。" ;;
+        *) break ;;
+      esac
+    done
+  else
+    echo "2/3 网页用哪个端口？$PORT（已通过环境变量 PORT 指定）"
+  fi
   printf "3/3 用 IPv4 还是 IPv6？（输入1回车是ipv4,输入2回车是ipv6）："
   read -r ans
   case "$ans" in
@@ -87,6 +94,13 @@ if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   esac
   echo ""
 fi
+
+# 端口必须有效：非交互安装请用环境变量 PORT 指定纯数字端口
+case "$PORT" in
+  ''|*[!0-9]*)
+    echo "未指定有效端口：交互安装请在向导第 2 问输入纯数字端口；非交互安装请设置环境变量 PORT（例如：PORT=18080 …）。"
+    exit 1 ;;
+esac
 
 # 按选择的 IP 版本决定监听地址
 case "$IPVER" in
