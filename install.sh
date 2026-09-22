@@ -125,7 +125,10 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       -e "s|@PORT@|$PORT|g" -e "s|@PYTHON@|$PYTHON|g" \
       minishare.service > /etc/systemd/system/minishare.service
   systemctl daemon-reload
-  systemctl enable --now minishare
+  systemctl enable minishare
+  # 必须用 restart 而不是 start：机器上如果已经跑着旧实例（比如之前装过、
+  # 换了端口重装），start 不会重启它，新端口永远不会监听，装完也打不开
+  systemctl restart minishare
   echo "已设为开机自启并启动（systemd）"
 elif command -v rc-service >/dev/null 2>&1; then
   sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@BIND@|$BIND|g" \
@@ -133,7 +136,9 @@ elif command -v rc-service >/dev/null 2>&1; then
       minishare.openrc > /etc/init.d/minishare
   chmod +x /etc/init.d/minishare
   rc-update add minishare default
-  rc-service minishare start
+  # 必须用 restart 而不是 start：机器上如果已经跑着旧实例（比如之前装过、
+  # 换了端口重装），start 不会重启它，新端口永远不会监听，装完也打不开
+  rc-service minishare restart
   echo "已设为开机自启并启动（OpenRC）"
 else
   echo "没检测到 systemd / OpenRC，请手动后台运行："
