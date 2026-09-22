@@ -30,6 +30,7 @@ import hashlib
 import secrets
 import sqlite3
 import threading
+from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
@@ -674,6 +675,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             p = urlparse(self.path).path
+            if p == "/healthz":
+                # Check SQLite too: a listening socket alone does not mean the app works.
+                meta_get("pw")
+                return self._json({"service": "minishare", "ok": True})
             if not meta_get("pw"):
                 if p in ("/", "/setup"):
                     return self._send(200, setup_page())
@@ -868,7 +873,15 @@ def _expiry_days(v):
 
 # ---------------- 主程序 ----------------
 class Server(ThreadingHTTPServer):
+    def __init__(self, server_address, handler, bind_and_activate=True):
+        self.address_family = (socket.AF_INET6 if ":" in server_address[0]
+                               else socket.AF_INET)
+        super().__init__(server_address, handler, bind_and_activate)
+
     def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            # Match the selected IP version consistently across Linux/BSD.
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         # 在 listen 之前钳住 MSS：所有 accept 出来的子连接都会继承，
         # 服务端只发小包。用于穿越 PMTU 黑洞链路（大包被中间环节静
         # 默丢弃、ICMP 分片通知又回不来时，连接会一直卡住）。
@@ -877,18 +890,44 @@ class Server(ThreadingHTTPServer):
             try:
                 self.socket.setsockopt(socket.IPPROTO_TCP,
                                        socket.TCP_MAXSEG, MSS)
-            except OSError:
+            except (OSError, AttributeError):
                 pass
         super().server_bind()
 
 
+def check_server(host, port, attempts=10):
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    error = "no response"
+    for attempt in range(attempts):
+        conn = HTTPConnection(host, port, timeout=2)
+        try:
+            conn.request("GET", "/healthz")
+            response = conn.getresponse()
+            body = response.read(4096)
+            if response.status == 200 and json.loads(body) == {"service": "minishare", "ok": True}:
+                print("minishare 本机 HTTP 和数据库检查通过", flush=True)
+                return 0
+            error = "unexpected HTTP response: %s" % response.status
+        except (OSError, ValueError, HTTPException) as exc:
+            error = str(exc)
+        finally:
+            conn.close()
+        if attempt + 1 < attempts:
+            time.sleep(1)
+    print("minishare 本机检查失败：%s" % error, file=sys.stderr)
+    return 1
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--check":
+        sys.exit(check_server(sys.argv[2], int(sys.argv[3])))
     init_db()
     cleanup_expired()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     srv = Server((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print(f"minishare 启动：http://{HOST}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
+    url_host = f"[{HOST}]" if ":" in HOST else HOST
+    print(f"minishare 启动：http://{url_host}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
           flush=True)
     try:
         srv.serve_forever()

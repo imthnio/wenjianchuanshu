@@ -69,7 +69,7 @@ if [ -z "$SRV_FILE" ]; then
 fi
 PORT="$(grep -o 'SHARE_PORT=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"' || true)"
 if [ -z "$PORT" ]; then PORT="18080"; fi
-echo "检测到 minishare 端口：$PORT（HTTPS 会跟随这个端口）"
+echo "检测到 minishare 端口：${PORT}（HTTPS 会跟随这个端口）"
 echo ""
 
 # ---- 问 2：IPv4 还是 IPv6（默认跟随 minishare 的监听地址） ----
@@ -128,10 +128,16 @@ if [ "$NAT" = "1" ] && [ "$IPVER" = "6" ]; then
   echo "NAT 模式目前只支持 IPv4，请用 IPv4 重装 minishare 后再试。"
   exit 1
 fi
+ORIG_PORT="$PORT"
+if [ "$NAT" = "1" ] && [ -f /etc/minishare-nat-port ]; then
+  PORT="$(cat /etc/minishare-nat-port)"
+  case "$PORT" in ''|*[!0-9]*) echo "保存的 HTTPS 端口无效。"; exit 1 ;; esac
+  if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then exit 1; fi
+fi
 if [ "$NAT" = "1" ]; then
   echo "使用 NAT 模式：https://$DOMAIN:$PORT"
 else
-  echo "使用普通模式：https://$DOMAIN（80/443）"
+  echo "使用普通模式：https://${DOMAIN}（80/443）"
 fi
 echo ""
 
@@ -152,11 +158,11 @@ if [ -z "$DNSIP" ]; then
   exit 1
 fi
 if [ -n "$PUBIP" ] && [ "$DNSIP" != "$PUBIP" ]; then
-  echo "域名现在解析到 $DNSIP，但本机公网 IP 是 $PUBIP，对不上。"
-  echo "证书申请会失败。请先把 $REC 记录改成 $PUBIP，等生效后再运行。"
+  echo "域名现在解析到 ${DNSIP}，但本机公网 IP 是 ${PUBIP}，对不上。"
+  echo "证书申请会失败。请先把 $REC 记录改成 ${PUBIP}，等生效后再运行。"
   exit 1
 fi
-echo "域名解析正常（$DOMAIN -> $DNSIP）。"
+echo "域名解析正常（$DOMAIN -> ${DNSIP}）。"
 echo ""
 
 if [ "$NAT" = "1" ]; then
@@ -271,33 +277,71 @@ fi
 echo "Caddy 就绪：$(caddy version)"
 echo ""
 
-# ---- [6] 写 Caddy 配置 ----
-echo "[6] 配置反向代理（Caddy 监听 $PORT）…"
+# Caddy wildcard bind and Python loopback bind cannot share one TCP port.
+BACKEND_PORT="$(python3 - <<'PYPORT'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PYPORT
+)"
+ORIG_HOST="${SRV_HOST:-0.0.0.0}"
+BACKUP_DIR="$(mktemp -d)"
+cp "$SRV_FILE" "$BACKUP_DIR/minishare-service"
 mkdir -p /etc/caddy
+if [ -f /etc/caddy/Caddyfile ]; then cp /etc/caddy/Caddyfile "$BACKUP_DIR/Caddyfile"; fi
+rollback_https() {
+  result=$?
+  trap - EXIT
+  if [ "$result" -ne 0 ]; then
+    echo "HTTPS 启动失败，恢复原 minishare 配置（$ORIG_HOST:${ORIG_PORT}）。"
+    if [ -d /run/systemd/system ]; then
+      systemctl stop caddy || true
+    else
+      rc-service caddy stop || true
+    fi
+    cp "$BACKUP_DIR/minishare-service" "$SRV_FILE"
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload
+      systemctl restart minishare || true
+    else
+      rc-service minishare restart || true
+    fi
+    if [ -f "$BACKUP_DIR/Caddyfile" ]; then
+      cp "$BACKUP_DIR/Caddyfile" /etc/caddy/Caddyfile
+      if [ -d /run/systemd/system ]; then systemctl restart caddy || true; else rc-service caddy restart || true; fi
+    else
+      rm -f /etc/caddy/Caddyfile
+    fi
+  fi
+  rm -rf "$BACKUP_DIR"
+  exit "$result"
+}
+trap rollback_https EXIT
+
+# ---- [6] 写 Caddy 配置 ----
+echo "[6] Caddy 监听 ${PORT}，Python 后端使用独立本地端口 ${BACKEND_PORT}…"
 cat > /etc/caddy/Caddyfile <<EOF
 https://$DOMAIN:$PORT {
 	tls $CERTDIR/fullchain.pem $CERTDIR/privkey.pem
-	reverse_proxy 127.0.0.1:$PORT
+	reverse_proxy 127.0.0.1:$BACKEND_PORT
 }
 EOF
-echo "配置已写入 /etc/caddy/Caddyfile"
-echo ""
 
-# ---- [7] 把 minishare 收进内网，端口让给 Caddy ----
-echo "[7] 把 minishare 收进内网（127.0.0.1:$PORT），端口 $PORT 让给 Caddy…"
-ORIG_HOST="${SRV_HOST:-0.0.0.0}"
+# ---- [7] 把 minishare 收进内网，使用不同端口 ----
 case "$SRV_FILE" in
   *.service)
-    sed -i 's/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=127.0.0.1/' "$SRV_FILE"
+    sed -i -e 's/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=127.0.0.1/' \
+      -e "s/^Environment=SHARE_PORT=.*/Environment=SHARE_PORT=$BACKEND_PORT/" "$SRV_FILE"
     systemctl daemon-reload
     systemctl restart minishare
     ;;
   *)
-    sed -i 's/^export SHARE_HOST=.*/export SHARE_HOST="127.0.0.1"/' "$SRV_FILE"
+    sed -i -e 's/^export SHARE_HOST=.*/export SHARE_HOST="127.0.0.1"/' \
+      -e "s/^export SHARE_PORT=.*/export SHARE_PORT=\"$BACKEND_PORT\"/" "$SRV_FILE"
     rc-service minishare restart
     ;;
 esac
-echo ""
 
 # ---- [8] 设置开机自启并启动（启动失败则回滚 minishare，不让站点变砖） ----
 echo "[8] 设置开机自启…"
@@ -355,23 +399,16 @@ else
   CADDY_MANAGED=0
 fi
 if [ "$CADDY_MANAGED" = "1" ] && [ "$CADDY_OK" != "1" ]; then
-  echo "Caddy 没能启动，回滚 minishare 到外网监听（$ORIG_HOST:$PORT），站点保持可用。"
-  case "$SRV_FILE" in
-    *.service)
-      sed -i "s/^Environment=SHARE_HOST=.*/Environment=SHARE_HOST=$ORIG_HOST/" "$SRV_FILE"
-      systemctl daemon-reload
-      systemctl restart minishare
-      ;;
-    *)
-      sed -i "s/^export SHARE_HOST=.*/export SHARE_HOST=\"$ORIG_HOST\"/" "$SRV_FILE"
-      rc-service minishare restart
-      ;;
-  esac
-  echo "已回滚。请先看 Caddy 日志再重试："
-  echo "  systemd: journalctl -u caddy -n 50"
-  echo "  OpenRC:  tail -n 50 /var/log/messages"
+  echo "Caddy 没能启动，请检查日志；即将自动恢复原配置。"
   exit 1
 fi
+if [ "$CADDY_MANAGED" != "1" ]; then
+  echo "缺少受支持的服务管理器，HTTPS 未完成。"
+  exit 1
+fi
+printf '%s\n' "$PORT" > /etc/minishare-nat-port
+trap - EXIT
+rm -rf "$BACKUP_DIR"
 echo "Caddy 运行中。"
 echo ""
 
@@ -379,16 +416,16 @@ echo ""
 echo "[9] 放行 $PORT 端口…"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$PORT"/tcp >/dev/null
-  echo "ufw 已放行 $PORT。"
+  echo "ufw 已放行 ${PORT}。"
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
   firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null
   firewall-cmd --reload >/dev/null
-  echo "firewalld 已放行 $PORT。"
+  echo "firewalld 已放行 ${PORT}。"
 elif command -v iptables >/dev/null 2>&1; then
   iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-  echo "iptables 已放行 $PORT。"
+  echo "iptables 已放行 ${PORT}。"
 else
-  echo "没检测到防火墙工具：如果外网打不开，去云服务商安全组放行 TCP $PORT。"
+  echo "没检测到防火墙工具：如果外网打不开，去云服务商安全组放行 TCP ${PORT}。"
 fi
 echo ""
 
@@ -513,10 +550,16 @@ echo ""
 
 # ---- [4] 写 Caddy 配置 ----
 echo "[4] 配置反向代理…"
+case "$SRV_HOST" in
+  ::) UPSTREAM="[::1]:$PORT" ;;
+  *:*) UPSTREAM="[$SRV_HOST]:$PORT" ;;
+  0.0.0.0|'') UPSTREAM="127.0.0.1:$PORT" ;;
+  *) UPSTREAM="$SRV_HOST:$PORT" ;;
+esac
 mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
-	reverse_proxy 127.0.0.1:$PORT
+	reverse_proxy $UPSTREAM
 }
 EOF
 echo "配置已写入 /etc/caddy/Caddyfile"
@@ -577,12 +620,17 @@ elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null
   firewall-cmd --permanent --add-service=https >/dev/null
   firewall-cmd --reload >/dev/null
   echo "firewalld 已放行 80/443。"
-elif command -v iptables >/dev/null 2>&1; then
-  iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-  iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-  echo "iptables 已放行 80/443。"
 else
-  echo "没检测到防火墙工具：如果外网打不开，去云服务商安全组放行 TCP 80/443。"
+  FW=iptables
+  [ "$IPVER" = "6" ] && FW=ip6tables
+  if command -v "$FW" >/dev/null 2>&1; then
+    for HTTP_PORT in 80 443; do
+      "$FW" -C INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT 2>/dev/null || "$FW" -I INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT
+    done
+    echo "$FW 已临时放行 80/443，请确认规则持久化。"
+  else
+    echo "请检查主机防火墙和服务商安全组，放行 TCP 80/443。"
+  fi
 fi
 echo ""
 

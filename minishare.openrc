@@ -8,6 +8,8 @@ command="@PYTHON@"
 command_args="@APP_DIR@/fileshare.py"
 command_background=true
 pidfile="/run/minishare.pid"
+output_log="/var/log/minishare.log"
+error_log="/var/log/minishare.log"
 
 export SHARE_HOST="@BIND@"
 export SHARE_PORT="@PORT@"
