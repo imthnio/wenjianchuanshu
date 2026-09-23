@@ -191,6 +191,13 @@ class UploadTooLarge(Exception):
 class BadUpload(Exception):
     pass
 
+# multipart 解析的前置快速拒绝只拦"明显超大"的请求体：信封本身
+# （boundary/头，几百字节）不计入文件大小，精确的账在流式写文件时
+# 按实际文件字节数扣（见 parse_multipart 里的 charge）。这样"页面上
+# 显示的最大可上传"与"实际能传"严格一致：正好卡着上限的文件不会
+# 因为信封多出几百字节就被 413。
+_PRECHECK_SLACK = 1024 * 1024
+
 def _fix_header_encoding(v):
     """HTTP 头是按 latin1 解码的；如果里面实际是 UTF-8 字节（如中文文件名），还原它。"""
     try:
@@ -255,7 +262,8 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
         total = int(content_length)
     except (TypeError, ValueError):
         raise BadUpload("bad content length")
-    if total > max_bytes:
+    if total > max_bytes + _PRECHECK_SLACK:
+        # 明显超大的直接拒掉，不必读完整个请求体
         raise UploadTooLarge()
     bnd = b"--" + boundary
     delim = b"\r\n" + bnd
@@ -263,6 +271,12 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     remaining = total
     fields, files = {}, []
     created_paths = []
+    budget = max_bytes  # 实际文件字节的剩余额度（信封开销不计入）
+    def charge(n):
+        nonlocal budget
+        budget -= n
+        if budget < 0:
+            raise UploadTooLarge()
 
     def fill(need=1):
         nonlocal remaining
@@ -324,13 +338,16 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
                     i = b.find(delim)
                     out.write(b[:i])
                     size += i
+                    charge(i)
                     ended = b[i + len(delim):i + len(delim) + 2] == b"--"
                     del buf[:i + len(delim) + 2]
                     out.close()
                     return size, ended
                 if len(buf) > keep:
+                    n = len(buf) - keep
                     out.write(buf[:-keep])
-                    size += len(buf) - keep
+                    size += n
+                    charge(n)
                     del buf[:-keep]
                 if not fill(keep + 1):
                     raise BadUpload("truncated data")
@@ -493,11 +510,23 @@ def disk_foot():
             f"<span class='diskbar'><i style='width:{pct}%'></i></span></div>")
 
 def upload_limit():
-    # 接收端实际可上传的最大字节数：配置上限与磁盘剩余空间取小者。
+    # 实际可上传的最大字节数：配置上限与磁盘剩余空间取小者。
     # 磁盘快满时，MAX_UPLOAD 再大也传不上去，页面上就该直接告诉对方真实数字。
     used, total = disk_usage()
+    if total <= 0:
+        # statvfs 失败、磁盘大小未知：不能按"剩余 0"处理，否则一次失败的
+        # statvfs 会让所有上传直接 413，整个上传功能被误杀。未知时退回配置上限。
+        return MAX_UPLOAD, 0
     free = max(total - used, 0)
     return min(MAX_UPLOAD, free), free
+
+def too_large_msg():
+    # 413 时的错误文案：区分"磁盘满了"和"文件超配置上限"，
+    # 否则磁盘满时用户会对着几 MB 的文件困惑"到底哪里大了"。
+    _, free = upload_limit()
+    if free < MAX_UPLOAD:
+        return "磁盘剩余空间不足（剩余 %s），无法上传" % hsize(free)
+    return "文件太大，超出上限"
 
 def setup_page(err=""):
     e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
@@ -704,7 +733,7 @@ document.getElementById('pwForm').addEventListener('submit', function(ev){{
 }});
 </script>{disk_foot()}""")
 
-def share_page(sid, share, files, base):
+def share_page(sid, share, files):
     rows = []
     for f in files:
         rows.append(f"""<div class='file'><div>📄 {html.escape(f['filename'])}
@@ -714,7 +743,7 @@ def share_page(sid, share, files, base):
 <h1>📥 {html.escape(share['title'] or '文件分享')}</h1>
 <p class='muted'>共 {len(files)} 个文件 · 到期：{htime(share['expires'])}</p>
 {''.join(rows) if rows else "<p class='muted'>文件已被删除</p>"}
-<p class='muted' style='margin-top:16px'>由 minishare 提供 · {html.escape(base)}</p></div>""")
+</div>""")
 
 def receive_page(sid, share):
     limit, _ = upload_limit()
@@ -773,12 +802,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self):
         return valid_session(self._cookie().get("sid"))
-
-    def _base(self):
-        proto = self.headers.get("X-Forwarded-Proto", "http")
-        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
-                or f"{HOST}:{PORT}")
-        return f"{proto}://{host}"
 
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         if isinstance(body, str):
@@ -862,7 +885,7 @@ class Handler(BaseHTTPRequestHandler):
         d = parse_qs(raw.decode("utf-8", "replace"))
         return {k: v[0] for k, v in d.items()}
 
-    def _multipart(self):
+    def _multipart(self, cap=None):
         ctype = self.headers.get("Content-Type", "")
         m = re.search(r"boundary=([^;]+)", ctype)
         if not m:
@@ -880,10 +903,12 @@ class Handler(BaseHTTPRequestHandler):
             raise BadUpload("empty body")
         # 注：BaseHTTPRequestHandler 在收到 Expect: 100-continue 时已自动
         # 回过 100，这里不再手动发，避免重复的 interim 响应。
-        # 实际生效的上限是 min(配置上限, 磁盘剩余空间)，与接收页面上
+        # 实际生效的上限默认是 min(配置上限, 磁盘剩余空间)，与接收页面上
         # 显示给对方的数字一致：超过剩余空间的上传直接 413 拒绝，
         # 而不是让对方传一半才遇到 500。
-        limit, _ = upload_limit()
+        # /api/receive（只创建接收链接、不收文件）传 cap=MAX_UPLOAD：
+        # 建链接这个动作本身不占磁盘，不该被磁盘剩余空间卡住。
+        limit = cap if cap is not None else upload_limit()[0]
         return parse_multipart(self.rfile, n, boundary, limit)
 
     def _send_file(self, path, filename):
@@ -957,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, not_found())
                 if s["type"] == "receive":
                     return self._redirect(f"/r/{sid}")
-                return self._send(200, share_page(sid, s, share_files(sid), self._base()))
+                return self._send(200, share_page(sid, s, share_files(sid)))
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/f/(\d+)", p)
             if m:
@@ -1027,7 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     fields, files = self._multipart()
                 except UploadTooLarge:
-                    return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
+                    return self._fail_close({"ok": False, "error": too_large_msg()}, 413)
                 except BadUpload as e:
                     # 解析失败时请求体可能没读完（如 Content-Type 里没 boundary）：
                     # 必须关连接，否则残留的请求体会污染同一 keep-alive 连接上
@@ -1062,10 +1087,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_auth():
                     return
                 try:
-                    fields, files = self._multipart()
+                    fields, files = self._multipart(MAX_UPLOAD)
                 except UploadTooLarge:
-                    # 与 /api/share、/r/<sid>/upload 一致：超大上传返回 413
-                    #（之前这里是 400，且错误信息是空字符串）
+                    # 建链接不收文件：用配置上限解析，不受磁盘剩余空间限制
                     return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
                     return self._fail_close({"ok": False, "error": str(e)}, 400)
@@ -1168,7 +1192,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _, files = self._multipart()
                 except UploadTooLarge:
-                    return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
+                    return self._fail_close({"ok": False, "error": too_large_msg()}, 413)
                 except BadUpload as e:
                     # 同 /api/share：解析失败可能没读完请求体，关连接防污染
                     return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
