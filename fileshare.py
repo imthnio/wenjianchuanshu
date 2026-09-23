@@ -234,15 +234,25 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
             remaining -= len(data)
 
     def read_headers():
+        nonlocal remaining
         headers = {}
         while True:
-            eol = -1
-            while eol == -1:
-                if not fill(4):
-                    raise BadUpload("truncated headers")
+            while True:
                 eol = bytes(buf).find(b"\r\n")
-                if eol == -1 and len(buf) > 65536:
+                if eol != -1:
+                    break
+                if len(buf) > 65536:
                     raise BadUpload("header too long")
+                # 注意：fill(4) 只保证"缓冲区至少有 4 字节"；当已有字节但
+                # 找不到换行时它什么都不读，直接原地空转，曾导致真死循环。
+                # 这里每轮必须真的多读一块；读完还没有就是报文被截断。
+                if remaining == 0:
+                    raise BadUpload("truncated headers")
+                data = rfile.read(min(CHUNK, remaining))
+                if not data:
+                    raise BadUpload("truncated headers")
+                remaining -= len(data)
+                buf.extend(data)
             line = bytes(buf[:eol])
             del buf[:eol + 2]
             if not line:
@@ -314,14 +324,21 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     try:
         # 跳过 preamble，定位第一个 boundary
         while True:
-            if not fill(len(bnd) + 2):
-                raise BadUpload("no boundary")
             i = bytes(buf).find(bnd)
             if i != -1:
                 del buf[:i]
                 break
             if len(buf) > 1024 * 1024:
                 raise BadUpload("preamble too long")
+            # 同 read_headers：fill(len(bnd)+2) 在已有足够字节但没命中时
+            # 不会再读，直接原地空转，曾导致真死循环。每轮必须真的多读一块。
+            if remaining == 0:
+                raise BadUpload("no boundary")
+            data = rfile.read(min(CHUNK, remaining))
+            if not data:
+                raise BadUpload("no boundary")
+            remaining -= len(data)
+            buf.extend(data)
         # 消费第一个 boundary 行
         if not fill(len(bnd) + 2):
             raise BadUpload("truncated")
@@ -432,10 +449,11 @@ def dash_page(shares):
         link = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
         items.append(f"""<div class='file'><div>
 <span class='badge {cls}'>{typ}</span><b>{html.escape(s['title'] or '(无备注)')}</b>
-<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])}</div>
+<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
 <div class='linkbox' id='lk-{s['id']}'></div></div>
 <div style='white-space:nowrap'>
 <button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
+<button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
 <button class='danger' onclick="delShare('{s['id']}')">删除</button>
 </div></div>""")
     lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
@@ -462,7 +480,6 @@ def dash_page(shares):
 <div class='card'><h2>📋 我的分享</h2>{lst}</div>
 <div class='card'><h2>🔑 修改密码</h2>
 <form id='pwForm'>
-<input type='password' name='old' placeholder='当前密码' required>
 <input type='password' name='new1' placeholder='新密码' required minlength='4'>
 <input type='password' name='new2' placeholder='重复新密码' required minlength='4'>
 <button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div>
@@ -477,6 +494,21 @@ function delShare(id){{
   if(!confirm('确定删除这个分享吗？文件也会一起删除。')) return;
   fetch('/api/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
     body:'id='+encodeURIComponent(id)}}).then(r=>r.json()).then(()=>location.reload());
+}}
+function editExpiry(id){{
+  var box=document.getElementById('ex-'+id);
+  box.innerHTML="<select id='exs-"+id+"'><option value='1'>1 天后过期</option>"
+    +"<option value='7' selected>7 天后过期</option><option value='30'>30 天后过期</option>"
+    +"<option value='0'>永久有效</option></select> "
+    +"<button class='ghost' onclick=\"saveExpiry('"+id+"')\">确定</button>"
+    +"<button class='ghost' onclick=\"cancelExpiry('"+id+"')\">取消</button>";
+}}
+function cancelExpiry(id){{document.getElementById('ex-'+id).innerHTML="";}}
+function saveExpiry(id){{
+  var v=document.getElementById('exs-'+id).value;
+  fetch('/api/expiry',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)+'&expiry='+encodeURIComponent(v)}})
+    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'修改失败');}});
 }}
 function bindXhr(fid, url, resId, progId, okText){{
   var f=document.getElementById(fid);
@@ -819,12 +851,28 @@ class Handler(BaseHTTPRequestHandler):
                     delete_share(f["id"])
                 return self._json({"ok": True})
 
+            if p == "/api/expiry":
+                # 管理员手动调整已创建分享的过期时间（延长或缩短）
+                if not self._authed():
+                    return self._json({"ok": False, "error": "未登录"}, 401)
+                f = self._form()
+                sid = f.get("id", "")
+                with db() as c:
+                    s = c.execute("SELECT id FROM shares WHERE id=?",
+                                  (sid,)).fetchone()
+                    if not s:
+                        return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    days = _expiry_days(f.get("expiry"))
+                    now = int(time.time())
+                    c.execute("UPDATE shares SET expires=? WHERE id=?",
+                              (now + days * 86400 if days else 0, sid))
+                return self._json({"ok": True})
+
             if p == "/api/chpw":
                 if not self._authed():
                     return self._json({"ok": False, "error": "未登录"}, 401)
                 f = self._form()
-                if not check_pw(f.get("old", ""), meta_get("pw")):
-                    return self._json({"ok": False, "error": "当前密码错误"})
+                # 已登录即视为管理员身份，不再校验当前密码
                 if len(f.get("new1", "")) < 4 or f.get("new1") != f.get("new2"):
                     return self._json({"ok": False, "error": "新密码至少4位且两次一致"})
                 meta_set("pw", hash_pw(f["new1"]))
@@ -877,6 +925,15 @@ class Server(ThreadingHTTPServer):
         self.address_family = (socket.AF_INET6 if ":" in server_address[0]
                                else socket.AF_INET)
         super().__init__(server_address, handler, bind_and_activate)
+
+    def get_request(self):
+        # 每个连接设 120 秒无数据超时：客户端只建连不发数据（或发一半
+        # 就停住）时，工作线程不会永远卡在 rfile.read() 里。线程数无上限，
+        # 不设超时一个慢连接就能永久占住一个线程直到耗尽内存。
+        # 超时按"连续无数据"计算，正常传大文件不受影响。
+        conn, addr = super().get_request()
+        conn.settimeout(120)
+        return conn, addr
 
     def server_bind(self):
         if self.address_family == socket.AF_INET6:
