@@ -201,7 +201,13 @@ def _disp_param(disp, key):
             v = p.split("=", 1)[1].strip()
             if "''" in v:
                 enc, _, val = v.partition("''")
-                return unquote(val, encoding=enc or "utf-8", errors="replace")
+                try:
+                    return unquote(val, encoding=enc or "utf-8", errors="replace")
+                except (LookupError, ValueError):
+                    # 编码名是客户端随便填的（如 filename*=GARBAGE''...）：
+                    # unquote 对未知编码抛 LookupError。回退到 utf-8 解码，
+                    # 畸形输入按普通文件名处理，不应 500。
+                    return unquote(val, encoding="utf-8", errors="replace")
             return v.strip('"')
         if pl.startswith(kl + "="):
             v = p.split("=", 1)[1].strip()
@@ -770,7 +776,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _form(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            # Content-Length 填了垃圾值：之前 int() 直接抛 ValueError，
+            # 走通用 except 变成 500；畸形请求应 400。
+            raise BadUpload("bad content length")
         if n < 0 or n > 1_000_000:
             raise BadUpload("form too large")
         raw = self.rfile.read(n) if n > 0 else b""
@@ -786,7 +797,11 @@ class Handler(BaseHTTPRequestHandler):
             boundary = m.group(1).strip().strip('"').encode("latin1")
         except UnicodeEncodeError:
             raise BadUpload("bad boundary")
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            # 同 _form：垃圾 Content-Length 应 400 而不是 500
+            raise BadUpload("bad content length")
         if not n:
             raise BadUpload("empty body")
         # 注：BaseHTTPRequestHandler 在收到 Expect: 100-continue 时已自动
@@ -929,7 +944,10 @@ class Handler(BaseHTTPRequestHandler):
                 except UploadTooLarge:
                     return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
-                    return self._json({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                    # 解析失败时请求体可能没读完（如 Content-Type 里没 boundary）：
+                    # 必须关连接，否则残留的请求体会污染同一 keep-alive 连接上
+                    # 的下一个请求（实测：服务端曾把残留 body 当成新请求解析）。
+                    return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 title = (fields.get("title") or "").strip()[:100]
@@ -951,7 +969,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "未登录"}, 401)
                 try:
                     fields, _ = self._multipart()
-                except (UploadTooLarge, BadUpload) as e:
+                except UploadTooLarge:
+                    # 与 /api/share、/r/<sid>/upload 一致：超大上传返回 413
+                    #（之前这里是 400，且错误信息是空字符串）
+                    return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
+                except BadUpload as e:
                     return self._fail_close({"ok": False, "error": str(e)}, 400)
                 title = (fields.get("title") or "").strip()[:100]
                 days = _expiry_days(fields.get("expiry"))
@@ -1044,7 +1066,8 @@ class Handler(BaseHTTPRequestHandler):
                 except UploadTooLarge:
                     return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
-                    return self._json({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                    # 同 /api/share：解析失败可能没读完请求体，关连接防污染
+                    return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 now = int(time.time())
