@@ -10,9 +10,11 @@ import re
 import socket
 import subprocess
 import tempfile
+import json
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
@@ -67,6 +69,89 @@ class Connectivity(unittest.TestCase):
     @unittest.skipUnless(socket.has_ipv6, 'IPv6 unavailable')
     def test_ipv6(self):
         self.exercise('::', '::1')
+
+    def test_dash_expiry_buttons_have_valid_onclick(self):
+        # 回归测试：控制台"改过期"的确定/取消按钮由 JS 拼出 onclick，
+        # 引号错位会导致运行时生成 onclick="saveExpiry("+id+"')" 这种坏 HTML，
+        # 点确定没反应。正确应为 onclick="saveExpiry('"+id+"')"。
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        body = app.dash_page(shares).decode("utf-8")
+        self.assertIn('saveExpiry(\'\\"+id+\\"\')', body)
+        self.assertIn('cancelExpiry(\'\\"+id+\\"\')', body)
+        self.assertNotIn('saveExpiry(\\"+id+\\")', body)
+
+    def test_oversized_form_rejected_without_reading(self):
+        # 普通表单超过 1MB 直接 400，不读进内存
+        with self.server("127.0.0.1") as port:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/setup", body=b"x=1",
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Content-Length": "2000000"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 400)
+            c.close()
+
+    def test_title_api(self):
+        # 改备注：未登录 401 → 登录后改名 → dash 显示 → 清空 → 不存在 404
+        with self.server("127.0.0.1") as port:
+            def req(method, path, body=None, headers=None, cookie=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                h = dict(headers or {})
+                if cookie:
+                    h["Cookie"] = cookie
+                c.request(method, path, body=body, headers=h)
+                r = c.getresponse()
+                data = r.read()
+                ck = r.getheader("Set-Cookie")
+                c.close()
+                return r.status, ck, data
+
+            form = {"Content-Type": "application/x-www-form-urlencoded"}
+            s, _, _ = req("POST", "/api/title", b"id=x&title=y", form)
+            self.assertEqual(s, 401)
+
+            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234"}).encode()
+            s, ck, _ = req("POST", "/setup", body, form)
+            self.assertEqual(s, 302)
+            cookie = ck.split(";")[0]
+
+            mp = ("------b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nold\r\n"
+                  "------b--\r\n").encode()
+            s, _, b = req("POST", "/api/receive", mp,
+                          {"Content-Type": "multipart/form-data; boundary=----b"}, cookie)
+            sid = json.loads(b)["id"]
+
+            body = urllib.parse.urlencode({"id": sid, "title": "新备注名"}).encode()
+            s, _, b = req("POST", "/api/title", body, form, cookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(json.loads(b)["ok"])
+            with app.db() as c:
+                row = c.execute("SELECT title FROM shares WHERE id=?", (sid,)).fetchone()
+            self.assertEqual(row["title"], "新备注名")
+
+            s, _, b = req("GET", "/dash", cookie=cookie)
+            self.assertIn("新备注名".encode(), b)
+
+            body = urllib.parse.urlencode({"id": sid, "title": ""}).encode()
+            s, _, b = req("POST", "/api/title", body, form, cookie)
+            self.assertTrue(json.loads(b)["ok"])
+            s, _, b = req("GET", "/dash", cookie=cookie)
+            self.assertIn("(无备注)".encode(), b)
+
+            body = urllib.parse.urlencode({"id": "nope12345", "title": "x"}).encode()
+            s, _, b = req("POST", "/api/title", body, form, cookie)
+            self.assertEqual(s, 404)
+
+    def test_clean_filename_strips_control_chars(self):
+        # 文件名里的 CR/LF 若不清理，会污染下载时的 Content-Disposition 响应头
+        self.assertEqual(app._clean_filename('evil\r\nX-Injected: 1.txt'),
+                         'evilX-Injected: 1.txt')
+        self.assertEqual(app._clean_filename('../../etc/passwd'), 'passwd')
+        self.assertEqual(app._clean_filename('正常 文件名.pdf'), '正常 文件名.pdf')
 
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:
