@@ -325,6 +325,139 @@ class Connectivity(unittest.TestCase):
                 self.assertNotEqual(proxy.getsockname()[1], backend)
                 self.assertEqual(self.request('127.0.0.1', backend, '/')[0], 200)
 
+    def _login_cookie(self, port, pw="pw123456"):
+        app.meta_set("pw", app.hash_pw(pw))
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/login",
+                  body=urllib.parse.urlencode({"pw": pw}).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 302)
+        cookie = r.getheader("Set-Cookie").split(";")[0]
+        c.close()
+        return cookie
+
+    def test_filename_star_garbage_encoding_not_500(self):
+        # filename*=GARBAGE''%41%42：编码名是客户端随便填的，unquote 会抛
+        # LookupError。应回退 utf-8 解码得到文件名 "AB"，200 而不是 500。
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port)
+            bnd = "----b"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nt\r\n"
+                  f"--{bnd}--\r\n").encode()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/api/receive", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            sid = json.loads(r.read())["id"]
+            c.close()
+            up = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; "
+                  f"filename*=GARBAGE''%41%42\r\n"
+                  f"Content-Type: application/octet-stream\r\n\r\nhello\r\n"
+                  f"--{bnd}--\r\n").encode("latin1")
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", f"/r/{sid}/upload", body=up,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}"})
+            r = c.getresponse()
+            body = r.read()
+            c.close()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(json.loads(body)["ok"])
+            with app.db() as dbc:
+                row = dbc.execute("SELECT filename FROM files").fetchone()
+            self.assertEqual(row["filename"], "AB")
+
+    def test_garbage_content_length_is_400_not_500(self):
+        # Content-Length 填垃圾值：int() 抛 ValueError，必须 400 而不是 500。
+        # 表单路径（_form）和 multipart 路径（_multipart）都要覆盖。
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port)
+            bad = {"Content-Length": "abc"}
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login", body=b"",
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               **bad})
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 400)
+            c.close()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/api/share", body=b"",
+                      headers={"Content-Type": "multipart/form-data; boundary=----x",
+                               "Cookie": cookie, **bad})
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 400)
+            self.assertEqual(r.getheader("Connection"), "close")
+            c.close()
+
+    def test_share_badupload_closes_connection(self):
+        # /api/share 解析失败（如 Content-Type 里没 boundary）时请求体没读完：
+        # 必须关连接并带 Connection: close，否则残留的请求体会污染同一
+        # keep-alive 连接上的下一个请求（实测：服务端曾把残留 body 当成
+        # 新请求的方法行解析，吐出 501）。/api/receive 早就是这么做的。
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port)
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            raw = (f"POST /api/share HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\n"
+                   "Content-Type: multipart/form-data\r\nContent-Length: 100\r\n\r\n").encode() + b"Z" * 100
+            s.sendall(raw)
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            clen = 0
+            for line in resp.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    clen = int(line.split(b":", 1)[1])
+            body = resp.split(b"\r\n\r\n", 1)[1]
+            while len(body) < clen:
+                body += s.recv(4096)
+            self.assertTrue(resp.split(b"\r\n")[0].endswith(b"400 Bad Request"),
+                            resp.split(b"\r\n")[0])
+            self.assertTrue(any(l.lower().startswith(b"connection:") and b"close" in l.lower()
+                                for l in resp.split(b"\r\n")), resp)
+            # 同一连接上再发请求：服务端已关连接，绝不能把残留 body 当请求解析
+            try:
+                s.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            s.settimeout(3)
+            try:
+                more = s.recv(4096)
+            except (socket.timeout, ConnectionResetError, BrokenPipeError):
+                more = b""
+            self.assertNotIn(b"501", more)
+            s.close()
+
+    def test_receive_api_oversized_is_413(self):
+        # /api/receive 超大上传应与 /api/share、/r/<sid>/upload 一致返回 413
+        #（之前是 400 且错误信息为空字符串）。
+        old_max = app.MAX_UPLOAD
+        app.MAX_UPLOAD = 200
+        try:
+            with self.server("127.0.0.1") as port:
+                cookie = self._login_cookie(port)
+                bnd = "----t"
+                mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nx\r\n"
+                      f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\r\n"
+                      + "x" * 500 + f"\r\n--{bnd}--\r\n").encode()
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/api/receive", body=mp,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                body = r.read()
+                c.close()
+                self.assertEqual(r.status, 413)
+                self.assertIn("太大", body.decode("utf-8"))
+        finally:
+            app.MAX_UPLOAD = old_max
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
