@@ -2310,6 +2310,91 @@ class Connectivity(unittest.TestCase):
                     "SELECT size FROM files WHERE share_id=?", (sid,)).fetchone()
             self.assertEqual(row["size"], 0)
 
+    def test_multipart_too_many_fields_400(self):
+        # 碎字段 part DoS：字段 part 不进文件额度、不落盘，直接进内存 dict，
+        # 不限数量会把 fields 撑爆。超限必须 400（而不是 200 建分享成功）。
+        # getattr 兜底：旧代码没有这个常量时，赋值只是无害的摆设，
+        # 服务端照旧 200 建分享，测试干净地 FAIL（而不是 AttributeError）。
+        old = getattr(app, "MAX_FIELDS_PER_REQUEST", None)
+        app.MAX_FIELDS_PER_REQUEST = 5
+        try:
+            with self.server("127.0.0.1") as port:
+                app.create_user("pw123456", is_admin=True)
+                cookie = self._chunk_login(port, "pw123456")
+                bnd = "FIELDBND"
+                parts = []
+                for i in range(10):
+                    parts.append(
+                        '--%s\r\nContent-Disposition: form-data; name="f%d"'
+                        '\r\n\r\nx\r\n' % (bnd, i))
+                # 带一个正常文件：旧代码（无上限）会 200 建分享成功，
+                # 这样测试在旧代码上才会失败，是真回归测试
+                parts.append(
+                    '--%s\r\nContent-Disposition: form-data; name="file"; '
+                    'filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nhi\r\n'
+                    % bnd)
+                parts.append("--%s--\r\n" % bnd)
+                body = "".join(parts).encode()
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+                try:
+                    c.request("POST", "/api/share", body=body, headers={
+                        "Content-Type":
+                            "multipart/form-data; boundary=" + bnd,
+                        "Cookie": cookie})
+                    r = c.getresponse()
+                    self.assertEqual(r.status, 400)
+                finally:
+                    c.close()
+        finally:
+            if old is None:
+                del app.MAX_FIELDS_PER_REQUEST
+            else:
+                app.MAX_FIELDS_PER_REQUEST = old
+
+    def test_chunk_init_session_cap_429(self):
+        # 分片会话上限：kind=upload 走接收链接、免登录、链接公开，
+        # 不限数量会被刷爆内存和 inode。超限必须回 429 JSON。
+        # getattr 兜底：旧代码没有这个常量时测试干净地 FAIL。
+        old = getattr(app, "MAX_CHUNK_SESSIONS", None)
+        app.MAX_CHUNK_SESSIONS = 3
+        try:
+            with self.server("127.0.0.1") as port:
+                app.create_user("pw123456", is_admin=True)
+                now = int(time.time())
+                with app.db() as dbc:
+                    dbc.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                                " VALUES(?,?,?,?,?,?)",
+                                ("caprecv", "receive", "t", now, 0, 1))
+                base = {"sid": "caprecv", "kind": "upload", "name": "a.bin",
+                        "size": "10", "chunks": "1"}
+                for _ in range(3):
+                    s, _ = self._chunk_post(port, "/api/chunk_init", base)
+                    self.assertEqual(s, 200)
+                s, b = self._chunk_post(port, "/api/chunk_init", base)
+                self.assertEqual(s, 429)
+                self.assertIn("太多", b.decode("utf-8"))
+        finally:
+            if old is None:
+                del app.MAX_CHUNK_SESSIONS
+            else:
+                app.MAX_CHUNK_SESSIONS = old
+
+    def test_chunk_query_too_many_fields_400(self):
+        # /api/chunk 的 query 解析也加了字段上限（碎字段 DoS）
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "x.bin",
+                 "size": "100", "chunks": "1"}, cookie=cookie)
+            up = json.loads(b.decode("utf-8"))["up"]
+            qs = "up=%s&i=0&" % up + "&".join("z%d=1" % i for i in range(30))
+            s, _ = self._chunk_post(port, "/api/chunk?" + qs, raw=b"z" * 100,
+                                    cookie=cookie)
+            self.assertIn(s, (400, "RESET"))
+
     def test_upload_pages_use_chunked_flow(self):
         # 三个上传入口都走分片：页面里有百分比、完成提示，
         # 不再用整文件一次 POST 的旧写法
@@ -2650,6 +2735,52 @@ class Installer(unittest.TestCase):
                                text=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_install_dl_busts_raw_cache(self):
+        # 回归：raw.githubusercontent.com 有约 5 分钟 CDN 缓存，刚推上去的
+        # 修复不加时间戳会拿到旧脚本。dl() 对 raw 镜像的 URL 必须带 ?t= 参数。
+        text = (ROOT / "install.sh").read_text()
+        start = text.index("  dl() {")
+        end = text.index("\n  }\n", start) + len("\n  }\n")
+        func = "\n".join(
+            line[2:] if line.startswith("  ") else line
+            for line in text[start:end].splitlines())
+        with tempfile.TemporaryDirectory() as folder:
+            bindir = Path(folder) / "bin"
+            bindir.mkdir()
+            log = Path(folder) / "curl.log"
+            # 假 curl：记录被请求的 URL，按 -o 写出文件，返回成功
+            (bindir / "curl").write_text(
+                "#!/bin/sh\n"
+                'echo "$@" >> "$CURL_LOG"\n'
+                'prev=""\n'
+                'for a in "$@"; do\n'
+                '  if [ "$prev" = "-o" ]; then echo x > "$a"; fi\n'
+                '  prev="$a"\n'
+                "done\n"
+                "exit 0\n")
+            (bindir / "curl").chmod(0o755)
+            script = ("set -eu\n"
+                      'MIRRORS="https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main '
+                      'https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main"\n'
+                      + func + '\ncd ' + shlex.quote(folder) + '\ndl foo.py\n')
+            r = subprocess.run(
+                ["sh", "-c", script],
+                env={**os.environ, "PATH": str(bindir) + ":/usr/bin:/bin",
+                     "CURL_LOG": str(log)},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            urls = log.read_text().strip().splitlines()
+            self.assertEqual(len(urls), 1)  # 第一个镜像成功就不再试
+            self.assertIn("raw.githubusercontent.com", urls[0])
+            self.assertRegex(urls[0], r"\?t=\d+$")
+
+    def test_repair_sh_busts_raw_cache(self):
+        # repair.sh 直接拼下载 URL：raw 镜像同样要带时间戳防旧缓存
+        text = (ROOT / "repair.sh").read_text()
+        self.assertIn('install.sh?t=$TS', text)
+        self.assertRegex(text, r'TS="\$\(date \+%s\)"')
+
+
 class HTTPSConfig(unittest.TestCase):
     def nat_case(self, fail):
         with tempfile.TemporaryDirectory() as folder:
@@ -2823,14 +2954,16 @@ class HTTPSConfig(unittest.TestCase):
     def test_caddy_restart_never_kills_script(self):
         # 回归：set -e 下裸写 systemctl restart caddy，失败会直接退出脚本，
         # 后面的"[5b]/[8b] 是否真在跑"检查和日志打印就永远跑不到了。
-        # 所有启动 caddy 的地方必须 || true，把"起没起来"的判断交给后面的检查。
+        # 所有启动 caddy 的地方必须 || true、或包在 if 条件里（条件位置
+        # 不受 set -e 影响），把"起没起来"的判断交给后面的检查。
         text = (ROOT / 'enable-https.sh').read_text()
         for i, line in enumerate(text.splitlines(), 1):
             s = line.strip()
             if s.startswith('#') or 'RELOAD_HOOK' in s:
                 continue
             if 'systemctl restart caddy' in s or 'rc-service caddy restart' in s:
-                self.assertIn('|| true', s, f'line {i}: {s}')
+                guarded = ('|| true' in s or s.startswith('if '))
+                self.assertTrue(guarded, f'line {i}: {s}')
 
 
     def test_normal_mode_restores_caddyfile_on_failure(self):
@@ -2866,6 +2999,42 @@ class HTTPSConfig(unittest.TestCase):
             self.assertEqual((caddy_dir / 'Caddyfile').read_text(),
                              'old working config\n')
             self.assertIn('restart caddy', (Path(folder) / 'rc.log').read_text())
+
+    def test_restore_failure_warns_caddy_is_down(self):
+        # 回归：普通模式恢复 Caddyfile.bak 后，如果 Caddy 重启也失败，
+        # 以前只打印"已恢复之前的 Caddy 配置"，用户会误以为一切正常，
+        # 实际上 Caddy 还停着、原来的 HTTPS 也是断的。
+        # 现在必须明确说"重启失败、Caddy 是停的"，并给手动启动命令。
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('if [ "$CADDY_CHECKABLE" = "1" ]')
+        end = text.index('exit 1\nfi', start) + len('exit 1\nfi')
+        block = text[start:end]
+        with tempfile.TemporaryDirectory() as folder:
+            caddy_dir = Path(folder) / 'caddy'
+            caddy_dir.mkdir()
+            (caddy_dir / 'Caddyfile').write_text('new broken config\n')
+            (caddy_dir / 'Caddyfile.bak').write_text('old working config\n')
+            bindir = Path(folder) / 'bin'
+            bindir.mkdir()
+            # 假 systemctl：restart 永远失败，且记录自己被调用过
+            (bindir / 'systemctl').write_text(
+                '#!/bin/sh\necho "$@" >> "$RC_LOG"\nexit 1\n')
+            (bindir / 'systemctl').chmod(0o755)
+            block2 = block.replace('/etc/caddy', str(caddy_dir))
+            r = subprocess.run(['sh', '-c', 'set -eu\n' + block2],
+                               env={**os.environ,
+                                    'PATH': str(bindir) + ':/usr/bin:/bin',
+                                    'CADDY_CHECKABLE': '1', 'CADDY_OK': '0',
+                                    'RC_LOG': str(Path(folder) / 'rc.log')},
+                               capture_output=True, text=True, timeout=10)
+            # set -e 下脚本不能被失败的 restart 杀死：必须走完恢复流程
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertEqual((caddy_dir / 'Caddyfile').read_text(),
+                             'old working config\n')
+            out = r.stdout + r.stderr
+            self.assertIn('重启失败', out)
+            self.assertIn('停的', out)
+            self.assertIn('systemctl start caddy', out)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
