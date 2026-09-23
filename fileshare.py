@@ -19,6 +19,7 @@ minishare —— 极简文件分享 / 接收服务
 """
 import os
 import sys
+import errno
 import re
 import json
 import time
@@ -315,6 +316,87 @@ _PRECHECK_SLACK = 1024 * 1024
 # 下几千万个空文件 part（每个只占一百多字节），把磁盘 inode 和
 # SQLite 拖死。正常人一次传 200 个文件绰绰有余。
 MAX_FILES_PER_REQUEST = 200
+
+# ---------------- 分片上传 ----------------
+# 大文件一次 POST 传完，经过 Cloudflare 这类反代时很容易因为
+# “单个请求耗时太长”被中间环节掐掉（用户看到的就是 请求失败(522)）。
+# 切成小片逐个传：每个请求都很快完成，既避开超时，又能显示真实的
+# 上传百分比；某片失败也只重传该片，不用整个文件重来。
+CHUNK_SIZE = 4 * 1024 * 1024  # 每片 4MB
+CHUNK_TTL = 2 * 3600  # 分片会话 2 小时没传完就清理临时文件
+
+# 分片上传的前端通用函数：分享页“添加文件”、接收页“上传”、控制台
+# “发送文件”三个上传入口共用。大文件切成 4MB 一片逐个 POST，每片请求
+# 都很快完成，经过 Cloudflare 这类反代不会因“单个请求耗时太长”被掐
+# （之前整文件一次 POST 大文件容易 请求失败(522)）；同时能显示真实的
+# 上传百分比和“正在上传第几个/上传完成”，某片失败只重传该片。
+CHUNK_JS = """
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+var CHUNK_SIZE=4*1024*1024;
+// params: {sid, kind:'add'|'upload'}；ui: {prog, pct, stat}
+// 成功 resolve()，失败 reject(Error)，错误信息可直接展示给用户。
+function chunkUpload(params, files, ui){
+  return new Promise(function(resolve, reject){
+    var total=0, i;
+    for(i=0;i<files.length;i++) total+=files[i].size;
+    var sent=0;
+    function paint(){
+      var p=total>0?Math.floor(sent/total*100):100;
+      ui.prog.value=p;
+      if(ui.pct) ui.pct.textContent=p+'%';
+    }
+    function jpost(url, body){
+      return fetch(url,{method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:body}).then(function(r){
+          return r.json().catch(function(){return null;}).then(function(j){
+            return {status:r.status, json:j};
+          });
+        });
+    }
+    function upFile(fi){
+      if(fi>=files.length){ paint(); resolve(); return; }
+      var f=files[fi], nchunks=Math.max(1, Math.ceil(f.size/CHUNK_SIZE));
+      if(ui.stat) ui.stat.innerHTML='正在上传 <b>'+escapeHtml(f.name)+'</b>（'+(fi+1)+'/'+files.length+'）…';
+      jpost('/api/chunk_init',
+        'sid='+encodeURIComponent(params.sid)+'&kind='+params.kind+
+        '&name='+encodeURIComponent(f.name)+'&size='+f.size+'&chunks='+nchunks
+      ).then(function(r){
+        if(!r.json||!r.json.ok) throw new Error((r.json&&r.json.error)||('请求失败('+r.status+')'));
+        var up=r.json.up;
+        function upChunk(c){
+          if(c>=nchunks){
+            jpost('/api/chunk_done','up='+encodeURIComponent(up)).then(function(r2){
+              if(!r2.json||!r2.json.ok) throw new Error((r2.json&&r2.json.error)||('请求失败('+r2.status+')'));
+              upFile(fi+1);
+            }).catch(reject);
+            return;
+          }
+          var blob=f.slice(c*CHUNK_SIZE,(c+1)*CHUNK_SIZE), tries=0;
+          function retryOrFail(err){
+            if(tries<3){ send(); }
+            else{ reject(new Error(err.message+'（第'+(c+1)+'片，已重试3次仍失败）')); }
+          }
+          function send(){
+            tries++;
+            fetch('/api/chunk?up='+encodeURIComponent(up)+'&i='+c,{method:'POST',body:blob})
+            .then(function(r3){
+              return r3.json().catch(function(){return null;}).then(function(j3){
+                if(j3&&j3.ok){ sent+=blob.size; paint(); upChunk(c+1); }
+                else{ retryOrFail(new Error((j3&&j3.error)||('请求失败('+r3.status+')'))); }
+              });
+            }).catch(function(){ retryOrFail(new Error('网络错误')); });
+          }
+          send();
+        }
+        upChunk(0);
+      }).catch(reject);
+    }
+    paint();
+    upFile(0);
+  });
+}
+"""
 
 # urlencoded 表单最多解析多少个字段：1MB 的 body 全是 a0=1&a1=1… 这种
 # 碎字段时，parse_qs 会造出十几万个 dict 条目（几十 MB 临时内存）。
@@ -740,8 +822,17 @@ def dash_page(shares, user):
 <button class='danger' onclick="delFiles()">删除选中</button>
 </div>""") if is_admin else ""
     users_card = ""
+    # 眼睛：普通用户的明文密码直接嵌进本页（仅管理员可见），点眼睛本地即时显示，
+    # 不再为每次点击发一次网络请求（之前慢就慢在这一次往返上）。
+    upw_json = "{}"
     if is_admin:
         urows = []
+        pw_map = {}
+        with db() as c:
+            for r in c.execute("SELECT id, pw_plain FROM users WHERE is_admin=0"):
+                pw_map[str(r["id"])] = r["pw_plain"] or ""
+        # json 转义后是合法的 JS 字面量；< 转成 \u003c 防止密码里有 </script> 跳出脚本块
+        upw_json = json.dumps(pw_map, ensure_ascii=False).replace("<", "\\u003c")
         for u in list_users():
             remark = (u["remark"] or "").strip()
             rmk = (f"<span class='badge' id='rmk-{u['id']}'>{html.escape(remark)}</span> "
@@ -779,8 +870,10 @@ def dash_page(shares, user):
 <option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>
 <option value='30'>30 天后过期</option><option value='0'>永久有效</option>
 </select></div>
-<button>上传并生成分享链接</button>
-<progress id='sendProg' value='0' max='100' style='display:none'></progress>
+<button id='sendBtn'>上传并生成分享链接</button>
+<div id='sendProgWrap' style='display:none'><progress id='sendProg' value='0' max='100'></progress>
+ <span id='sendPct' class='muted'>0%</span></div>
+<div id='sendStat' class='muted'></div>
 </form><div id='sendRes'></div></div>
 <div class='card'><h2>📥 创建接收链接</h2>
 <p class='muted'>把链接发给对方，对方打开网页上传文件，文件会存到你的服务器上。</p>
@@ -800,6 +893,8 @@ def dash_page(shares, user):
 <input type='password' name='new2' placeholder='重复新密码' required minlength='4'>
 <button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div>
 <script>
+""" + CHUNK_JS + f"""
+var _UPW={upw_json};
 function fullLink(p){{return location.origin + p;}}
 function copyText(t, box){{
   // 剪贴板 API 只在安全上下文（HTTPS / localhost）可用；默认用
@@ -897,7 +992,7 @@ function bindXhr(fid, url, resId, progId, okText){{
     xhr.onload=function(){{
       if(prog)prog.style.display='none';
       try{{var j=JSON.parse(xhr.responseText);
-        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick=\\"copyText(fullLink('"+j.link+"'),this.previousElementSibling)\\">复制链接</button>";
+        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
           setTimeout(()=>location.reload(), 1500);
         }}else{{res.innerHTML="<div class='err'>"+(j.error||'失败')+"</div>";}}
       }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
@@ -906,8 +1001,51 @@ function bindXhr(fid, url, resId, progId, okText){{
     xhr.send(new FormData(f));
   }});
 }}
-bindXhr('sendForm','/api/share','sendRes','sendProg','上传成功，分享链接：');
 bindXhr('recvForm','/api/receive','recvRes',null,'接收链接已生成：');
+// 控制台“发送文件”走分片上传：先建分享拿 sid，再把文件一片片传上去。
+// 大文件不再整文件一次 POST，不会被反代掐（请求失败(522)），
+// 还有实时百分比和“上传完成”提示。
+document.getElementById('sendForm').addEventListener('submit', function(ev){{
+  ev.preventDefault();
+  var form=ev.target, res=document.getElementById('sendRes'),
+      prog=document.getElementById('sendProg'), pct=document.getElementById('sendPct'),
+      stat=document.getElementById('sendStat'), btn=document.getElementById('sendBtn'),
+      wrap=document.getElementById('sendProgWrap');
+  var files=form.querySelector("input[type=file]").files;
+  if(!files.length) return;
+  res.innerHTML=''; btn.disabled=true;
+  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  stat.textContent='创建分享…';
+  var title=form.querySelector("input[name=title]").value,
+      expiry=form.querySelector("select[name=expiry]").value,
+      createdLink=null;
+  fetch('/api/share_create',{{method:'POST',
+    headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'title='+encodeURIComponent(title)+'&expiry='+encodeURIComponent(expiry)}})
+  .then(function(r){{return r.json().then(function(j){{return {{s:r.status,j:j}};}});}})
+  .then(function(x){{
+    if(!x.j.ok) throw new Error(x.j.error||('请求失败('+x.s+')'));
+    stat.textContent='准备上传…';
+    createdLink=x.j.link;
+    return chunkUpload({{sid:x.j.id, kind:'add'}}, files,
+      {{prog:prog, pct:pct, stat:stat}}).then(function(){{return x.j.link;}});
+  }})
+  .then(function(link){{
+    prog.value=100; pct.textContent='100%';
+    stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
+    res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+fullLink(link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
+    setTimeout(()=>location.reload(), 1500);
+  }})
+  .catch(function(err){{
+    btn.disabled=false; stat.textContent='';
+    var html="<div class='err'>"+escapeHtml(err.message||'失败')+"</div>";
+    if(createdLink){{
+      html+="<div class='ok'>已上传的文件已保留，分享链接：</div><div class='linkbox'>"
+        +fullLink(createdLink)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
+    }}
+    res.innerHTML=html;
+  }});
+}});
 // 表单 POST 通用封装：手动拼 application/x-www-form-urlencoded，
 // 不依赖 new FormData 迭代；提交时按钮禁用并显示“处理中”，
 // 任何失败（HTTP 错误、返回非 JSON、网络错误）都在页面上明确提示，
@@ -1004,31 +1142,28 @@ function saveRemark(id){{
 function togglePw(id, btn){{
   var box=document.getElementById('upw-'+id);
   if(box.dataset.open==='1'){{box.innerHTML='';box.dataset.open='';btn.textContent='👁';return;}}
-  fetch('/api/user_pw',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)}})
-    .then(r=>r.json()).then(j=>{{
-      if(!j.ok){{alert(j.error||'查看失败');return;}}
-      box.dataset.open='1'; btn.textContent='👁‍🗨';
-      box.innerHTML='';
-      var t=document.createElement('span');
-      t.className='muted'; t.textContent='密码：';
-      var b=document.createElement('b');
-      b.textContent=j.pw||'（老账号，明文未知，改一次密码后可见）';
-      var cp=document.createElement('button');
-      cp.className='ghost'; cp.textContent='复制'; cp.style.marginLeft='8px';
-      cp.onclick=function(){{
-        var done=function(){{cp.textContent='已复制';}};
-        if(navigator.clipboard&&navigator.clipboard.writeText){{
-          navigator.clipboard.writeText(j.pw).then(done,function(){{cp.textContent='复制失败';}});
-        }}else{{
-          var ta=document.createElement('textarea');ta.value=j.pw;document.body.appendChild(ta);
-          ta.select();try{{document.execCommand('copy');done();}}catch(e){{cp.textContent='复制失败';}}
-          document.body.removeChild(ta);
-        }}
-      }};
-      box.appendChild(t); box.appendChild(b);
-      if(j.pw)box.appendChild(cp);
-    }});
+  // 密码已随页面下发（var _UPW），本地直接显示，不发请求，点开即现
+  var pw=(_UPW||{{}})[String(id)];
+  box.dataset.open='1'; btn.textContent='👁‍🗨';
+  box.innerHTML='';
+  var t=document.createElement('span');
+  t.className='muted'; t.textContent='密码：';
+  var b=document.createElement('b');
+  b.textContent=pw||'（老账号，明文未知，改一次密码后可见）';
+  var cp=document.createElement('button');
+  cp.className='ghost'; cp.textContent='复制'; cp.style.marginLeft='8px';
+  cp.onclick=function(){{
+    var done=function(){{cp.textContent='已复制';}};
+    if(navigator.clipboard&&navigator.clipboard.writeText){{
+      navigator.clipboard.writeText(pw).then(done,function(){{cp.textContent='复制失败';}});
+    }}else{{
+      var ta=document.createElement('textarea');ta.value=pw;document.body.appendChild(ta);
+      ta.select();try{{document.execCommand('copy');done();}}catch(e){{cp.textContent='复制失败';}}
+      document.body.removeChild(ta);
+    }}
+  }};
+  box.appendChild(t); box.appendChild(b);
+  if(pw)box.appendChild(cp);
 }}
 var _uaf=document.getElementById('userAddForm');
 if(_uaf){{_uaf.addEventListener('submit', function(ev){{
@@ -1064,16 +1199,10 @@ def share_page(sid, share, files, user=None):
     for f in files:
         name = html.escape(f["filename"])
         kind = _view_kind(f["filename"])
+        # 图片和视频都不在页面里直接内联显示：之前 <img> 会让浏览器打开分享页
+        # 就自动下载显示所有图片；<video> 即使 preload='none' 也会渲染出播放器。
+        # 没点"查看"就不加载任何媒体内容，只留"查看"按钮，点了才看。
         media = ""
-        if kind == "img":
-            media = (f"<a href='/s/{sid}/v/{f['id']}' target='_blank'>"
-                     f"<img src='/s/{sid}/v/{f['id']}' loading='lazy' alt='{name}' "
-                     "style='max-width:100%;max-height:340px;border-radius:8px;"
-                     "display:block;margin-bottom:8px'></a>")
-        elif kind == "vid":
-            media = (f"<video controls preload='metadata' src='/s/{sid}/v/{f['id']}' "
-                     "style='max-width:100%;max-height:340px;border-radius:8px;"
-                     "display:block;margin-bottom:8px'></video>")
         view_btn = (f"<a href='/s/{sid}/v/{f['id']}' target='_blank'>"
                     "<button class='ghost'>查看</button></a> " if kind else "")
         del_btn = (f"<button class='ghost' onclick='delShareFile({f['id']},this)'>删除</button> "
@@ -1083,11 +1212,13 @@ def share_page(sid, share, files, user=None):
 <div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div></div>""")
     add_form = ""
     if manage:
-        add_form = """<div class='card' style='max-width:560px;margin:16px auto'>
+        add_form = ("""<div class='card' style='max-width:560px;margin:16px auto'>
 <h3>➕ 添加文件</h3>
 <form id='addForm'><input type='file' name='file' multiple required>
-<button>上传</button>
-<progress id='addProg' value='0' max='100' style='display:none'></progress></form>
+<button id='addBtn'>上传</button>
+<div id='addProgWrap' style='display:none'><progress id='addProg' value='0' max='100'></progress>
+ <span id='addPct' class='muted'>0%</span></div>
+<div id='addStat' class='muted'></div></form>
 <div id='addRes'></div></div>
 <script>
 function delShareFile(fid, el){
@@ -1103,23 +1234,30 @@ function delShareFile(fid, el){
   })
   .catch(function(){ el.disabled = false; alert('请求失败'); });
 }
+""" + CHUNK_JS + """
 document.getElementById('addForm').addEventListener('submit', function(ev){
   ev.preventDefault();
-  var res=document.getElementById('addRes'), prog=document.getElementById('addProg');
-  res.innerHTML=''; prog.style.display='block'; prog.value=0;
-  var xhr=new XMLHttpRequest(); xhr.open('POST', location.pathname+'/add');
-  xhr.upload.onprogress=function(e){if(e.lengthComputable)prog.value=e.loaded/e.total*100;};
-  xhr.onload=function(){
-    prog.style.display='none';
-    try{var j=JSON.parse(xhr.responseText);
-      if(j.ok) location.reload();
-      else res.innerHTML="<div class='err'>"+(j.error||'上传失败')+"</div>";
-    }catch(e){res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}
-  };
-  xhr.onerror=function(){prog.style.display='none';res.innerHTML="<div class='err'>网络错误</div>";};
-  xhr.send(new FormData(this));
+  var res=document.getElementById('addRes'), prog=document.getElementById('addProg'),
+      pct=document.getElementById('addPct'), stat=document.getElementById('addStat'),
+      btn=document.getElementById('addBtn'), wrap=document.getElementById('addProgWrap');
+  var files=ev.target.querySelector("input[type=file]").files;
+  if(!files.length) return;
+  res.innerHTML=''; btn.disabled=true;
+  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  stat.textContent='准备上传…';
+  // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
+  // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
+  chunkUpload({sid:'""" + sid + """', kind:'add'}, files,
+    {prog:prog, pct:pct, stat:stat}).then(function(){
+      prog.value=100; pct.textContent='100%';
+      stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
+      setTimeout(function(){location.reload();}, 900);
+    }).catch(function(err){
+      btn.disabled=false; stat.textContent='';
+      res.innerHTML="<div class='err'>"+escapeHtml(err.message||'上传失败')+"</div>";
+    });
 });
-</script>"""
+</script>""")
     return page("下载文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📥 {html.escape(share['title'] or '文件分享')}</h1>
 <p class='muted'>共 {len(files)} 个文件 · 到期：{htime(share['expires'])}</p>
@@ -1128,32 +1266,42 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
 
 def receive_page(sid, share):
     limit, _ = upload_limit()
+    up_script = ("""<script>
+""" + CHUNK_JS + """
+document.getElementById('upForm').addEventListener('submit', function(ev){
+  ev.preventDefault();
+  var res=document.getElementById('res'), prog=document.getElementById('prog'),
+      pct=document.getElementById('upPct'), stat=document.getElementById('upStat'),
+      btn=document.getElementById('upBtn'), wrap=document.getElementById('upProgWrap');
+  var files=ev.target.querySelector("input[type=file]").files;
+  if(!files.length) return;
+  res.innerHTML=''; btn.disabled=true;
+  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  stat.textContent='准备上传…';
+  // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
+  // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
+  chunkUpload({sid:'""" + sid + """', kind:'upload'}, files,
+    {prog:prog, pct:pct, stat:stat}).then(function(){
+      prog.value=100; pct.textContent='100%';
+      stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
+      res.innerHTML="<div class='ok'>上传成功，对方已可收到 ✅</div>";
+    }).catch(function(err){
+      btn.disabled=false; stat.textContent='';
+      res.innerHTML="<div class='err'>"+escapeHtml(err.message||'上传失败')+"</div>";
+    });
+});
+</script>""")
     return page("上传文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📤 {html.escape(share['title'] or '文件接收')}</h1>
 <p class='muted'>选择文件上传，上传完成后对方即可收到。到期：{htime(share['expires'])}</p>
 <p class='muted'>📦最大可上传 <b>{hsize(limit)}</b>文件</p>
 <form id='upForm'><input type='file' name='file' multiple required>
-<button>开始上传</button>
-<progress id='prog' value='0' max='100' style='display:none'></progress></form>
+<button id='upBtn'>开始上传</button>
+<div id='upProgWrap' style='display:none'><progress id='prog' value='0' max='100'></progress>
+ <span id='upPct' class='muted'>0%</span></div>
+<div id='upStat' class='muted'></div></form>
 <div id='res'></div></div>
-<script>
-document.getElementById('upForm').addEventListener('submit', function(ev){{
-  ev.preventDefault();
-  var res=document.getElementById('res'), prog=document.getElementById('prog');
-  res.innerHTML=''; prog.style.display='block'; prog.value=0;
-  var xhr=new XMLHttpRequest(); xhr.open('POST', location.pathname+'/upload');
-  xhr.upload.onprogress=function(e){{if(e.lengthComputable)prog.value=e.loaded/e.total*100;}};
-  xhr.onload=function(){{
-    prog.style.display='none';
-    try{{var j=JSON.parse(xhr.responseText);
-      res.innerHTML = j.ok ? "<div class='ok'>上传成功，共 "+j.count+" 个文件 ✅</div>"
-                           : "<div class='err'>"+(j.error||'上传失败')+"</div>";
-    }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
-  }};
-  xhr.onerror=function(){{prog.style.display='none';res.innerHTML="<div class='err'>网络错误</div>";}};
-  xhr.send(new FormData(this));
-}});
-</script>""")
+""" + up_script)
 
 def not_found():
     return page("不存在", "<div class='card' style='max-width:420px;margin:40px auto'><h1>😅 链接不存在或已过期</h1><p class='muted'>请检查链接是否正确，或联系分享者。</p></div>")
@@ -1349,6 +1497,62 @@ class Handler(BaseHTTPRequestHandler):
         # 建链接这个动作本身不占磁盘，不该被磁盘剩余空间卡住。
         limit = cap if cap is not None else upload_limit()[0]
         return parse_multipart(self.rfile, n, boundary, limit)
+
+    # ---- 分片上传 ----
+    def _chunk_state(self):
+        st = getattr(self.server, "_chunk", None)
+        if st is None:
+            # 防御：极少数情况下 Handler 没走 Server.__init__
+            # （比如单测直接调方法），现场补一个。
+            self.server._chunk = {}
+            self.server._chunk_lock = threading.Lock()
+            st = self.server._chunk
+        return st, self.server._chunk_lock
+
+    def _chunk_sweep(self, now):
+        # 清理过期没传完的会话与其临时文件
+        st, lock = self._chunk_state()
+        with lock:
+            dead = [t for t, e in st.items() if e["expires"] <= now]
+            for t in dead:
+                e = st.pop(t)
+                try:
+                    os.unlink(e["tmp"])
+                except OSError:
+                    pass
+
+    def _chunk_finalize(self, e):
+        # 分片收齐后落盘入库：与普通上传走同样的 files 表结构。
+        # 传的过程中分享可能过期/被删：这时文件不能入库，删临时文件。
+        want = "send" if e["kind"] == "add" else "receive"
+        if not self._valid_share(e["sid"], want):
+            try:
+                os.unlink(e["tmp"])
+            except OSError:
+                pass
+            return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+        stored = secrets.token_hex(16)
+        try:
+            os.rename(e["tmp"], os.path.join(FILES_DIR, stored))
+        except OSError:
+            try:
+                os.unlink(e["tmp"])
+            except OSError:
+                pass
+            return self._json({"ok": False, "error": "保存失败，请重试"}, 500)
+        now = int(time.time())
+        try:
+            with db() as c:
+                c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                          " VALUES(?,?,?,?,?)",
+                          (e["sid"], e["filename"], stored, e["size"], now))
+        except Exception:
+            try:
+                os.unlink(os.path.join(FILES_DIR, stored))
+            except OSError:
+                pass
+            raise
+        return self._json({"ok": True})
 
     def _send_file(self, path, filename):
         size = os.path.getsize(path)
@@ -1707,6 +1911,26 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 return self._json({"ok": True, "link": f"/s/{sid}", "id": sid})
 
+            if p == "/api/share_create":
+                # 分片上传配套：先只建分享（不收文件），返回 sid；
+                # 前端随后用 /api/chunk_init?kind=add 把文件一片片传上来。
+                # （控制台“发送文件”大文件走这个流程，避免整文件一次
+                # POST 被反代掐掉。）
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                title = (f.get("title") or "").strip()[:100]
+                days = _expiry_days(f.get("expiry"))
+                now = int(time.time())
+                sid = new_share_id()
+                with db() as c:
+                    c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                              " VALUES(?,?,?,?,?,?)",
+                              (sid, "send", title, now,
+                               now + days * 86400 if days else 0, user["id"]))
+                return self._json({"ok": True, "link": f"/s/{sid}", "id": sid})
+
             if p == "/api/receive":
                 user = self._require_auth()
                 if not user:
@@ -1953,6 +2177,180 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 return self._json({"ok": True, "count": len(files)})
 
+            if p == "/api/chunk_init":
+                # 分片上传第 1 步：建会话。kind=add 给分享追加文件（要登录且
+                # 是本人/管理员），kind=upload 走接收链接（免登录）。
+                # _form() 已经把小 body 读完，后面 early return 不用关连接。
+                f = self._form()
+                sid = f.get("sid", "")
+                kind = f.get("kind", "")
+                name = _clean_filename(f.get("name", ""))
+                try:
+                    size = int(f.get("size", "-1"))
+                    chunks = int(f.get("chunks", "0"))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                if kind == "add":
+                    user = self._require_auth()
+                    if not user:
+                        return
+                    s = self._valid_share(sid, "send")
+                    if not s:
+                        return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    if not can_manage_share(user, s):
+                        return self._json({"ok": False, "error": "只能操作自己的分享"}, 403)
+                elif kind == "upload":
+                    s = self._valid_share(sid, "receive")
+                    if not s:
+                        return self._json({"ok": False, "error": "链接不存在或已过期"}, 404)
+                else:
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                # 片数必须与大小自洽：防止客户端谎报
+                expect = (size + CHUNK_SIZE - 1) // CHUNK_SIZE if size > 0 else 1
+                if size < 0 or chunks != expect:
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                limit = upload_limit()[0]
+                if size > limit:
+                    return self._json({"ok": False, "error": too_large_msg()}, 413)
+                now = int(time.time())
+                self._chunk_sweep(now)
+                token = secrets.token_hex(16)
+                tmp = os.path.join(FILES_DIR, "chunk_" + token)
+                try:
+                    open(tmp, "wb").close()
+                except OSError:
+                    return self._json({"ok": False, "error": "服务器错误"}, 500)
+                st, lock = self._chunk_state()
+                with lock:
+                    st[token] = {"sid": sid, "kind": kind, "filename": name,
+                                 "size": size, "chunks": chunks, "next": 0,
+                                 "recvd": 0, "tmp": tmp,
+                                 "expires": now + CHUNK_TTL}
+                return self._json({"ok": True, "up": token})
+
+            if p == "/api/chunk":
+                # 分片上传第 2 步：收一片。body 就是分片的原始字节，
+                # 不是 multipart，解析开销最小。
+                q = parse_qs(urlparse(self.path).query)
+                token = (q.get("up") or [""])[0]
+                idx_s = (q.get("i") or [""])[0]
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    idx = int(idx_s)
+                except (TypeError, ValueError):
+                    self._close_if_body_pending()
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                st, lock = self._chunk_state()
+                now = time.time()
+                with lock:
+                    e = st.get(token)
+                    live = e is not None and e["expires"] > now
+                    # 正常收片：序号必须等于 next，且不能超出总片数。
+                    # 另允许重发上一片：客户端某片成功后若没收到响应会重传
+                    # 该片，直接回成功（不重复写盘），否则一次丢包就导致
+                    # 整个文件重传。
+                    dup = (live and idx >= 0 and e["next"] > 0
+                           and idx == e["next"] - 1
+                           and n == e.get("last_n", -1))
+                    if live and not dup and idx == e["next"] and idx < e["chunks"]:
+                        expect_n = min(CHUNK_SIZE, e["size"] - e["recvd"])
+                    else:
+                        expect_n = -1
+                if not live or (not dup and (n != expect_n or n < 0 or n > CHUNK_SIZE)):
+                    # 序号/大小对不上：不读 body，直接关连接，客户端
+                    # 重传这一片即可（body 最多 4MB，但恶意请求可能谎报
+                    # 超大 Content-Length，不能无脑读完）。
+                    return self._fail_close(
+                        {"ok": False, "error": "分片已失效，请重新上传"}, 400)
+                try:
+                    # 先把 body 读进内存（不持锁，网络读可能慢），再持锁
+                    # 校验+写盘：杜绝两个并发请求带同序号导致重复追加。
+                    buf = bytearray()
+                    remain = n
+                    while remain > 0:
+                        data = self.rfile.read(min(65536, remain))
+                        if not data:
+                            raise BadUpload("truncated chunk")
+                        buf += data
+                        remain -= len(data)
+                except BadUpload:
+                    return self._fail_close(
+                        {"ok": False, "error": "分片接收失败，请重试"}, 400)
+                with lock:
+                    e2 = st.get(token)
+                    if e2 is None or e2["expires"] <= time.time():
+                        return self._json(
+                            {"ok": False, "error": "分片已失效，请重新上传"}, 400)
+                    redup = (idx >= 0 and e2["next"] > 0
+                             and idx == e2["next"] - 1
+                             and n == e2.get("last_n", -1))
+                    if idx == e2["next"] and idx < e2["chunks"]:
+                        try:
+                            with open(e2["tmp"], "ab") as out:
+                                out.write(buf)
+                        except OSError as oe:
+                            # 写盘失败（最常见是磁盘满了）：整个上传会话作废，
+                            # 删临时文件，给明确提示而不是笼统的服务器错误。
+                            # 会话已 pop，sweep 也不会再碰它。
+                            st.pop(token, None)
+                            try:
+                                os.unlink(e2["tmp"])
+                            except OSError:
+                                pass
+                            if oe.errno == errno.ENOSPC:
+                                return self._json(
+                                    {"ok": False,
+                                     "error": "服务器磁盘空间不足，上传失败"}, 507)
+                            raise
+                        e2["recvd"] += n
+                        e2["next"] += 1
+                        e2["last_n"] = n
+                    elif not redup:
+                        return self._json(
+                            {"ok": False, "error": "分片已失效，请重新上传"}, 400)
+                    # 每片成功都顺延过期时间：大文件传得慢也不怕 2 小时不够
+                    e2["expires"] = time.time() + CHUNK_TTL
+                    recvd = e2["recvd"]
+                return self._json({"ok": True, "recvd": recvd})
+
+            if p == "/api/chunk_done":
+                # 分片上传第 3 步：收齐确认，落盘入库
+                f = self._form()
+                token = f.get("up", "")
+                if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+                    return self._json({"ok": False, "error": "上传会话无效"}, 400)
+                st, lock = self._chunk_state()
+                with lock:
+                    e = st.pop(token, None)
+                if (e is None or e["expires"] <= time.time()
+                        or e["recvd"] != e["size"]):
+                    if e is not None:
+                        try:
+                            os.unlink(e["tmp"])
+                        except OSError:
+                            pass
+                    return self._json({"ok": False, "error": "上传不完整，请重新上传"}, 400)
+                if e["kind"] == "add":
+                    # 完成阶段重新鉴权：初始化时有权限，不代表传完时还有。
+                    # 用户可能被删、会话可能失效、分享可能易主——这时不能入库。
+                    # 注意：会话已从内存 pop，无论鉴权成败都要删临时文件，
+                    # 否则 sweep 也清不到，会永久占磁盘。
+                    user = self._require_auth()
+                    if not user:
+                        try:
+                            os.unlink(e["tmp"])
+                        except OSError:
+                            pass
+                        return
+                    s = self._valid_share(e["sid"], "send")
+                    if not s or not can_manage_share(user, s):
+                        try:
+                            os.unlink(e["tmp"])
+                        except OSError:
+                            pass
+                        return self._json({"ok": False, "error": "无权限或分享已失效"}, 403)
+                return self._chunk_finalize(e)
+
             # 未知路径：body 没读的话关连接，防残留污染 keep-alive
             self._close_if_body_pending()
             return self._json({"ok": False, "error": "unknown"}, 404)
@@ -1991,6 +2389,10 @@ class Server(ThreadingHTTPServer):
         # 每个用例起一个新 Server 就不会互相污染。
         self._login_fail = {}
         self._login_lock = threading.Lock()
+        # 分片上传会话：token -> {sid,kind,filename,size,chunks,next,
+        # recvd,tmp,expires}。放 Server 实例上，测试里每个 Server 互不干扰。
+        self._chunk = {}
+        self._chunk_lock = threading.Lock()
         super().__init__(server_address, handler, bind_and_activate)
 
     def get_request(self):
@@ -2046,6 +2448,17 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--check":
         sys.exit(check_server(sys.argv[2], int(sys.argv[3])))
     init_db()
+    # 启动时清理上次异常退出留下的分片临时文件：内存里的上传会话
+    # 已丢失，这些 chunk_* 文件永远不会被认领，不清会一直占磁盘。
+    try:
+        for fn in os.listdir(FILES_DIR):
+            if fn.startswith("chunk_"):
+                try:
+                    os.unlink(os.path.join(FILES_DIR, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
     cleanup_expired()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     srv = Server((HOST, PORT), Handler)
