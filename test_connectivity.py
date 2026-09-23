@@ -274,7 +274,7 @@ class Connectivity(unittest.TestCase):
         with patch.object(app.os, "statvfs", side_effect=OSError("boom")):
             limit, free = app.upload_limit()
             self.assertEqual(limit, app.MAX_UPLOAD)
-            self.assertEqual(free, 0)
+            self.assertIsNone(free)
 
     def test_file_at_displayed_limit_is_accepted(self):
         # 回归测试：上限按"实际文件字节数"执行，multipart 信封开销不计入。
@@ -1500,6 +1500,318 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(st_new, 302)
             self.assertEqual(st_old, 200)
 
+    # ---- 小工具 ----
+    def _login_as(self, port, pw):
+        # 只登录（用户已由 create_user 建好），不重复创建
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/login",
+                  body=urllib.parse.urlencode({"pw": pw}).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 302)
+        ck = r.getheader("Set-Cookie").split(";")[0]
+        c.close()
+        return ck
+
+    def _post(self, port, path, fields, cookie):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", path,
+                  body=urllib.parse.urlencode(fields).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded",
+                           "Cookie": cookie})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, json.loads(body)
+
+    def _upload_share(self, port, cookie, filename, data, ctype):
+        boundary = "TSTBND"
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                f"filename=\"{filename}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
+        body += data + f"\r\n--{boundary}--\r\n".encode()
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/api/share", body=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                           "Cookie": cookie})
+        r = c.getresponse()
+        j = json.loads(r.read())
+        c.close()
+        self.assertTrue(j["ok"])
+        return j["id"]
+
+    # ---- PDF 在线查看 ----
+    def test_pdf_has_view_button_and_inline_view(self):
+        # 回归：PDF 在分享页要有"查看"按钮（之前只有下载），
+        # 点开后浏览器内联打开（application/pdf + inline），而不是下载。
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "pdf_admin")
+            pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+            sid = self._upload_share(port, cookie, "322.pdf", pdf, "application/pdf")
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", f"/s/{sid}")
+            r = c.getresponse()
+            page = r.read().decode("utf-8")
+            c.close()
+            self.assertEqual(r.status, 200)
+            m = re.search(r"/s/%s/v/(\d+)" % sid, page)
+            self.assertIsNotNone(m, "分享页没有 PDF 的查看链接")
+            self.assertIn("查看</button>", page)
+            # 列表里不内联嵌入整个 PDF（太重），只给按钮
+            self.assertNotIn("<embed", page)
+            self.assertNotIn("<iframe", page)
+            fid = m.group(1)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", f"/s/{sid}/v/{fid}")
+            r = c.getresponse()
+            data = r.read()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.getheader("Content-Type"), "application/pdf")
+            self.assertIn("inline", r.getheader("Content-Disposition"))
+            self.assertEqual(data, pdf)
+            c.close()
+
+    def test_pdf_view_supports_range(self):
+        # PDF 阅读器打开大文件时会发 Range 分片请求，必须 206
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "pdf2_admin")
+            pdf = b"%PDF-1.4\n" + b"x" * 5000 + b"\n%%EOF"
+            sid = self._upload_share(port, cookie, "a.pdf", pdf, "application/pdf")
+            with app.db() as c:
+                fid = c.execute("SELECT id FROM files WHERE share_id=?", (sid,)).fetchone()["id"]
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", f"/s/{sid}/v/{fid}", headers={"Range": "bytes=0-99"})
+            r = c.getresponse()
+            data = r.read()
+            c.close()
+            self.assertEqual(r.status, 206)
+            self.assertEqual(data, pdf[:100])
+
+    def test_txt_view_still_forces_download(self):
+        # 非图片/视频/PDF（比如 txt）走查看接口仍强制下载：防 MIME 混淆，原有行为不变
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "pdf3_admin")
+            sid = self._upload_share(port, cookie, "note.txt", b"hello", "text/plain")
+            with app.db() as c:
+                fid = c.execute("SELECT id FROM files WHERE share_id=?", (sid,)).fetchone()["id"]
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", f"/s/{sid}/v/{fid}")
+            r = c.getresponse()
+            r.read()
+            c.close()
+            self.assertEqual(r.status, 200)
+            self.assertIn("attachment", r.getheader("Content-Disposition"))
+            # 分享页上 txt 没有查看按钮
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", f"/s/{sid}")
+            page = c.getresponse().read().decode("utf-8")
+            c.close()
+            self.assertNotIn("查看</button>", page)
+
+    # ---- 备注名 ----
+    def test_user_remark_add_set_and_list(self):
+        # 备注名：建用户时带 remark，之后改备注，list_users 读到最新值；
+        # 全空白视为清除
+        app.create_user("rmk_admin", is_admin=True)
+        u = app.create_user("rmk_user1", remark="张三")
+        users = {x["id"]: x for x in app.list_users()}
+        self.assertEqual(users[u["id"]]["remark"], "张三")
+        app.set_user_remark(u["id"], "李四")
+        users = {x["id"]: x for x in app.list_users()}
+        self.assertEqual(users[u["id"]]["remark"], "李四")
+        app.set_user_remark(u["id"], "   ")
+        users = {x["id"]: x for x in app.list_users()}
+        self.assertEqual(users[u["id"]]["remark"], "")
+
+    def test_user_add_api_with_remark(self):
+        # /api/user_add 带 remark 字段：存进数据库
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "rmk2_admin")
+            st, j = self._post(port, "/api/user_add",
+                               {"pw1": "rmk2_user", "pw2": "rmk2_user", "remark": "王五"},
+                               cookie)
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            users = {x["id"]: x for x in app.list_users()}
+            self.assertEqual(users[j["id"]]["remark"], "王五")
+
+    def test_user_remark_api(self):
+        # 管理员改备注成功；普通用户调接口 403 且改不掉
+        with self.server("127.0.0.1") as port:
+            acookie = self._login_cookie(port, "rmk3_admin")
+            u = app.create_user("rmk3_user", remark="原备注")
+            ucookie = self._login_as(port, "rmk3_user")
+            st, j = self._post(port, "/api/user_remark",
+                               {"id": u["id"], "remark": "赵六"}, acookie)
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            users = {x["id"]: x for x in app.list_users()}
+            self.assertEqual(users[u["id"]]["remark"], "赵六")
+            st, j = self._post(port, "/api/user_remark",
+                               {"id": u["id"], "remark": "黑客"}, ucookie)
+            self.assertEqual(st, 403)
+            users = {x["id"]: x for x in app.list_users()}
+            self.assertEqual(users[u["id"]]["remark"], "赵六")
+
+    def test_user_remark_xss_escaped(self):
+        # 备注名里的 HTML 必须转义，不能注入脚本
+        app.create_user("rmk4_admin", is_admin=True)
+        u = app.create_user("rmk4_user", remark="<script>alert(1)</script>")
+        page = app.dash_page([], {"id": 1, "is_admin": True}).decode("utf-8")
+        m = re.search(r"id='rmk-%d'>(.*?)</span>" % u["id"], page)
+        self.assertIsNotNone(m)
+        self.assertNotIn("<script>", m.group(1))
+        self.assertIn("&lt;script&gt;", m.group(1))
+
+    def test_remark_and_pwplain_migration(self):
+        # 老库（没有 remark / pw_plain 列）：init_db 自动补上，不丢数据
+        import sqlite3
+        dbp = os.path.join(self.tmp.name, "old.db")
+        con = sqlite3.connect(dbp)
+        con.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, pw TEXT, is_admin INTEGER, created INTEGER)")
+        con.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)", ("x", 1, 1))
+        con.commit()
+        con.close()
+        app.DB_PATH = dbp
+        app.init_db()
+        cols = [r[1] for r in sqlite3.connect(dbp).execute("PRAGMA table_info(users)")]
+        self.assertIn("remark", cols)
+        self.assertIn("pw_plain", cols)
+
+    def test_dash_remark_ui_only_for_admin(self):
+        # 备注输入框/改备注按钮只出现在管理员的控制台
+        app.create_user("rmk5_admin", is_admin=True)
+        app.create_user("rmk5_user")
+        pa = app.dash_page([], {"id": 1, "is_admin": True}).decode("utf-8")
+        pn = app.dash_page([], {"id": 2, "is_admin": False}).decode("utf-8")
+        self.assertIn("name='remark'", pa)
+        self.assertIn('onclick="editRemark(', pa)
+        self.assertNotIn('onclick="editRemark(', pn)
+        self.assertNotIn("👥 用户管理</h2>", pn)
+
+    # ---- 眼睛：管理员查看用户密码 ----
+    def test_admin_can_view_user_pw(self):
+        # 眼睛：管理员能看到用户当前明文密码
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "eye_admin")
+            u = app.create_user("eye_user1")
+            st, j = self._post(port, "/api/user_pw", {"id": u["id"]}, cookie)
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            self.assertEqual(j["pw"], "eye_user1")
+
+    def test_admin_view_pw_follows_changes(self):
+        # 用户自己改密码 / 管理员重设后，眼睛看到的永远是最新密码
+        with self.server("127.0.0.1") as port:
+            acookie = self._login_cookie(port, "eye2_admin")
+            u = app.create_user("eye2_user")
+            ucookie = self._login_as(port, "eye2_user")
+            st, j = self._post(port, "/api/chpw",
+                               {"new1": "eye2_newpw", "new2": "eye2_newpw"}, ucookie)
+            self.assertEqual(st, 200)
+            st, j = self._post(port, "/api/user_pw", {"id": u["id"]}, acookie)
+            self.assertEqual(j["pw"], "eye2_newpw")
+            st, j = self._post(port, "/api/user_resetpw",
+                               {"id": u["id"], "pw1": "eye2_rst", "pw2": "eye2_rst"},
+                               acookie)
+            self.assertEqual(st, 200)
+            st, j = self._post(port, "/api/user_pw", {"id": u["id"]}, acookie)
+            self.assertEqual(j["pw"], "eye2_rst")
+
+    def test_user_pw_admin_only(self):
+        # 普通用户不能看任何人的密码；管理员也不能看管理员账号的
+        with self.server("127.0.0.1") as port:
+            acookie = self._login_cookie(port, "eye3_admin")
+            u = app.create_user("eye3_user")
+            ucookie = self._login_as(port, "eye3_user")
+            st, _ = self._post(port, "/api/user_pw", {"id": u["id"]}, ucookie)
+            self.assertEqual(st, 403)
+            st, _ = self._post(port, "/api/user_pw", {"id": 1}, acookie)
+            self.assertEqual(st, 403)
+
+    def test_user_pw_old_account_empty(self):
+        # 老版本迁移来的账号明文未知：返回空串，前端提示改一次密码后可见
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "eye4_admin")
+            with app.db() as c:
+                c.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)",
+                          (app.hash_pw("eye4_old"), 0, 1))
+                uid = c.execute("SELECT id FROM users WHERE is_admin=0").fetchone()["id"]
+            st, j = self._post(port, "/api/user_pw", {"id": uid}, cookie)
+            self.assertEqual(st, 200)
+            self.assertEqual(j["pw"], "")
+
+    def test_eye_button_only_for_admin(self):
+        # 眼睛按钮只在管理员控制台出现，普通用户页面没有任何痕迹
+        app.create_user("eye5_admin", is_admin=True)
+        app.create_user("eye5_user")
+        pa = app.dash_page([], {"id": 1, "is_admin": True}).decode("utf-8")
+        pn = app.dash_page([], {"id": 2, "is_admin": False}).decode("utf-8")
+        self.assertIn('onclick="togglePw(', pa)
+        self.assertNotIn('onclick="togglePw(', pn)
+        self.assertNotIn("/api/user_pw", pn.split("<script>")[0])
+
+    # ---- 未读请求体必须关连接（防 keep-alive 污染） ----
+    def test_unread_body_closes_connection(self):
+        # 回归：鉴权/参数检查失败直接返回、但请求体没读时，
+        # 必须发 Connection: close，否则残留 body 会污染同一 keep-alive
+        # 连接上的下一个请求（实测：/s/<sid>/add 404 后，下一个请求被
+        # multipart 残留 body 污染成 400）。
+        with self.server("127.0.0.1") as port:
+            acookie = self._login_cookie(port, "cc_admin")
+            u = app.create_user("cc_user")
+            ucookie = self._login_as(port, "cc_user")
+            big = "x" * 5000
+            cases = [
+                ("/s/deadbeef/add", acookie, 404),  # 分享不存在
+                ("/api/user_add", ucookie, 403),    # 普通用户调管理员接口
+                ("/logout", acookie, 302),          # POST logout 带 body
+            ]
+            for path, cookie, st in cases:
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", path, body=big.encode(),
+                          headers={"Content-Type": "text/plain", "Cookie": cookie})
+                r = c.getresponse()
+                r.read()
+                self.assertEqual(r.status, st, path)
+                self.assertEqual(r.getheader("Connection"), "close", path)
+                c.close()
+
+    def test_dead_add_closes_socket(self):
+        # 更直接的证明：发完带 body 的 404 后，服务端真关掉 socket（读到 EOF），
+        # 而不是留着连接让残留 body 污染下一个请求
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "cc2_admin")
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            body = b"x" * 3000
+            req = (f"POST /s/deadbeef/add HTTP/1.1\r\nHost: x\r\n"
+                   f"Cookie: {cookie}\r\nContent-Type: text/plain\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n"
+                   ).encode() + body
+            s.sendall(req)
+            s.settimeout(3)
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            head = data.split(b"\r\n\r\n")[0].decode("latin1")
+            self.assertIn("404", head.split("\r\n")[0])
+            self.assertIn("Connection: close", head)
+            # 能读到 EOF = 服务端关了连接；旧代码会一直挂着等下一个请求
+
+    # ---- statvfs 失败 ----
+    def test_too_large_msg_no_disk(self):
+        # 磁盘信息未知时 413 文案不能谎称"剩余 0B"
+        with patch.object(app.os, "statvfs", side_effect=OSError("nope")):
+            msg = app.too_large_msg()
+            self.assertNotIn("0B", msg)
+            self.assertIn("超出上限", msg)
+            foot = app.disk_foot()
+            self.assertIn("磁盘信息不可用", foot)
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
@@ -1796,8 +2108,14 @@ class HTTPSConfig(unittest.TestCase):
             caddyfile.write_text('original caddy config\n')
             bin_dir = root / 'bin'
             bin_dir.mkdir()
+            # 注意：假 systemctl 必须"真实"——restart 失败后 is-active 也要失败。
+            # 新版脚本里 restart 失败不再被 set -e 直接掐死（|| true），而是由
+            # [8b] 的 is-active 检查来发现失败并回滚；假 is-active 永远成功
+            # 会让失败路径测不到。
             commands = {'sleep': 'exit 0', 'systemctl':
-                        'if [ "$1 $2" = "restart caddy" ] && [ "$FAIL_CADDY" = 1 ]; then exit 1; fi\nexit 0'}
+                        'if [ "$1 $2" = "restart caddy" ] && [ "$FAIL_CADDY" = 1 ]; then exit 1; fi\n'
+                        'if [ "$1 $2" = "is-active --quiet" ] && [ "$FAIL_CADDY" = 1 ]; then exit 1; fi\nexit 0',
+                        'journalctl': 'exit 1'}
             if sys.platform == 'darwin':
                 commands['sed'] = 'if [ "$1" = -i ]; then shift; exec /usr/bin/sed -i "" "$@"; else exec /usr/bin/sed "$@"; fi'
             for name, body in commands.items():
@@ -1902,6 +2220,61 @@ class HTTPSConfig(unittest.TestCase):
         r = self.run_dns_check(block, '0')
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn('STILL_ALIVE', r.stdout)
+
+    def port_check_block(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('for p in 80 443; do')
+        end = text.index('echo "80/443 端口空闲.')
+        return text[start:end]
+
+    def run_port_check(self, listen, port):
+        block = self.port_check_block()
+        script = 'set -eu\n_LISTEN="$1"\nPORT="$2"\n' + block + '\necho STILL_ALIVE'
+        return subprocess.run(['sh', '-c', script, 'sh', listen, port],
+                              capture_output=True, text=True, timeout=10)
+
+    def test_port_check_detects_minishare_itself(self):
+        # 回归：minishare 自己就装在 80/443 上时，提示必须说"重装换端口"，
+        # 而不是让用户"停掉占用程序"（停掉 minishare 自己没有意义）。
+        r = self.run_port_check('tcp 0 0 0.0.0.0:80 x', '80')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('minishare 自己就装在端口 80 上', r.stdout)
+        self.assertIn('STILL_ALIVE', self.run_port_check('', '18080').stdout)
+
+    def test_port_check_other_program_message(self):
+        # 别人占了 443：保持原来的"停掉占用程序"提示
+        r = self.run_port_check('tcp 0 0 :::443 x', '18080')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('停掉占用它们的程序', r.stdout)
+
+    def test_normal_caddyfile_backed_up(self):
+        # 回归：普通模式覆盖 /etc/caddy/Caddyfile 前必须先备份，
+        # 之前直接覆盖，机器上原有的 Caddy 配置就丢了。
+        text = (ROOT / 'enable-https.sh').read_text()
+        a = text.index('echo "[4] 配置反向代理…')
+        block = text[a:text.index('# ---- [5] 设置开机自启', a)]
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'Caddyfile').write_text('old config\n')
+            block2 = block.replace('/etc/caddy', folder)
+            r = subprocess.run(['sh', '-c', 'set -eu\n' + block2],
+                               env={**os.environ, 'SRV_HOST': '0.0.0.0',
+                                    'PORT': '18080', 'DOMAIN': 'test.example.com'},
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((Path(folder) / 'Caddyfile.bak').read_text(), 'old config\n')
+            self.assertIn('test.example.com', (Path(folder) / 'Caddyfile').read_text())
+
+    def test_caddy_restart_never_kills_script(self):
+        # 回归：set -e 下裸写 systemctl restart caddy，失败会直接退出脚本，
+        # 后面的"[5b]/[8b] 是否真在跑"检查和日志打印就永远跑不到了。
+        # 所有启动 caddy 的地方必须 || true，把"起没起来"的判断交给后面的检查。
+        text = (ROOT / 'enable-https.sh').read_text()
+        for i, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if s.startswith('#') or 'RELOAD_HOOK' in s:
+                continue
+            if 'systemctl restart caddy' in s or 'rc-service caddy restart' in s:
+                self.assertIn('|| true', s, f'line {i}: {s}')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
