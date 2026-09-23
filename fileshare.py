@@ -317,6 +317,13 @@ _PRECHECK_SLACK = 1024 * 1024
 # SQLite 拖死。正常人一次传 200 个文件绰绰有余。
 MAX_FILES_PER_REQUEST = 200
 
+# 单次上传请求里最多带多少个纯字段 part：字段 part 不走文件额度的
+# charge（只有文件字节才扣 budget），也不落盘，直接进内存 dict。
+# 不限数量的话，攻击者可以用 10GB 请求体塞几千万个碎字段 part
+#（每个几十字节），fields dict 的内存直接爆炸——文件 part 有
+# MAX_FILES_PER_REQUEST 兜底，这里之前漏了。正常表单字段从不超过两位数。
+MAX_FIELDS_PER_REQUEST = 100
+
 # ---------------- 分片上传 ----------------
 # 大文件一次 POST 传完，经过 Cloudflare 这类反代时很容易因为
 # “单个请求耗时太长”被中间环节掐掉（用户看到的就是 请求失败(522)）。
@@ -324,6 +331,12 @@ MAX_FILES_PER_REQUEST = 200
 # 上传百分比；某片失败也只重传该片，不用整个文件重来。
 CHUNK_SIZE = 4 * 1024 * 1024  # 每片 4MB
 CHUNK_TTL = 2 * 3600  # 分片会话 2 小时没传完就清理临时文件
+
+# 服务端同时存在的分片上传会话上限：每个会话占一个内存条目 + 磁盘上一个
+# 临时文件。kind=upload 走接收链接，免登录、链接是公开分享的，不限数量
+# 会被拿来刷爆内存和 inode（会话 2 小时才过期，刷的速度远快于过期速度）。
+# 正常人同时传几十个文件顶天了，1000 是留足余量的上限。
+MAX_CHUNK_SESSIONS = 1000
 
 # 分片上传的前端通用函数：分享页“添加文件”、接收页“上传”、控制台
 # “发送文件”三个上传入口共用。大文件切成 4MB 一片逐个 POST，每片请求
@@ -477,6 +490,7 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     remaining = total
     fields, files = {}, []
     n_files = 0
+    n_fields = 0
     created_paths = []
     budget = max_bytes  # 实际文件字节的剩余额度（信封开销不计入）
     def charge(n):
@@ -638,6 +652,11 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
                 files.append({"name": name, "filename": filename,
                               "stored": stored, "size": size})
             else:
+                n_fields += 1
+                if n_fields > MAX_FIELDS_PER_REQUEST:
+                    # 已落盘的临时文件由外层 except BaseException 清理；
+                    # 这里先计数再读：超限直接拒掉，不必把这个 part 读完
+                    raise BadUpload("too many fields")
                 data, ended = read_data_mem(1024 * 1024)
                 fields[name] = data.decode("utf-8", "replace")
             if ended:
@@ -2214,14 +2233,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": too_large_msg()}, 413)
                 now = int(time.time())
                 self._chunk_sweep(now)
-                token = secrets.token_hex(16)
-                tmp = os.path.join(FILES_DIR, "chunk_" + token)
-                try:
-                    open(tmp, "wb").close()
-                except OSError:
-                    return self._json({"ok": False, "error": "服务器错误"}, 500)
                 st, lock = self._chunk_state()
                 with lock:
+                    if len(st) >= MAX_CHUNK_SESSIONS:
+                        # _form() 已经把小 body 读完，直接回 429，不用关连接。
+                        # 检查必须在建临时文件之前：被拒的请求不能留下
+                        # 无会话的 chunk_* 空文件（sweep 只清有会话的）。
+                        return self._json(
+                            {"ok": False, "error": "服务器上传任务太多，请稍后再试"}, 429)
+                    token = secrets.token_hex(16)
+                    tmp = os.path.join(FILES_DIR, "chunk_" + token)
+                    try:
+                        open(tmp, "wb").close()
+                    except OSError:
+                        return self._json({"ok": False, "error": "服务器错误"}, 500)
                     st[token] = {"sid": sid, "kind": kind, "filename": name,
                                  "size": size, "chunks": chunks, "next": 0,
                                  "recvd": 0, "tmp": tmp,
@@ -2231,7 +2256,18 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/chunk":
                 # 分片上传第 2 步：收一片。body 就是分片的原始字节，
                 # 不是 multipart，解析开销最小。
-                q = parse_qs(urlparse(self.path).query)
+                try:
+                    q = parse_qs(urlparse(self.path).query,
+                                 max_num_fields=10)
+                except TypeError:
+                    # Python < 3.10.7 没有 max_num_fields 参数：退回不限。
+                    # query 里只有 up/i 两个参数，请求行最长 64KB，
+                    # 老版本上可放大的上限有限，风险可接受。
+                    q = parse_qs(urlparse(self.path).query)
+                except ValueError:
+                    # 碎字段 query（DoS）：body 还没读，关连接防污染
+                    self._close_if_body_pending()
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
                 token = (q.get("up") or [""])[0]
                 idx_s = (q.get("i") or [""])[0]
                 try:
