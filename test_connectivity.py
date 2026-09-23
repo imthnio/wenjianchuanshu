@@ -1163,6 +1163,343 @@ class Connectivity(unittest.TestCase):
             owner = c.execute("SELECT owner_id FROM shares WHERE id='oldshr01'").fetchone()["owner_id"]
             self.assertEqual(owner, admin["id"])
 
+    def _mkview_share(self, files, stype="send", owner=1):
+        # files: [(filename, bytes)]，返回 (sid, [fid...])
+        os.makedirs(app.FILES_DIR, exist_ok=True)
+        now = int(time.time())
+        sid = "viewtest01"
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,?)", (sid, stype, "t", now, 0, owner))
+            ids = []
+            for name, data in files:
+                stored = "st_%d_%s" % (len(ids), name.replace("/", "_"))
+                with open(os.path.join(app.FILES_DIR, stored), "wb") as f:
+                    f.write(data)
+                cur = c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                                " VALUES(?,?,?,?,?)",
+                                (sid, name, stored, len(data), now))
+                ids.append(cur.lastrowid)
+        return sid, ids
+
+    def _vget(self, port, path, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            c.request("GET", path, headers=headers or {})
+            r = c.getresponse()
+            body = r.read()
+            return r.status, dict(r.getheaders()), body
+        finally:
+            c.close()
+
+    def test_view_kind_svg_not_inline(self):
+        # svg 内联打开时里面的脚本会在本站域名下执行：只能下载，不能查看
+        self.assertIsNone(app._view_kind("x.svg"))
+        self.assertEqual(app._view_kind("x.PNG"), "img")
+        self.assertEqual(app._view_kind("x.Mp4"), "vid")
+        self.assertIsNone(app._view_kind("x.txt"))
+
+    def test_inline_view_image_200_and_headers(self):
+        app.create_user("pw123456", is_admin=True)
+        png = b"\x89PNG\r\n\x1a\n" + b"x" * 1000
+        with self.server("127.0.0.1") as port:
+            sid, (fid,) = self._mkview_share([("a.png", png)])
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}")
+            self.assertEqual(s, 200)
+            self.assertEqual(h.get("Content-Type"), "image/png")
+            self.assertEqual(h.get("Content-Disposition"), "inline")
+            self.assertEqual(h.get("Accept-Ranges"), "bytes")
+            self.assertEqual(h.get("X-Content-Type-Options"), "nosniff")
+            self.assertEqual(body, png)
+
+    def test_inline_view_range_206_and_suffix_range(self):
+        app.create_user("pw123456", is_admin=True)
+        data = b"y" * 5000
+        with self.server("127.0.0.1") as port:
+            sid, (fid,) = self._mkview_share([("b.mp4", data)])
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}",
+                                    {"Range": "bytes=0-99"})
+            self.assertEqual(s, 206)
+            self.assertEqual(h.get("Content-Range"),
+                             "bytes 0-99/%d" % len(data))
+            self.assertEqual(body, data[:100])
+            # bytes=-N：最后 N 字节
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}",
+                                    {"Range": "bytes=-10"})
+            self.assertEqual(s, 206)
+            self.assertEqual(h.get("Content-Range"),
+                             "bytes %d-%d/%d" % (len(data) - 10, len(data) - 1,
+                                                 len(data)))
+            self.assertEqual(body, data[-10:])
+
+    def test_inline_view_invalid_range_416(self):
+        app.create_user("pw123456", is_admin=True)
+        data = b"y" * 5000
+        with self.server("127.0.0.1") as port:
+            sid, (fid,) = self._mkview_share([("b.mp4", data)])
+            s, _, _ = self._vget(port, f"/s/{sid}/v/{fid}",
+                                 {"Range": "bytes=999999-"})
+            self.assertEqual(s, 416)
+
+    def test_inline_view_nonmedia_falls_back_to_download(self):
+        app.create_user("pw123456", is_admin=True)
+        # /v/ 指向非图片/视频：退回 attachment 下载，防 MIME 混淆
+        data = b"hello"
+        with self.server("127.0.0.1") as port:
+            sid, (fid,) = self._mkview_share([("c.txt", data)])
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}")
+            self.assertEqual(s, 200)
+            self.assertTrue(h.get("Content-Disposition", "").startswith("attachment"))
+            self.assertEqual(body, data)
+
+    def test_inline_view_404_paths(self):
+        app.create_user("pw123456", is_admin=True)
+        data = b"y" * 100
+        with self.server("127.0.0.1") as port:
+            sid, (fid,) = self._mkview_share([("b.mp4", data)])
+            # 不存在的文件 id
+            self.assertEqual(self._vget(port, f"/s/{sid}/v/{fid + 9999}")[0], 404)
+            # 不存在的分享 id
+            self.assertEqual(self._vget(port, f"/s/nope1234/v/{fid}")[0], 404)
+            # 接收链接没有在线查看
+            os.makedirs(app.FILES_DIR, exist_ok=True)
+            now = int(time.time())
+            with app.db() as c:
+                c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                          " VALUES(?,?,?,?,?,1)", ("recvtest01", "receive", "t", now, 0))
+            self.assertEqual(self._vget(port, f"/s/recvtest01/v/{fid}")[0], 404)
+
+    def test_share_page_renders_preview_for_media(self):
+        sid = "viewtest01"
+        share = {"title": "t", "expires": 0}
+        files = [{"id": 1, "filename": "a.png", "size": 10},
+                 {"id": 2, "filename": "b.mp4", "size": 20},
+                 {"id": 3, "filename": "c.txt", "size": 5}]
+        body = app.share_page(sid, share, files).decode("utf-8")
+        self.assertIn("<video", body)
+        self.assertIn("<img", body)
+        self.assertIn(f"/s/{sid}/v/1", body)
+        self.assertIn(f"/s/{sid}/v/2", body)
+        # txt 没有查看入口，但下载链接还在
+        self.assertNotIn(f"/s/{sid}/v/3", body)
+        self.assertIn(f"/s/{sid}/f/3", body)
+
+    def _t_multipart(self, port, path, cookie, files):
+        # files: [(filename, bytes)]，返回 (status, json)
+        bnd = "----addt"
+        parts = []
+        for name, data in files:
+            parts.append((f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                          f"filename=\"{name}\"\r\n\r\n").encode() + data + b"\r\n")
+        body = b"".join(parts) + f"--{bnd}--\r\n".encode()
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("POST", path, body=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                           "Cookie": cookie})
+        r = c.getresponse()
+        data = json.loads(r.read())
+        c.close()
+        return r.status, data
+
+    def test_share_add_and_del_file_flow(self):
+        # 分享创建后：主人可以在分享页追加文件、删除文件；
+        # 删光后访客看到"文件都被删除啦"
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port)  # 管理员，同时是分享的 owner
+            sid, (fid,) = self._mkview_share([("a.txt", b"hello")])
+            # 追加一个文件
+            s, data = self._t_multipart(port, f"/s/{sid}/add", cookie,
+                                        [("b.png", b"\x89PNG\r\n\x1a\n" + b"z" * 50)])
+            self.assertEqual(s, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["count"], 1)
+            _, _, body = self._vget(port, f"/s/{sid}")
+            self.assertIn(b"b.png", body)
+            # 删掉追加的文件
+            with app.db() as c:
+                newfid = c.execute("SELECT id FROM files WHERE share_id=? AND filename='b.png'",
+                                   (sid,)).fetchone()["id"]
+            s, data = self._t_api(port, "/api/share_file_del",
+                                  {"sid": sid, "id": str(newfid)}, cookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(self._vget(port, f"/s/{sid}/v/{newfid}")[0], 404)
+            # 删光：访客看到"文件都被删除啦"
+            s, data = self._t_api(port, "/api/share_file_del",
+                                  {"sid": sid, "id": str(fid)}, cookie)
+            self.assertTrue(data["ok"])
+            _, _, body = self._vget(port, f"/s/{sid}")
+            self.assertIn("文件都被删除啦".encode("utf-8"), body)
+
+    def test_share_add_del_forbidden_for_other_user(self):
+        # 普通用户不能给别人的分享加文件/删文件；管理员可以
+        app.create_user("adminpw1", is_admin=True)
+        app.create_user("userBbbb")
+        with self.server("127.0.0.1") as port:
+            _, bcookie, _ = self._t_login(port, "userBbbb")
+            _, admcookie, _ = self._t_login(port, "adminpw1")
+            sid, (fid,) = self._mkview_share([("a.txt", b"hello")], owner=1)
+            # B 加文件 → 403
+            s, data = self._t_multipart(port, f"/s/{sid}/add", bcookie,
+                                        [("x.txt", b"x")])
+            self.assertEqual(s, 403)
+            self.assertFalse(data["ok"])
+            # B 删文件 → 403
+            s, data = self._t_api(port, "/api/share_file_del",
+                                  {"sid": sid, "id": str(fid)}, bcookie)
+            self.assertEqual(s, 403)
+            # 未登录 → 401
+            s, _ = self._t_multipart(port, f"/s/{sid}/add", "", [("x.txt", b"x")])
+            self.assertEqual(s, 401)
+            # 删别人的分享里不存在的文件 id → 404（不是 403 信息泄露）
+            s, data = self._t_api(port, "/api/share_file_del",
+                                  {"sid": sid, "id": "999999"}, admcookie)
+            self.assertEqual(s, 404)
+            # 管理员可以删
+            s, data = self._t_api(port, "/api/share_file_del",
+                                  {"sid": sid, "id": str(fid)}, admcookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(data["ok"])
+
+    def test_share_page_manage_controls_visibility(self):
+        # 管理按钮（删除/添加文件）只出现在本人或管理员打开的分享页上
+        sid = "viewtest01"
+        share = {"title": "t", "expires": 0, "owner_id": 5}
+        files = [{"id": 1, "filename": "a.txt", "size": 5}]
+        b_owner = app.share_page(sid, share, files, {"id": 5, "is_admin": False}).decode("utf-8")
+        self.assertIn("delShareFile", b_owner)
+        self.assertIn("addForm", b_owner)
+        b_other = app.share_page(sid, share, files, {"id": 6, "is_admin": False}).decode("utf-8")
+        self.assertNotIn("delShareFile", b_other)
+        self.assertNotIn("addForm", b_other)
+        b_admin = app.share_page(sid, share, files, {"id": 7, "is_admin": True}).decode("utf-8")
+        self.assertIn("delShareFile", b_admin)
+        b_none = app.share_page(sid, share, files).decode("utf-8")
+        self.assertNotIn("delShareFile", b_none)
+        self.assertNotIn("addForm", b_none)
+        # 文件删空后的提示文案
+        b_empty = app.share_page(sid, share, [], {"id": 5, "is_admin": False}).decode("utf-8")
+        self.assertIn("文件都被删除啦", b_empty)
+
+    def test_console_file_download(self):
+        # 控制台"全部文件"的下载：登录可下（attachment），
+        # 分享链接删掉后的孤儿文件也能下；未登录跳登录页
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port)
+            sid, (fid,) = self._mkview_share([("doc.pdf", b"%PDF-1.4" + b"z" * 100)])
+            # 删掉分享链接，文件变孤儿
+            with app.db() as c:
+                c.execute("DELETE FROM shares WHERE id=?", (sid,))
+            s, h, body = self._vget(port, f"/dl/{fid}", {"Cookie": cookie})
+            self.assertEqual(s, 200)
+            self.assertTrue(h.get("Content-Disposition", "").startswith("attachment"))
+            self.assertEqual(body, b"%PDF-1.4" + b"z" * 100)
+            # 不存在的文件 id → 404
+            self.assertEqual(self._vget(port, "/dl/999999", {"Cookie": cookie})[0], 404)
+            # 未登录 → 跳登录
+            s, h, _ = self._vget(port, f"/dl/{fid}")
+            self.assertEqual(s, 302)
+            self.assertIn("/login", h.get("Location", ""))
+
+    def test_dash_all_files_has_download_button(self):
+        # "全部文件"每行都有下载按钮：管理员和普通用户都能看到
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,1)", ("dlbtn01", "send", "t", now, 0))
+            cur = c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                            " VALUES(?,?,?,?,?)", ("dlbtn01", "a.txt", "st_a", 5, now))
+            fid = cur.lastrowid
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        for user in ({"id": 1, "is_admin": True}, {"id": 2, "is_admin": False}):
+            body = app.dash_page(shares, user).decode("utf-8")
+            self.assertIn(f"/dl/{fid}", body)
+            self.assertIn("下载</button>", body)
+
+    def test_dash_forms_use_postform(self):
+        # 回归测试：添加用户/改密码曾用 new URLSearchParams([...fd]) 且没有 .catch，
+        # 某些浏览器或网络下请求失败时页面静默、看起来"点了没反应"。
+        # 现统一走 postForm：手动拼 urlencoded、有明确的失败提示。
+        shares = []
+        admin_html = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
+        self.assertIn("function postForm", admin_html)
+        self.assertIn("postForm('/api/user_add'", admin_html)
+        self.assertIn("postForm('/api/chpw'", admin_html)
+        self.assertNotIn("URLSearchParams", admin_html)
+        user_html = app.dash_page(shares, {"id": 2, "is_admin": False}).decode("utf-8")
+        self.assertIn("postForm('/api/chpw'", user_html)
+        self.assertNotIn("URLSearchParams", user_html)
+        self.assertNotIn("<form id='userAddForm'", user_html)
+
+    def test_postform_never_silent(self):
+        # postForm 必须：有 .catch、有"处理中"反馈、提交时禁用按钮、
+        # HTTP 错误时优先展示服务端返回的 error 文案。
+        shares = []
+        html = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
+        i = html.find("function postForm")
+        self.assertGreater(i, 0)
+        seg = html[i:html.find("</script>", i)]
+        self.assertIn(".catch(function", seg)
+        self.assertIn("处理中", seg)
+        self.assertIn("btn.disabled=true", seg)
+        self.assertIn("(j&&j.error)", seg)
+
+    def test_user_add_duplicate_pw_json_error(self):
+        # 密码重复时服务端返回 400 + JSON error，前端能直接展示文案而不是静默
+        with self.server("127.0.0.1") as port:
+            app.create_user("dup_pw_admin", is_admin=True)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "dup_pw_admin"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            c.request("POST", "/api/user_add",
+                      body=urllib.parse.urlencode(
+                          {"pw1": "dup_pw_admin", "pw2": "dup_pw_admin"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            body = r.read()
+            self.assertEqual(r.status, 400)
+            j = json.loads(body)
+            self.assertFalse(j["ok"])
+            self.assertTrue(j["error"])
+            c.close()
+
+    def test_regular_user_changes_own_password(self):
+        # 普通用户走 /api/chpw 改自己的密码：成功后新密码能登录、旧密码失效
+        with self.server("127.0.0.1") as port:
+            app.create_user("adm_for_chpw", is_admin=True)
+            app.create_user("user_old_pw")
+            def login(pw):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/login",
+                          body=urllib.parse.urlencode({"pw": pw}).encode(),
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+                r = c.getresponse()
+                r.read()
+                ck = r.getheader("Set-Cookie")
+                c.close()
+                return r.status, (ck.split(";")[0].split("=")[1] if ck else None)
+            st, cookie = login("user_old_pw")
+            self.assertEqual(st, 302)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/api/chpw",
+                      body=urllib.parse.urlencode(
+                          {"new1": "user_new_pw", "new2": "user_new_pw"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": f"sid={cookie}"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(json.loads(r.read())["ok"])
+            c.close()
+            st_new, _ = login("user_new_pw")
+            st_old, _ = login("user_old_pw")
+            self.assertEqual(st_new, 302)
+            self.assertEqual(st_old, 200)
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
