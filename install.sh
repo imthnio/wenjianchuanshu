@@ -2,15 +2,16 @@
 # minishare 一键安装/修复：Debian / Ubuntu / Alpine / CentOS / Arch 通用
 #
 # 小白用法：SSH 连上服务器（root 用户）后，粘贴 README 里的那一段命令，回车。
-# 脚本会自动识别：
+# 脚本会自动识别，不用你选命令：
 #   - 没装过 minishare → 全新安装向导（3 个问题，端口必须自己输入）；
-#   - 已装过 minishare → 保留数据修复：只更新 Python 程序，保留现有监听
-#     地址、端口、密码和上传文件；先备份原程序，重启后检查失败则自动恢复。
+#   - 已装过 minishare → 问你是"保留数据修复"还是"重新安装"（比如要换端口），
+#     直接回车默认修复；保留数据修复只更新 Python 程序，保留现有监听地址、
+#     端口、密码和上传文件，先备份原程序，重启后检查失败则自动恢复。
 #
 # 进阶：非交互安装可用环境变量预设
 #   APP_DIR / PORT / IPVER(4 或 6，默认 4) / BIND / MINISHARE_REPO / NONINTERACTIVE=1
 #   PUBLIC_HOST / PUBLIC_PORT：NAT 入站地址和外部映射端口，可选
-#   FORCE_INSTALL=1：即使已装过也强制走全新安装（例如要换端口重装）
+#   FORCE_INSTALL=1：非交互时即使已装过也强制走全新安装（交互时直接选 2 就行）
 set -e
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -99,7 +100,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 PYTHON="$(command -v python3)"
 
-# ---- 2. 自动识别：已装过 → 保留数据修复；没装过 → 全新安装 ----
+# ---- 2. 自动识别：已装过 → 让用户选修复还是重装；没装过 → 全新安装 ----
 MODE=install
 if [ -z "${FORCE_INSTALL:-}" ]; then
   if [ -d /run/systemd/system ] && [ -f /etc/systemd/system/minishare.service ]; then
@@ -113,10 +114,22 @@ if [ -z "${FORCE_INSTALL:-}" ]; then
   fi
 fi
 
+if [ "$MODE" = repair ] && [ -t 0 ] && [ -z "${NONINTERACTIVE:-}" ]; then
+  echo "检测到这台机器已经装过 minishare。"
+  echo "  1) 保留数据修复（只更新程序，保留监听地址、端口、密码和上传文件）[默认，直接回车]"
+  echo "  2) 重新安装（按向导重设目录、端口等，比如要换端口）"
+  printf "请选择 [1/2]："
+  read -r ans || ans=""
+  case "$ans" in
+    2) MODE=install; echo "已切换为重新安装。" ;;
+    *) echo "进入保留数据修复。" ;;
+  esac
+  echo ""
+fi
+
 if [ "$MODE" = repair ]; then
   # ---- 保留数据修复：只更新 Python 程序，保留现有监听地址、端口、密码和上传文件 ----
-  echo "检测到已安装的 minishare，进入保留数据修复模式。"
-  echo "只更新 Python 程序，保留现有监听地址、端口、密码和上传文件；"
+  echo "保留数据修复：只更新 Python 程序，保留现有监听地址、端口、密码和上传文件；"
   echo "先备份原程序，重启后检查失败则自动恢复原程序。"
   RTMP=$(mktemp -d)
   # 把已知格式的服务文件当数据解析，绝不执行 / source 它。
