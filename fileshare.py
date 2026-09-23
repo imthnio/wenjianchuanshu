@@ -60,15 +60,42 @@ def init_db():
     os.makedirs(FILES_DIR, exist_ok=True)
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pw TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0,
+            created INTEGER NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS sessions(
-            token TEXT PRIMARY KEY, created INTEGER, expires INTEGER)""")
+            token TEXT PRIMARY KEY, user_id INTEGER,
+            created INTEGER, expires INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS shares(
             id TEXT PRIMARY KEY, type TEXT, title TEXT,
-            created INTEGER, expires INTEGER)""")
+            created INTEGER, expires INTEGER, owner_id INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS files(
             id INTEGER PRIMARY KEY AUTOINCREMENT, share_id TEXT,
             filename TEXT, stored TEXT, size INTEGER, created INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_id)")
+        # 兼容老版本数据库：补上新增的列
+        for table, col in (("sessions", "user_id"), ("shares", "owner_id")):
+            cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
+            if col not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER")
+        _migrate_to_multiuser(c)
+
+def _migrate_to_multiuser(c):
+    # 老版本只有 meta.pw 一个密码：转成 users 表的第一条管理员记录，
+    # 老分享全部归到管理员名下；旧会话没有 user_id，一律作废重登。
+    if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+        return
+    old = c.execute("SELECT v FROM meta WHERE k='pw'").fetchone()
+    if not old:
+        return  # 全新安装：/setup 会创建管理员账号
+    now = int(time.time())
+    c.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)",
+              (old["v"], 1, now))
+    admin_id = c.execute("SELECT id FROM users WHERE is_admin=1").fetchone()["id"]
+    c.execute("UPDATE shares SET owner_id=? WHERE owner_id IS NULL", (admin_id,))
+    c.execute("DELETE FROM sessions")
+    c.execute("DELETE FROM meta WHERE k='pw'")
 
 def meta_get(k):
     with db() as c:
@@ -96,20 +123,85 @@ def check_pw(pw, stored):
         return False
     return hmac.compare_digest(hash_pw(pw, salt), stored)
 
-def new_session():
+# ---------------- 多用户：密码即账号 ----------------
+# 没有用户名，登录只输密码：不同的密码对应不同的账号。
+# 账号只能由管理员添加，没有注册入口。
+
+def has_users():
+    with db() as c:
+        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+
+def list_users():
+    with db() as c:
+        return c.execute(
+            "SELECT id, is_admin, created FROM users ORDER BY id").fetchall()
+
+def create_user(pw, is_admin=False):
+    # 密码即账号身份：密码不能与现有任何账号重复，否则登录时无法区分。
+    if len(pw) < 4:
+        raise ValueError("密码至少 4 位")
+    with db() as c:
+        for r in c.execute("SELECT pw FROM users"):
+            if check_pw(pw, r["pw"]):
+                raise ValueError("这个密码已经被别的账号用了，换一个")
+        now = int(time.time())
+        cur = c.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)",
+                        (hash_pw(pw), 1 if is_admin else 0, now))
+        return {"id": cur.lastrowid, "is_admin": bool(is_admin)}
+
+def find_user_by_pw(pw):
+    with db() as c:
+        for r in c.execute("SELECT id, pw, is_admin FROM users"):
+            if check_pw(pw, r["pw"]):
+                return {"id": r["id"], "is_admin": bool(r["is_admin"])}
+    return None
+
+def get_user(uid):
+    with db() as c:
+        r = c.execute("SELECT id, is_admin FROM users WHERE id=?", (uid,)).fetchone()
+        return {"id": r["id"], "is_admin": bool(r["is_admin"])} if r else None
+
+def set_user_pw(uid, pw):
+    if len(pw) < 4:
+        raise ValueError("密码至少 4 位")
+    with db() as c:
+        for r in c.execute("SELECT id, pw FROM users WHERE id!=?", (uid,)):
+            if check_pw(pw, r["pw"]):
+                raise ValueError("这个密码已经被别的账号用了，换一个")
+        c.execute("UPDATE users SET pw=? WHERE id=?", (hash_pw(pw), uid))
+
+def delete_user(uid):
+    # 删账号：踢掉他的所有会话；他的分享链接失效（文件按现有规则保留，
+    # 在"全部文件"里显示为"链接已删"，管理员可手动清理）。
+    with db() as c:
+        for r in c.execute("SELECT id FROM shares WHERE owner_id=?", (uid,)).fetchall():
+            c.execute("DELETE FROM shares WHERE id=?", (r["id"],))
+        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
+
+def can_manage_share(user, share):
+    # 管理员可操作任何分享；普通用户只能操作自己的
+    return user["is_admin"] or share["owner_id"] == user["id"]
+
+def new_session(user_id):
     tok = secrets.token_urlsafe(32)
     now = int(time.time())
     with db() as c:
-        c.execute("INSERT INTO sessions(token,created,expires) VALUES(?,?,?)",
-                  (tok, now, now + SESSION_DAYS * 86400))
+        c.execute("INSERT INTO sessions(token,user_id,created,expires)"
+                  " VALUES(?,?,?,?)",
+                  (tok, user_id, now, now + SESSION_DAYS * 86400))
     return tok
 
-def valid_session(tok):
+def session_user(tok):
+    # 会话对应的账号，不存在/过期返回 None
     if not tok:
-        return False
+        return None
     with db() as c:
-        r = c.execute("SELECT expires FROM sessions WHERE token=?", (tok,)).fetchone()
-    return bool(r and r["expires"] > time.time())
+        r = c.execute(
+            "SELECT u.id, u.is_admin FROM sessions s"
+            " JOIN users u ON s.user_id=u.id"
+            " WHERE s.token=? AND s.expires>?", (tok, time.time())).fetchone()
+    return {"id": r["id"], "is_admin": bool(r["is_admin"])} if r else None
 
 def drop_session(tok):
     with db() as c:
@@ -147,7 +239,7 @@ def all_files():
     now = int(time.time())
     with db() as c:
         return c.execute(
-            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title"
+            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title,s.owner_id"
             " FROM files f LEFT JOIN shares s ON f.share_id=s.id"
             " WHERE s.id IS NULL OR s.expires=0 OR s.expires>?"
             " ORDER BY f.id DESC", (now,)).fetchall()
@@ -542,10 +634,12 @@ def login_page(err=""):
     return page("登录", f"""<div class='card' style='max-width:420px;margin:40px auto'>
 <h1>🗂️ 文件分享</h1>{e}
 <form method='post' action='/login'>
-<input type='password' name='pw' placeholder='管理员密码' required autofocus>
-<button>登录</button></form></div>""")
+<input type='password' name='pw' placeholder='密码' required autofocus>
+<button>登录</button></form>
+<p class='muted'>没有用户名：不同的密码对应不同的账号，找管理员要你的密码。</p></div>""")
 
-def dash_page(shares):
+def dash_page(shares, user):
+    is_admin = user["is_admin"]
     items = []
     for s in shares:
         files = share_files(s["id"])
@@ -553,8 +647,13 @@ def dash_page(shares):
         typ = "发送" if s["type"] == "send" else "接收"
         cls = "" if s["type"] == "send" else "recv"
         link = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
+        # 管理员看全部分享：标出归属；普通用户只看得到自己的分享
+        owner = ""
+        if is_admin and s["owner_id"] is not None:
+            owner = ("<span class='badge'>我的</span>" if s["owner_id"] == user["id"]
+                     else f"<span class='badge recv'>用户#{s['owner_id']}</span>")
         items.append(f"""<div class='file'><div>
-<span class='badge {cls}'>{typ}</span><b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
+<span class='badge {cls}'>{typ}</span>{owner}<b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
 <div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
 <div class='linkbox' id='lk-{s['id']}'>{link}</div><div id='ti-{s['id']}'></div></div>
 <div style='white-space:nowrap'>
@@ -565,7 +664,8 @@ def dash_page(shares):
 </div></div>""")
     frows = []
     for fr in all_files():
-        fid, fn, fsz, fct, stype, stitle = fr["id"], fr["filename"], fr["size"], fr["created"], fr["type"], fr["title"]
+        fid, fn, fsz, fct = fr["id"], fr["filename"], fr["size"], fr["created"]
+        stype, stitle, sowner = fr["type"], fr["title"], fr["owner_id"]
         if stype is None:
             # 归属的分享链接已被删除，文件仍保留在这里等待手动清理
             ftyp, fcls, fsrc = "链接已删", "recv", "分享链接已删除"
@@ -573,16 +673,55 @@ def dash_page(shares):
             ftyp = "发送" if stype == "send" else "接收"
             fcls = "" if stype == "send" else "recv"
             fsrc = f"{ftyp}「{html.escape(stitle or '(无备注)')}」"
+        # 管理员看全部文件时标出归属；删文件的复选框和按钮只有管理员可见
+        ownermk = ""
+        if is_admin and sowner is not None:
+            ownermk = (" <span class='badge'>我的</span>" if sowner == user["id"]
+                       else f" <span class='badge recv'>用户#{sowner}</span>")
+        ck = f"<input type='checkbox' class='fileck' value='{fid}'>" if is_admin else ""
+        delbtn = (f"<button class='danger' onclick=\"delOneFile({fid})\">删除</button>"
+                  if is_admin else "")
         frows.append(f"""<div class='file'><div>
-<input type='checkbox' class='fileck' value='{fid}'>
-<span class='badge {fcls}'>{ftyp}</span><b>{html.escape(fn)}</b>
+{ck}<span class='badge {fcls}'>{ftyp}</span>{ownermk}<b>{html.escape(fn)}</b>
 <div class='muted'>{hsize(fsz)} · 来自{fsrc} · {htime(fct)}</div>
 </div>
-<button class='danger' onclick="delOneFile({fid})">删除</button></div>""")
+{delbtn}</div>""")
     flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
     lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
+    role = "👑 管理员" if is_admin else "👤 普通用户"
+    share_title = "📋 分享链接（全部用户）" if is_admin else "📋 我的分享"
+    filehint = ("发送和接收的所有文件都在这里。删除为彻底删除，不经过回收站。"
+                if is_admin else "所有用户的文件都在这里。你没有删除文件的权限。")
+    fileops = ("""<div class='row' style='margin-top:8px'>
+<button class='ghost' onclick="toggleAllFiles()">全选 / 取消全选</button>
+<button class='danger' onclick="delFiles()">删除选中</button>
+</div>""") if is_admin else ""
+    users_card = ""
+    if is_admin:
+        urows = []
+        for u in list_users():
+            if u["is_admin"]:
+                mark, who = "<span class='badge'>管理员</span>", "管理员"
+                ops = ("<span class='muted'>这是你，改密码请用下面的「修改密码」</span>"
+                       if u["id"] == user["id"] else "")
+            else:
+                mark, who = f"<span class='badge recv'>用户#{u['id']}</span>", "普通用户"
+                ops = (f"<button class='ghost' onclick=\"resetPw({u['id']})\">重设密码</button> "
+                       f"<button class='danger' onclick=\"userDel({u['id']})\">删除用户</button>")
+            urows.append(f"""<div class='file'><div>
+{mark}<b>{who}</b>
+<div class='muted'>创建于 {htime(u['created'])}</div><div id='urp-{u['id']}'></div></div>
+<div style='white-space:nowrap'>{ops}</div></div>""")
+        users_card = f"""<div class='card'><h2>👥 用户管理</h2>
+<p class='muted'>没有注册入口，账号只能由你添加。登录没有用户名：不同的密码就是不同的账号。</p>
+{''.join(urows)}
+<form id='userAddForm'>
+<input type='password' name='pw1' placeholder='新用户密码（至少4位）' required minlength='4'>
+<input type='password' name='pw2' placeholder='再次输入' required minlength='4'>
+<button class='ghost' style='width:100%'>添加用户</button></form><div id='userRes'></div></div>
+"""
     return page("控制台", f"""<div class='topbar'><h1>🗂️ 文件分享</h1>
-<a href='/logout' class='muted'>退出登录</a></div>
+<div><span class='muted'>{role}</span>　<a href='/logout' class='muted'>退出登录</a></div></div>
 <div class='card'><h2>📤 发送文件</h2>
 <form id='sendForm'>
 <input type='file' name='file' multiple required>
@@ -601,15 +740,12 @@ def dash_page(shares):
 <select name='expiry'><option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>
 <option value='30'>30 天后过期</option><option value='0'>永久有效</option></select>
 <button>生成接收链接</button></form><div id='recvRes'></div></div>
-<div class='card'><h2>📋 我的分享</h2>{lst}</div>
+<div class='card'><h2>{share_title}</h2>{lst}</div>
 <div class='card'><h2>📁 全部文件</h2>
-<p class='muted'>发送和接收的所有文件都在这里。删除为彻底删除，不经过回收站。</p>
+<p class='muted'>{filehint}</p>
 {flist}
-<div class='row' style='margin-top:8px'>
-<button class='ghost' onclick="toggleAllFiles()">全选 / 取消全选</button>
-<button class='danger' onclick="delFiles()">删除选中</button>
-</div><div id='fileRes'></div></div>
-<div class='card'><h2>🔑 修改密码</h2>
+{fileops}<div id='fileRes'></div></div>
+{users_card}<div class='card'><h2>🔑 修改密码</h2>
 <form id='pwForm'>
 <input type='password' name='new1' placeholder='新密码' required minlength='4'>
 <input type='password' name='new2' placeholder='重复新密码' required minlength='4'>
@@ -731,6 +867,36 @@ document.getElementById('pwForm').addEventListener('submit', function(ev){{
       document.getElementById('pwRes').innerHTML = j.ok?"<div class='ok'>密码已修改</div>":"<div class='err'>"+(j.error||'失败')+"</div>";
     }});
 }});
+function userDel(id){{
+  if(!confirm('确定删除这个用户吗？他的分享链接会失效，文件会保留在「全部文件」里。'))return;
+  fetch('/api/user_del',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)}})
+    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'删除失败');}});
+}}
+function resetPw(id){{
+  var box=document.getElementById('urp-'+id);
+  box.innerHTML="<input type='password' id='rp1-"+id+"' placeholder='新密码' minlength='4'> "
+    +"<input type='password' id='rp2-"+id+"' placeholder='再次输入' minlength='4'> "
+    +"<button class='ghost' onclick=\\\"saveResetPw('\\\"+id+\\\"')\\\">确定</button> "
+    +"<button class='ghost' onclick=\\\"cancelResetPw('\\\"+id+\\\"')\\\">取消</button>";
+}}
+function cancelResetPw(id){{document.getElementById('urp-'+id).innerHTML='';}}
+function saveResetPw(id){{
+  var a=document.getElementById('rp1-'+id).value, b=document.getElementById('rp2-'+id).value;
+  fetch('/api/user_resetpw',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)+'&pw1='+encodeURIComponent(a)+'&pw2='+encodeURIComponent(b)}})
+    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'重设失败');}});
+}}
+var _uaf=document.getElementById('userAddForm');
+if(_uaf){{_uaf.addEventListener('submit', function(ev){{
+  ev.preventDefault();
+  var fd=new FormData(this);
+  fetch('/api/user_add',{{method:'POST',body:new URLSearchParams([...fd])}})
+    .then(r=>r.json()).then(j=>{{
+      document.getElementById('userRes').innerHTML = j.ok?"<div class='ok'>用户已添加，记得把密码告诉他</div>":"<div class='err'>"+(j.error||'失败')+"</div>";
+      if(j.ok)setTimeout(()=>location.reload(), 1200);
+    }});
+}});}}
 </script>{disk_foot()}""")
 
 def share_page(sid, share, files):
@@ -800,8 +966,9 @@ class Handler(BaseHTTPRequestHandler):
                 c[k.strip()] = v.strip()
         return c
 
-    def _authed(self):
-        return valid_session(self._cookie().get("sid"))
+    def _user(self):
+        # 当前登录的账号：{"id","is_admin"}，未登录返回 None
+        return session_user(self._cookie().get("sid"))
 
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         if isinstance(body, str):
@@ -838,13 +1005,24 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _require_auth(self):
-        # API 鉴权：通过返回 True；未登录回 401，
+        # API 鉴权：通过返回账号字典；未登录回 401，
         # 且 body 没读时关连接（同 _close_if_body_pending 的道理）。
-        if self._authed():
-            return True
+        user = self._user()
+        if user:
+            return user
         self._close_if_body_pending()
         self._json({"ok": False, "error": "未登录"}, 401)
-        return False
+        return None
+
+    def _require_admin(self):
+        # 仅管理员：通过返回账号字典，否则 401/403
+        user = self._require_auth()
+        if not user:
+            return None
+        if not user["is_admin"]:
+            self._json({"ok": False, "error": "需要管理员权限"}, 403)
+            return None
+        return user
 
     def _redirect(self, loc):
         self.send_response(302)
@@ -948,31 +1126,41 @@ class Handler(BaseHTTPRequestHandler):
             p = urlparse(self.path).path
             if p == "/healthz":
                 # Check SQLite too: a listening socket alone does not mean the app works.
-                meta_get("pw")
+                with db() as c:
+                    c.execute("SELECT 1")
                 return self._json({"service": "minishare", "ok": True})
-            if not meta_get("pw"):
+            if not has_users():
                 if p in ("/", "/setup"):
                     return self._send(200, setup_page())
                 return self._redirect("/")
             if p == "/":
-                return self._redirect("/dash" if self._authed() else "/login")
+                return self._redirect("/dash" if self._user() else "/login")
             if p == "/login":
-                if self._authed():
+                if self._user():
                     return self._redirect("/dash")
                 return self._send(200, login_page())
             if p == "/logout":
                 return self._clear_sid()
             if p == "/dash":
-                if not self._authed():
+                user = self._user()
+                if not user:
                     return self._redirect("/login")
                 # 已过期的分享不列出来（每小时会被清理线程删掉，
-                # 在删掉之前访问链接已经是 404，这里保持一致）
+                # 在删掉之前访问链接已经是 404，这里保持一致）。
+                # 管理员看全部分享，普通用户只看自己的。
                 with db() as c:
-                    shares = c.execute(
-                        "SELECT * FROM shares WHERE expires=0 OR expires>?"
-                        " ORDER BY created DESC",
-                        (int(time.time()),)).fetchall()
-                return self._send(200, dash_page(shares))
+                    if user["is_admin"]:
+                        shares = c.execute(
+                            "SELECT * FROM shares WHERE expires=0 OR expires>?"
+                            " ORDER BY created DESC",
+                            (int(time.time()),)).fetchall()
+                    else:
+                        shares = c.execute(
+                            "SELECT * FROM shares WHERE owner_id=?"
+                            " AND (expires=0 OR expires>?)"
+                            " ORDER BY created DESC",
+                            (user["id"], int(time.time()))).fetchall()
+                return self._send(200, dash_page(shares, user))
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})", p)
             if m:
@@ -1027,27 +1215,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             p = urlparse(self.path).path
-            if p == "/setup" and not meta_get("pw"):
+            if p == "/setup" and not has_users():
                 f = self._form()
                 pw1, pw2 = f.get("pw1", ""), f.get("pw2", "")
                 if len(pw1) < 4:
                     return self._send(200, setup_page("密码至少 4 位"))
                 if pw1 != pw2:
                     return self._send(200, setup_page("两次输入不一致"))
-                meta_set("pw", hash_pw(pw1))
-                return self._set_sid(new_session())
+                # 首个账号即管理员
+                admin = create_user(pw1, is_admin=True)
+                return self._set_sid(new_session(admin["id"]))
 
-            if p == "/login" and meta_get("pw"):
+            if p == "/login" and has_users():
                 f = self._form()
-                if check_pw(f.get("pw", ""), meta_get("pw")):
-                    return self._set_sid(new_session())
+                user = find_user_by_pw(f.get("pw", ""))
+                if user:
+                    return self._set_sid(new_session(user["id"]))
                 return self._send(200, login_page("密码错误"))
 
             if p == "/logout":
                 return self._clear_sid()
 
             if p == "/api/share":
-                if not self._require_auth():
+                user = self._require_auth()
+                if not user:
                     return
                 try:
                     fields, files = self._multipart()
@@ -1066,9 +1257,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     sid = new_share_id()
                     with db() as c:
-                        c.execute("INSERT INTO shares(id,type,title,created,expires)"
-                                  " VALUES(?,?,?,?,?)",
-                                  (sid, "send", title, now, now + days * 86400 if days else 0))
+                        c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                                  " VALUES(?,?,?,?,?,?)",
+                                  (sid, "send", title, now, now + days * 86400 if days else 0,
+                                   user["id"]))
                         for fo in files:
                             c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
                                       " VALUES(?,?,?,?,?)",
@@ -1084,7 +1276,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "link": f"/s/{sid}", "id": sid})
 
             if p == "/api/receive":
-                if not self._require_auth():
+                user = self._require_auth()
+                if not user:
                     return
                 try:
                     fields, files = self._multipart(MAX_UPLOAD)
@@ -1107,21 +1300,30 @@ class Handler(BaseHTTPRequestHandler):
                 now = int(time.time())
                 sid = new_share_id()
                 with db() as c:
-                    c.execute("INSERT INTO shares(id,type,title,created,expires)"
-                              " VALUES(?,?,?,?,?)",
-                              (sid, "receive", title, now, now + days * 86400 if days else 0))
+                    c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                              " VALUES(?,?,?,?,?,?)",
+                              (sid, "receive", title, now, now + days * 86400 if days else 0,
+                               user["id"]))
                 return self._json({"ok": True, "link": f"/r/{sid}", "id": sid})
 
             if p == "/api/delete":
-                if not self._require_auth():
+                user = self._require_auth()
+                if not user:
                     return
                 f = self._form()
-                if f.get("id"):
-                    delete_share(f["id"])
+                sid = f.get("id", "")
+                s = get_share(sid)
+                if not s:
+                    return self._json({"ok": False, "error": "分享不存在"}, 404)
+                # 普通用户只能取消自己的分享链接，管理员可以取消任何人的
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能删除自己的分享"}, 403)
+                delete_share(sid)
                 return self._json({"ok": True})
 
             if p == "/api/del_files":
-                if not self._require_auth():
+                # 删文件只有管理员可以，普通用户没有任何删除文件的权限
+                if not self._require_admin():
                     return
                 f = self._form()
                 # 注意：str.isdigit() 对 "²" 这类 Unicode 数字也返回 True，
@@ -1132,16 +1334,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "deleted": removed})
 
             if p == "/api/expiry":
-                # 管理员手动调整已创建分享的过期时间（延长或缩短）
-                if not self._require_auth():
+                # 手动调整已创建分享的过期时间（延长或缩短）：
+                # 普通用户只能改自己的，管理员可以改任何人的
+                user = self._require_auth()
+                if not user:
                     return
                 f = self._form()
                 sid = f.get("id", "")
                 with db() as c:
-                    s = c.execute("SELECT id FROM shares WHERE id=?",
+                    s = c.execute("SELECT id, owner_id FROM shares WHERE id=?",
                                   (sid,)).fetchone()
                     if not s:
                         return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    if not can_manage_share(user, s):
+                        return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
                     days = _expiry_days(f.get("expiry"))
                     now = int(time.time())
                     c.execute("UPDATE shares SET expires=? WHERE id=?",
@@ -1149,8 +1355,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
 
             if p == "/api/title":
-                # 改分享的备注名（发送/接收通用），空字符串表示清除备注
-                if not self._require_auth():
+                # 改分享的备注名（发送/接收通用），空字符串表示清除备注：
+                # 普通用户只能改自己的，管理员可以改任何人的
+                user = self._require_auth()
+                if not user:
                     return
                 f = self._form()
                 sid = f.get("id", "")
@@ -1158,28 +1366,91 @@ class Handler(BaseHTTPRequestHandler):
                 if not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid):
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 with db() as c:
-                    r = c.execute("UPDATE shares SET title=? WHERE id=?",
-                                  (title, sid))
-                    if r.rowcount == 0:
+                    s = c.execute("SELECT owner_id FROM shares WHERE id=?",
+                                  (sid,)).fetchone()
+                    if not s:
                         return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    if not can_manage_share(user, s):
+                        return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
+                    c.execute("UPDATE shares SET title=? WHERE id=?", (title, sid))
                 return self._json({"ok": True})
 
             if p == "/api/chpw":
-                if not self._require_auth():
+                # 改自己的密码（管理员和普通用户都走这里，改的是当前登录的账号）
+                user = self._require_auth()
+                if not user:
                     return
                 f = self._form()
-                # 已登录即视为管理员身份，不再校验当前密码
                 if len(f.get("new1", "")) < 4 or f.get("new1") != f.get("new2"):
                     return self._json({"ok": False, "error": "新密码至少4位且两次一致"})
-                meta_set("pw", hash_pw(f["new1"]))
-                # 改密码很可能是因为旧密码泄露：让其他设备/浏览器上的旧会话
-                # 立即失效，只保留当前这一个会话不断线。
+                try:
+                    set_user_pw(user["id"], f["new1"])
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                # 改密码很可能是因为旧密码泄露：让这个账号在其他设备/浏览器上
+                # 的旧会话立即失效，只保留当前这一个会话不断线。
+                # 注意只踢掉自己的会话，不能影响别的账号。
                 me = self._cookie().get("sid")
                 with db() as c:
                     if me:
-                        c.execute("DELETE FROM sessions WHERE token!=?", (me,))
+                        c.execute("DELETE FROM sessions WHERE user_id=? AND token!=?",
+                                  (user["id"], me))
                     else:
-                        c.execute("DELETE FROM sessions")
+                        c.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+                return self._json({"ok": True})
+
+            # ---- 用户管理（仅管理员；账号没有注册入口，只能由管理员添加） ----
+            if p == "/api/user_add":
+                if not self._require_admin():
+                    return
+                f = self._form()
+                if f.get("pw1", "") != f.get("pw2", ""):
+                    return self._json({"ok": False, "error": "两次输入不一致"}, 400)
+                try:
+                    u = create_user(f.get("pw1", ""), is_admin=False)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                return self._json({"ok": True, "id": u["id"]})
+
+            if p == "/api/user_del":
+                if not self._require_admin():
+                    return
+                f = self._form()
+                try:
+                    uid = int(f.get("id", ""))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "bad id"}, 400)
+                target = get_user(uid)
+                if not target:
+                    return self._json({"ok": False, "error": "用户不存在"}, 404)
+                if target["is_admin"]:
+                    return self._json({"ok": False, "error": "不能删除管理员账号"}, 403)
+                delete_user(uid)
+                return self._json({"ok": True})
+
+            if p == "/api/user_resetpw":
+                # 管理员给普通用户重设密码（管理员改自己的密码走"修改密码"）
+                if not self._require_admin():
+                    return
+                f = self._form()
+                try:
+                    uid = int(f.get("id", ""))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "bad id"}, 400)
+                target = get_user(uid)
+                if not target:
+                    return self._json({"ok": False, "error": "用户不存在"}, 404)
+                if target["is_admin"]:
+                    return self._json({"ok": False, "error": "管理员请用修改密码"}, 403)
+                if f.get("pw1", "") != f.get("pw2", ""):
+                    return self._json({"ok": False, "error": "两次输入不一致"}, 400)
+                try:
+                    set_user_pw(uid, f.get("pw1", ""))
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                # 密码被重置后，踢掉该账号的所有会话
+                with db() as c:
+                    c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
                 return self._json({"ok": True})
 
             m = re.fullmatch(r"/r/([A-Za-z0-9_\-]{1,16})/upload", p)
