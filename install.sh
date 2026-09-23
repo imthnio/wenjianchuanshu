@@ -66,7 +66,12 @@ else
       # 用户立刻重装会拿到旧脚本、以为"修了没用"。URL 加时间戳参数绕过
       # 边缘缓存、回源拿最新（query 不影响文件内容）。
       u="$m/$1"
-      case "$u" in *raw.githubusercontent.com*) u="$u?t=$(date +%s)" ;; esac
+      # raw 和 jsdelivr 都有 CDN 缓存：刚推上去的修复，用户立刻重装会
+      # 拿到旧文件、以为"修了没用"。时间戳参数绕过边缘缓存、回源拿最新
+      #（query 不影响文件内容；两个镜像都要加）。
+      case "$u" in
+        *raw.githubusercontent.com*|*cdn.jsdelivr.net*) u="$u?t=$(date +%s)" ;;
+      esac
       if command -v curl >/dev/null 2>&1; then
         curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$1" "$u" 2>/dev/null && return 0
       else
