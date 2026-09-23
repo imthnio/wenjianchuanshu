@@ -1023,6 +1023,61 @@ class Connectivity(unittest.TestCase):
             s, j = self._t_api(port, "/api/delete", {"id": "nope12345"}, acookie)
             self.assertEqual(s, 404)
 
+    def test_expired_share_cannot_be_revived(self):
+        # 回归：已过期的分享在清理线程跑之前，调 /api/expiry 能把过期
+        # 时间改到未来，等于"复活"；调 /api/title 也能改备注。
+        # 现在三个接口统一走 _valid_share，过期直接 404。
+        import sqlite3 as _sq3
+        with self.server("127.0.0.1") as port:
+            app.create_user("exp_admin_pw", is_admin=True)
+            _, acookie, _ = self._t_login(port, "exp_admin_pw")
+            sid = self._t_mk_recv_share(port, acookie, "待过期")
+            # 模拟过期：清理线程还没跑
+            con = _sq3.connect(app.DB_PATH)
+            con.execute("UPDATE shares SET expires=? WHERE id=?",
+                        (int(time.time()) - 10, sid))
+            con.commit(); con.close()
+            # /api/expiry：404，且分享没有被复活（行已被删掉）
+            st, j = self._t_api(port, "/api/expiry",
+                                {"id": sid, "expiry": "30"}, acookie)
+            self.assertEqual(st, 404, j)
+            self.assertIsNone(app.get_share(sid))
+            # /api/title：404
+            sid2 = self._t_mk_recv_share(port, acookie, "待过期2")
+            con = _sq3.connect(app.DB_PATH)
+            con.execute("UPDATE shares SET expires=? WHERE id=?",
+                        (int(time.time()) - 10, sid2))
+            con.commit(); con.close()
+            st, j = self._t_api(port, "/api/title",
+                                {"id": sid2, "title": "hacked"}, acookie)
+            self.assertEqual(st, 404, j)
+            # /api/delete：404（之前直接 200）
+            sid3 = self._t_mk_recv_share(port, acookie, "待过期3")
+            con = _sq3.connect(app.DB_PATH)
+            con.execute("UPDATE shares SET expires=? WHERE id=?",
+                        (int(time.time()) - 10, sid3))
+            con.commit(); con.close()
+            st, j = self._t_api(port, "/api/delete", {"id": sid3}, acookie)
+            self.assertEqual(st, 404, j)
+
+    def test_expiry_api_still_works_on_live_share(self):
+        # 正常分享的改过期/改备注/删除不受影响
+        with self.server("127.0.0.1") as port:
+            app.create_user("live_admin_pw", is_admin=True)
+            _, acookie, _ = self._t_login(port, "live_admin_pw")
+            sid = self._t_mk_recv_share(port, acookie, "活的")
+            st, j = self._t_api(port, "/api/expiry",
+                                {"id": sid, "expiry": "30"}, acookie)
+            self.assertEqual(st, 200, j)
+            self.assertTrue(j["ok"])
+            st, j = self._t_api(port, "/api/title",
+                                {"id": sid, "title": "新备注"}, acookie)
+            self.assertEqual(st, 200, j)
+            self.assertTrue(j["ok"])
+            st, j = self._t_api(port, "/api/delete", {"id": sid}, acookie)
+            self.assertEqual(st, 200, j)
+            self.assertTrue(j["ok"])
+
     def test_multiuser_file_delete_admin_only(self):
         # 全部文件所有人可见，但删除只有管理员可以
         with self.server("127.0.0.1") as port:
@@ -1460,6 +1515,87 @@ class Connectivity(unittest.TestCase):
         self.assertIn("处理中", seg)
         self.assertIn("btn.disabled=true", seg)
         self.assertIn("(j&&j.error)", seg)
+
+    def _apipost_js(self):
+        # 从渲染后的控制台页面提取 apiPost 函数源码（大括号已展开）
+        html = app.dash_page([], {"id": 1, "is_admin": True}).decode("utf-8")
+        i = html.find("function apiPost(url, body){")
+        self.assertGreater(i, 0, "apiPost not found in dash page")
+        j = html.find("{", i)
+        depth, k = 0, j
+        while True:
+            if html[k] == "{":
+                depth += 1
+            elif html[k] == "}":
+                depth -= 1
+            if depth == 0:
+                break
+            k += 1
+        return html[i:k + 1]
+
+    def test_console_actions_use_apipost(self):
+        # 回归：控制台 7 个操作（删分享/删文件/改备注/改过期/删用户/
+        # 重设密码/改备注）曾用裸 fetch 且没有 .catch，网络抖动或
+        # 服务端返回非 JSON 时 Promise 静默拒绝、页面"点了没反应"。
+        # 现统一走 apiPost。
+        html = app.dash_page([], {"id": 1, "is_admin": True}).decode("utf-8")
+        self.assertIn("function apiPost(url, body){", html)
+        for fn, url in (("delShare", "/api/delete"),
+                        ("delFilesByIds", "/api/del_files"),
+                        ("saveTitle", "/api/title"),
+                        ("saveExpiry", "/api/expiry"),
+                        ("userDel", "/api/user_del"),
+                        ("saveResetPw", "/api/user_resetpw"),
+                        ("saveRemark", "/api/user_remark")):
+            i = html.find("function %s(" % fn)
+            self.assertGreater(i, 0, fn)
+            seg = html[i:html.find("}", html.find("{", i)) + 1]
+            # 函数体内必须走 apiPost，且不能残留裸 fetch( 静默链
+            self.assertIn("apiPost('%s'" % url, seg, fn)
+            self.assertNotIn("fetch(", seg, fn)
+
+    def test_apipost_never_silent(self):
+        # 行为测试（Node 实跑）：断网 / HTTP 500 非 JSON / HTTP 400 JSON
+        # error 三种失败都必须弹明确提示；成功才刷新。旧代码没有 apiPost，
+        # _apipost_js 直接 FAIL，是真回归测试。
+        js = self._apipost_js()
+        self.assertIn(".catch(function", js)
+        script = js + """
+var alerts=[], reloaded=false;
+var location={reload:function(){reloaded=true;}};
+function alert(m){alerts.push(String(m));}
+var __mode='';
+function fetch(url, opts){
+  if(__mode==='netfail') return Promise.reject(new Error('boom'));
+  if(__mode==='html500') return Promise.resolve({ok:false,status:500,
+    text:function(){return Promise.resolve('<html>err</html>');}});
+  if(__mode==='json400') return Promise.resolve({ok:false,status:400,
+    text:function(){return Promise.resolve('{"ok":false,"error":"\u8fd9\u4e2a\u5bc6\u7801\u5df2\u5b58\u5728"}');}});
+  return Promise.resolve({ok:true,status:200,
+    text:function(){return Promise.resolve('{"ok":true}');}});
+}
+async function run(){
+  var out=[];
+  __mode='netfail'; await apiPost('/x','a=1');
+  out.push('netfail:'+(alerts.length?alerts[alerts.length-1]:'NO ALERT'));
+  __mode='html500'; await apiPost('/x','a=1');
+  out.push('html500:'+(alerts.length?alerts[alerts.length-1]:'NO ALERT'));
+  __mode='json400'; await apiPost('/x','a=1');
+  out.push('json400:'+(alerts.length?alerts[alerts.length-1]:'NO ALERT'));
+  __mode='ok'; await apiPost('/x','a=1');
+  out.push('ok:'+(reloaded?'RELOADED':'NO RELOAD'));
+  console.log(out.join('\\n'));
+}
+run();
+"""
+        r = subprocess.run(["node", "-e", script], capture_output=True,
+                           text=True, timeout=15)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = dict(l.split(":", 1) for l in r.stdout.strip().split("\n"))
+        self.assertIn("请求失败", lines["netfail"], lines)
+        self.assertIn("HTTP 500", lines["html500"], lines)
+        self.assertIn("这个密码已存在", lines["json400"], lines)
+        self.assertEqual(lines["ok"], "RELOADED", lines)
 
     def test_user_add_duplicate_pw_json_error(self):
         # 密码重复时服务端返回 400 + JSON error，前端能直接展示文案而不是静默
@@ -2452,6 +2588,111 @@ class Connectivity(unittest.TestCase):
         self.assertIn("/s/abC123-_/v/1", body)
         self.assertIn("查看", body)
 
+    def test_multipart_enospc_returns_507(self):
+        # 回归测试：multipart 上传写盘中途磁盘满（ENOSPC），以前冒泡成
+        # 500"服务器错误"，用户不知道是磁盘满了（分片上传路径早就明确
+        # 507+文案）。现在三个 multipart 入口都要 507+明确文案。
+        import errno
+        from unittest import mock
+        real_open = open
+
+        class EnospcFile:
+            def __init__(self, real):
+                self._r = real
+            def write(self, data):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            def close(self):
+                self._r.close()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                self.close()
+                return False
+
+        def fake_open(path, mode="r", *a, **kw):
+            f = real_open(path, mode, *a, **kw)
+            if "w" in str(mode) and str(path).startswith(app.FILES_DIR):
+                return EnospcFile(f)
+            return f
+
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----enospc"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                  f"filename=\"a.txt\"\r\n\r\n" + "x" * 1000 +
+                  f"\r\n--{bnd}--\r\n").encode()
+            with mock.patch("builtins.open", fake_open):
+                c.request("POST", "/api/share", body=mp,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                self.assertEqual(r.status, 507)
+                self.assertIn("磁盘空间不足", r.read().decode("utf-8"))
+            # 同一连接上再发一个正常请求，确认连接已关、没有残留 body 污染
+            c.close()
+
+    def test_orphan_sweep_on_startup(self):
+        # 回归测试：_chunk_finalize 里 rename 成功、入库前崩溃，或 multipart
+        # 落盘后事务未提交就崩溃，会留下有文件、无 DB 行的孤儿。
+        # 启动清理必须删掉孤儿和 chunk_*，但保留 DB 有行的正常文件。
+        os.makedirs(app.FILES_DIR, exist_ok=True)
+        orphan = os.path.join(app.FILES_DIR, "deadbeef" * 8)
+        with open(orphan, "wb") as f:
+            f.write(b"orphan")
+        chunk_tmp = os.path.join(app.FILES_DIR, "chunk_abc123")
+        with open(chunk_tmp, "wb") as f:
+            f.write(b"chunk")
+        legit = os.path.join(app.FILES_DIR, "legitfile" + "0" * 55)
+        with open(legit, "wb") as f:
+            f.write(b"legit")
+        with app.db() as c:
+            c.execute("INSERT INTO files(filename,stored,size,created) "
+                      "VALUES('l.txt',?,5,?)",
+                      (os.path.basename(legit), int(time.time())))
+        app._sweep_startup_files()
+        self.assertFalse(os.path.exists(orphan))
+        self.assertFalse(os.path.exists(chunk_tmp))
+        self.assertTrue(os.path.exists(legit))
+
+
+    def test_caddy_bak_refreshed_every_run(self):
+        # 回归测试：普通模式的 Caddyfile.bak 以前只在"不存在时"备份一次。
+        # 第二次运行失败时，恢复的是第一次运行前的古老配置，而不是上次
+        # 成功的配置——会把正在用的 HTTPS 搞挂。现在每次运行都要重新备份。
+        text = (ROOT / "enable-https.sh").read_text()
+        # 普通模式的备份段（NAT 模式用的是 per-run 的 mktemp -d，没有 stale 问题）
+        start = text.index("# ---- [4] 写 Caddy 配置 ----")
+        start = text.index("mkdir -p /etc/caddy", start)
+        end = text.index("cat > /etc/caddy/Caddyfile <<EOF", start)
+        block = text[start:end]
+        self.assertIn("Caddyfile.bak", block)
+        with tempfile.TemporaryDirectory() as folder:
+            caddy = Path(folder) / "caddy"
+            caddy.mkdir()
+            (caddy / "Caddyfile").write_text("run1-working-config")
+            script = ("set -eu\n" + block.replace(
+                "/etc/caddy", str(caddy)).replace(
+                "mkdir -p " + str(caddy), "mkdir -p " + shlex.quote(str(caddy))))
+            r = subprocess.run(["sh", "-c", script], capture_output=True,
+                               text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((caddy / "Caddyfile.bak").read_text(),
+                             "run1-working-config")
+            # 第二次运行：Caddyfile 已是新的可用配置，备份必须更新
+            (caddy / "Caddyfile").write_text("run2-working-config")
+            r = subprocess.run(["sh", "-c", script], capture_output=True,
+                               text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((caddy / "Caddyfile.bak").read_text(),
+                             "run2-working-config")
+
 
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
@@ -3035,6 +3276,144 @@ class HTTPSConfig(unittest.TestCase):
             self.assertIn('重启失败', out)
             self.assertIn('停的', out)
             self.assertIn('systemctl start caddy', out)
+
+    def port_parse_block(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('PORT="$(grep -o \'SHARE_PORT=')
+        end = text.index('echo "检测到 minishare 端口')
+        return text[start:end]
+
+    def test_port_unparseable_is_hard_error(self):
+        # 回归：读不到 minishare 端口时，以前静默 fallback 到 18080，
+        # 脚本会拿着错误的端口继续配 Caddy、生成错误的访问地址。
+        # 现在必须直接报错退出，不猜。
+        block = self.port_parse_block()
+        with tempfile.TemporaryDirectory() as folder:
+            bad = Path(folder) / 'minishare.service'
+            bad.write_text('Environment=SHARE_HOST=0.0.0.0\n')
+            r = subprocess.run(
+                ['sh', '-c', 'set -eu\n' + block + '\nprintf "PORT=%s\\n" "$PORT"\n'],
+                env={**os.environ, 'SRV_FILE': str(bad)},
+                capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('SHARE_PORT', r.stdout + r.stderr)
+            good = Path(folder) / 'good.service'
+            good.write_text('Environment=SHARE_HOST=0.0.0.0\nEnvironment=SHARE_PORT=19332\n')
+            r = subprocess.run(
+                ['sh', '-c', 'set -eu\n' + block + '\nprintf "PORT=%s\\n" "$PORT"\n'],
+                env={**os.environ, 'SRV_FILE': str(good)},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('PORT=19332', r.stdout)
+
+    def nat_case_unit(self, fail, caddy_unit=None, service_text=None):
+        # 带 caddy 服务单元场景的 NAT 流程：fail=1 走回滚
+        import re as _re
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'etc/systemd/system').mkdir(parents=True)
+            (root / 'run/systemd/system').mkdir(parents=True)
+            (root / 'etc/caddy').mkdir()
+            service = root / 'etc/systemd/system/minishare.service'
+            original = (service_text if service_text is not None
+                        else 'Environment=SHARE_HOST=0.0.0.0\nEnvironment=SHARE_PORT=19332\n')
+            service.write_text(original)
+            caddyfile = root / 'etc/caddy/Caddyfile'
+            caddyfile.write_text('original caddy config\n')
+            unit = root / 'etc/systemd/system/caddy.service'
+            if caddy_unit is not None:
+                unit.write_text(caddy_unit)
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            commands = {'sleep': 'exit 0', 'systemctl':
+                        'if [ "$1 $2" = "restart caddy" ] && [ "$FAIL_CADDY" = 1 ]; then exit 1; fi\n'
+                        'if [ "$1 $2" = "is-active --quiet" ] && [ "$FAIL_CADDY" = 1 ]; then exit 1; fi\nexit 0',
+                        'journalctl': 'exit 1'}
+            if sys.platform == 'darwin':
+                commands['sed'] = 'if [ "$1" = -i ]; then shift; exec /usr/bin/sed -i "" "$@"; else exec /usr/bin/sed "$@"; fi'
+            for name, body in commands.items():
+                path = bin_dir / name
+                path.write_text('#!/bin/sh\n' + body + '\n')
+                path.chmod(0o755)
+            text = (ROOT / 'enable-https.sh').read_text()
+            block = text[text.index('# Caddy wildcard bind'):text.index('# ---- [9] 放行防火墙')]
+            block = block.replace('/etc/', str(root / 'etc') + '/').replace('/run/systemd/system', str(root / 'run/systemd/system'))
+            result = subprocess.run(['sh', '-c', 'set -eu\n' + block], env={**os.environ,
+                'PATH': str(bin_dir) + ':' + os.environ['PATH'], 'SRV_FILE': str(service),
+                'SRV_HOST': '0.0.0.0', 'ORIG_PORT': '19332', 'PORT': '19332',
+                'DOMAIN': 'test.example.com', 'CERTDIR': str(root / 'cert'), 'FAIL_CADDY': str(int(fail))},
+                capture_output=True, text=True, errors="replace", timeout=10)
+            # 注意：TemporaryDirectory 的 with 块在 return 后就删目录，
+            # 文件内容必须在这里读出来，不能把 Path 传给调用方再读。
+            return {
+                'rc': result.returncode,
+                'out': result.stdout + result.stderr,
+                'service': service.read_text() if service.exists() else None,
+                'caddyfile': caddyfile.read_text() if caddyfile.exists() else None,
+                'unit': unit.read_text() if unit.exists() else None,
+                'unit_exists': unit.exists(),
+                'original': original,
+            }
+
+    def test_nat_rollback_restores_preexisting_caddy_unit(self):
+        # 回归：NAT 模式 [8] 直接覆盖 /etc/systemd/system/caddy.service，
+        # 用户原来自己的 caddy 服务单元就丢了；回滚也不恢复。
+        # 现在覆盖前备份、回滚时恢复。
+        st = self.nat_case_unit(True, caddy_unit='my own caddy unit\n')
+        self.assertNotEqual(st['rc'], 0, st['out'])
+        self.assertEqual(st['unit'], 'my own caddy unit\n')
+        self.assertEqual(st['service'], st['original'])
+        self.assertEqual(st['caddyfile'], 'original caddy config\n')
+
+    def test_nat_rollback_removes_created_caddy_unit(self):
+        # 回归：失败的 NAT 运行会留下一个本脚本新建的、已 enable 的
+        # caddy.service，但 Caddyfile 已经被回滚删掉——下次开机 caddy
+        # 就进 Restart=on-failure 的 5 秒重启死循环。现在回滚时清理掉。
+        st = self.nat_case_unit(True)
+        self.assertNotEqual(st['rc'], 0, st['out'])
+        self.assertFalse(st['unit_exists'])
+        self.assertEqual(st['service'], st['original'])
+
+    def test_nat_sed_noop_triggers_rollback(self):
+        # 回归：[7] 的 sed 如果没匹配上（服务文件被手工改过格式），
+        # minishare 还在旧端口，Caddy 却去连 BACKEND_PORT——以前不检查，
+        # 留下一个"看着成功、实际不通"的状态。现在直接报错走回滚。
+        bad_service = 'Environment SHARE_HOST=0.0.0.0\nEnvironment SHARE_PORT=19332\n'
+        st = self.nat_case_unit(False, service_text=bad_service)
+        self.assertNotEqual(st['rc'], 0, st['out'])
+        self.assertIn('改写 minishare 服务文件失败', st['out'])
+        self.assertEqual(st['service'], st['original'])
+
+    def test_jsdelivr_cache_bust(self):
+        # 回归：jsdelivr 镜像也有 CDN 缓存，以前只有 raw 加了时间戳，
+        # 走镜像 fallback 的用户会拿到旧文件。现在两个镜像都加。
+        install = (ROOT / 'install.sh').read_text()
+        dl_start = install.index('dl() {')
+        dl_block = install[dl_start:install.index('TMPD="$(mktemp -d)"', dl_start)]
+        self.assertIn('*cdn.jsdelivr.net*', dl_block)
+        self.assertIn('?t=$(date +%s)', dl_block)
+        repair = (ROOT / 'repair.sh').read_text()
+        self.assertIn('cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh?t=$TS',
+                      repair)
+
+    def test_normal_mode_backs_up_caddy_unit(self):
+        # 回归：普通模式 [5] 也直接覆盖 caddy 服务单元。现在覆盖前备份，
+        # [5b] 失败恢复 Caddyfile.bak 时把服务单元也恢复回去。
+        text = (ROOT / 'enable-https.sh').read_text()
+        self.assertIn('/etc/caddy/caddy.service.bak', text)
+        five = text.index('# ---- [5] 设置开机自启并启动')
+        fiveb = text.index('# ---- [5b] 确认 Caddy 真的在跑')
+        self.assertIn('caddy.service.bak', text[five:fiveb])
+        self.assertIn('caddy.service.bak', text[fiveb:])
+
+    def test_repair_uses_mktemp_not_fixed_path(self):
+        # 回归：repair.sh 以前下载到固定路径 /tmp/minishare-install.sh，
+        # 预先放一个同名符号链接就能把下载内容写到任意文件（root 运行），
+        # 并发跑两次也会互相覆盖。现在必须用 mktemp 独占创建+trap 清理。
+        repair = (ROOT / 'repair.sh').read_text()
+        self.assertNotIn('/tmp/minishare-install.sh', repair)
+        self.assertIn('mktemp', repair)
+        self.assertIn("trap 'rm -f", repair)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
