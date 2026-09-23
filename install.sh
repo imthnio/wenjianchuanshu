@@ -62,12 +62,17 @@ else
   MIRRORS="https://raw.githubusercontent.com/${MINISHARE_REPO}/main https://cdn.jsdelivr.net/gh/${MINISHARE_REPO}@main"
   dl() { # 用法: dl 文件名 —— 每个镜像都试一遍，成功就返回
     for m in $MIRRORS; do
+      # raw.githubusercontent.com 有约 5 分钟的 CDN 缓存：刚推上去的修复，
+      # 用户立刻重装会拿到旧脚本、以为"修了没用"。URL 加时间戳参数绕过
+      # 边缘缓存、回源拿最新（query 不影响文件内容）。
+      u="$m/$1"
+      case "$u" in *raw.githubusercontent.com*) u="$u?t=$(date +%s)" ;; esac
       if command -v curl >/dev/null 2>&1; then
-        curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$1" "$m/$1" 2>/dev/null && return 0
+        curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$1" "$u" 2>/dev/null && return 0
       else
         # wget 参数必须同时兼容 GNU wget 和 busybox wget（精简 Alpine 只有后者，
         # 它不支持 --connect-timeout，用了会直接报错退出）：-T 两边都是超时秒数
-        wget -q -T 120 -O "$1" "$m/$1" 2>/dev/null && return 0
+        wget -q -T 120 -O "$1" "$u" 2>/dev/null && return 0
       fi
     done
     return 1
