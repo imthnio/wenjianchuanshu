@@ -141,6 +141,24 @@ def delete_share(sid):
         c.execute("DELETE FROM files WHERE share_id=?", (sid,))
         c.execute("DELETE FROM shares WHERE id=?", (sid,))
 
+def all_files():
+    with db() as c:
+        return c.execute(
+            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title"
+            " FROM files f LEFT JOIN shares s ON f.share_id=s.id"
+            " ORDER BY f.id DESC").fetchall()
+
+def delete_files(ids):
+    with db() as c:
+        for fid in ids:
+            r = c.execute("SELECT stored FROM files WHERE id=?", (fid,)).fetchone()
+            if r:
+                try:
+                    os.unlink(os.path.join(FILES_DIR, r["stored"]))
+                except OSError:
+                    pass
+                c.execute("DELETE FROM files WHERE id=?", (fid,))
+
 def cleanup_expired():
     now = int(time.time())
     with db() as c:
@@ -401,6 +419,7 @@ progress{width:100%;height:10px;margin:6px 0}
 .row{display:flex;gap:8px}.row>*{flex:1}
 .badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:20px;background:#eef4ff;color:#1677ff;margin-right:6px}
 .badge.recv{background:#f6ffed;color:#389e0d}
+input.fileck{width:auto;margin:0 8px 2px 0;vertical-align:-2px}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 """
 
@@ -456,6 +475,18 @@ def dash_page(shares):
 <button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
 <button class='danger' onclick="delShare('{s['id']}')">删除</button>
 </div></div>""")
+    frows = []
+    for fr in all_files():
+        fid, fn, fsz, fct, stype, stitle = fr["id"], fr["filename"], fr["size"], fr["created"], fr["type"], fr["title"]
+        ftyp = "发送" if stype == "send" else "接收"
+        fcls = "" if stype == "send" else "recv"
+        frows.append(f"""<div class='file'><div>
+<input type='checkbox' class='fileck' value='{fid}'>
+<span class='badge {fcls}'>{ftyp}</span><b>{html.escape(fn)}</b>
+<div class='muted'>{hsize(fsz)} · 来自{ftyp}「{html.escape(stitle or '(无备注)')}」 · {htime(fct)}</div>
+</div>
+<button class='danger' onclick="delOneFile({fid})">删除</button></div>""")
+    flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
     lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
     return page("控制台", f"""<div class='topbar'><h1>🗂️ 文件分享</h1>
 <a href='/logout' class='muted'>退出登录</a></div>
@@ -478,6 +509,13 @@ def dash_page(shares):
 <option value='30'>30 天后过期</option><option value='0'>永久有效</option></select>
 <button>生成接收链接</button></form><div id='recvRes'></div></div>
 <div class='card'><h2>📋 我的分享</h2>{lst}</div>
+<div class='card'><h2>📁 全部文件</h2>
+<p class='muted'>发送和接收的所有文件都在这里。删除为彻底删除，不经过回收站。</p>
+{flist}
+<div class='row' style='margin-top:8px'>
+<button class='ghost' onclick="toggleAllFiles()">全选 / 取消全选</button>
+<button class='danger' onclick="delFiles()">删除选中</button>
+</div><div id='fileRes'></div></div>
 <div class='card'><h2>🔑 修改密码</h2>
 <form id='pwForm'>
 <input type='password' name='new1' placeholder='新密码' required minlength='4'>
@@ -495,13 +533,31 @@ function delShare(id){{
   fetch('/api/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
     body:'id='+encodeURIComponent(id)}}).then(r=>r.json()).then(()=>location.reload());
 }}
+function toggleAllFiles(){{
+  var cks=document.querySelectorAll('.fileck'), all=true, i;
+  for(i=0;i<cks.length;i++){{if(!cks[i].checked)all=false;}}
+  for(i=0;i<cks.length;i++){{cks[i].checked=!all;}}
+}}
+function delOneFile(id){{delFilesByIds([id]);}}
+function delFiles(){{
+  var ids=[], cks=document.querySelectorAll('.fileck:checked'), i;
+  for(i=0;i<cks.length;i++){{ids.push(cks[i].value);}}
+  if(!ids.length){{alert('请先勾选要删除的文件');return;}}
+  delFilesByIds(ids);
+}}
+function delFilesByIds(ids){{
+  if(!confirm('确定彻底删除选中的 '+ids.length+' 个文件吗？删除后无法恢复。'))return;
+  fetch('/api/del_files',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'ids='+encodeURIComponent(ids.join(','))}})
+    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'删除失败');}});
+}}
 function editExpiry(id){{
   var box=document.getElementById('ex-'+id);
   box.innerHTML="<select id='exs-"+id+"'><option value='1'>1 天后过期</option>"
     +"<option value='7' selected>7 天后过期</option><option value='30'>30 天后过期</option>"
     +"<option value='0'>永久有效</option></select> "
-    +"<button class='ghost' onclick=\"saveExpiry('"+id+"')\">确定</button>"
-    +"<button class='ghost' onclick=\"cancelExpiry('"+id+"')\">取消</button>";
+    +"<button class='ghost' onclick=\\\"saveExpiry(\\\"+id+\\\"')\\\">确定</button>"
+    +"<button class='ghost' onclick=\\\"cancelExpiry(\\\"+id+\\\"')\\\">取消</button>";
 }}
 function cancelExpiry(id){{document.getElementById('ex-'+id).innerHTML="";}}
 function saveExpiry(id){{
@@ -850,6 +906,14 @@ class Handler(BaseHTTPRequestHandler):
                 if f.get("id"):
                     delete_share(f["id"])
                 return self._json({"ok": True})
+
+            if p == "/api/del_files":
+                if not self._authed():
+                    return self._json({"ok": False, "error": "未登录"}, 401)
+                f = self._form()
+                ids = [int(x) for x in (f.get("ids") or "").split(",") if x.strip().isdigit()]
+                delete_files(ids)
+                return self._json({"ok": True, "deleted": len(ids)})
 
             if p == "/api/expiry":
                 # 管理员手动调整已创建分享的过期时间（延长或缩短）
