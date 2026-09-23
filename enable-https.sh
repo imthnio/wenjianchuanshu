@@ -269,10 +269,13 @@ if ! command -v caddy >/dev/null 2>&1; then
   URL="https://github.com/caddyserver/caddy/releases/download/${TAG}/caddy_${VER}_linux_${CARCH}.tar.gz"
   echo "下载 $URL …"
   TMPD="$(mktemp -d)"
+  # 下载/解压中途失败（set -e 直接退出）时也清掉临时目录，不留垃圾
+  trap 'rm -rf "$TMPD"' EXIT
   curl -fsSL --max-time 120 -o "$TMPD/caddy.tar.gz" "$URL"
   tar -xzf "$TMPD/caddy.tar.gz" -C "$TMPD" caddy
   install -m 0755 "$TMPD/caddy" /usr/local/bin/caddy
   rm -rf "$TMPD"
+  trap - EXIT
 fi
 echo "Caddy 就绪：$(caddy version)"
 echo ""
@@ -540,10 +543,13 @@ if ! command -v caddy >/dev/null 2>&1; then
   URL="https://github.com/caddyserver/caddy/releases/download/${TAG}/caddy_${VER}_linux_${CARCH}.tar.gz"
   echo "下载 $URL …"
   TMPD="$(mktemp -d)"
+  # 下载/解压中途失败（set -e 直接退出）时也清掉临时目录，不留垃圾
+  trap 'rm -rf "$TMPD"' EXIT
   curl -fsSL --max-time 120 -o "$TMPD/caddy.tar.gz" "$URL"
   tar -xzf "$TMPD/caddy.tar.gz" -C "$TMPD" caddy
   install -m 0755 "$TMPD/caddy" /usr/local/bin/caddy
   rm -rf "$TMPD"
+  trap - EXIT
 fi
 echo "Caddy 就绪：$(caddy version)"
 echo ""
