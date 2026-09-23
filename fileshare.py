@@ -552,10 +552,26 @@ def dash_page(shares):
 <button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div>
 <script>
 function fullLink(p){{return location.origin + p;}}
+function copyText(t, box){{
+  // 剪贴板 API 只在安全上下文（HTTPS / localhost）可用；默认用
+  // http://IP:端口 打开时 navigator.clipboard 是 undefined，
+  // 直接调用会抛 TypeError，按钮点了没任何反应。先判断再调，
+  // 不可用时明确告诉用户手动复制，链接一直可见。
+  function fail(){{
+    box.innerHTML = '<span class="err">浏览器不允许自动复制，请手动复制：</span>'
+      + '<div class="linkbox">' + t + '</div>';
+  }}
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(t).then(function(){{
+      box.innerHTML = '<span class="ok">已复制到剪贴板</span>';
+    }}, fail);
+  }} else {{ fail(); }}
+}}
 function copyLink(id, p){{
   var el = document.getElementById('lk-'+id);
-  el.textContent = fullLink(p);
-  navigator.clipboard.writeText(fullLink(p)).then(()=>{{el.innerHTML='<span class=ok>已复制到剪贴板</span>';}});
+  var t = fullLink(p);
+  el.textContent = t;
+  copyText(t, el);
 }}
 function delShare(id){{
   if(!confirm('确定删除这个分享吗？文件也会一起删除。')) return;
@@ -632,7 +648,7 @@ function bindXhr(fid, url, resId, progId, okText){{
     xhr.onload=function(){{
       if(prog)prog.style.display='none';
       try{{var j=JSON.parse(xhr.responseText);
-        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick=\\"navigator.clipboard.writeText(fullLink('"+j.link+"'))\\">复制链接</button>";
+        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick=\\"copyText(fullLink('"+j.link+"'),this.previousElementSibling)\\">复制链接</button>";
           setTimeout(()=>location.reload(), 1500);
         }}else{{res.innerHTML="<div class='err'>"+(j.error||'失败')+"</div>";}}
       }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
