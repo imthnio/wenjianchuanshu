@@ -268,6 +268,90 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(os.listdir(app.FILES_DIR), [])
             c.close()
 
+    def test_upload_limit_falls_back_when_disk_unknown(self):
+        # 回归测试：statvfs 失败（目录被删、NFS 掉线等）时磁盘大小未知，
+        # 不能按"剩余 0"处理，否则所有上传直接 413。未知时应退回配置上限。
+        with patch.object(app.os, "statvfs", side_effect=OSError("boom")):
+            limit, free = app.upload_limit()
+            self.assertEqual(limit, app.MAX_UPLOAD)
+            self.assertEqual(free, 0)
+
+    def test_file_at_displayed_limit_is_accepted(self):
+        # 回归测试：上限按"实际文件字节数"执行，multipart 信封开销不计入。
+        # 以前是整个请求体（含信封）与上限比较，正好卡着页面显示数字的
+        # 文件会因为信封多出几十字节被 413。
+        import io as _io
+        def body_of(n):
+            bnd = b"----t"
+            body = (b"--" + bnd + b"\r\n"
+                    b'Content-Disposition: form-data; name="f"; filename="a.bin"\r\n'
+                    b"\r\n" + b"x" * n +
+                    b"\r\n--" + bnd + b"--\r\n")
+            return body, bnd
+        # 正好等于上限：必须通过（旧代码这里抛 UploadTooLarge）
+        body, bnd = body_of(1000)
+        self.assertGreater(len(body), 1000)  # 确认信封确实让 total 超过上限
+        fields, files = app.parse_multipart(_io.BytesIO(body), len(body), bnd, 1000)
+        self.assertEqual(files[0]["size"], 1000)
+        for fo in files:  # 成功落盘的文件测试自己清理
+            os.unlink(os.path.join(app.FILES_DIR, fo["stored"]))
+        # 真超了：流式扣额度时 413，且已落盘的部分文件被清理
+        body, bnd = body_of(1100)
+        with self.assertRaises(app.UploadTooLarge):
+            app.parse_multipart(_io.BytesIO(body), len(body), bnd, 1000)
+        self.assertEqual(os.listdir(app.FILES_DIR), [])
+        # 明显超大（total 远超上限+余量）：前置快速拒绝
+        body, bnd = body_of(1000)
+        with self.assertRaises(app.UploadTooLarge):
+            app.parse_multipart(_io.BytesIO(body), len(body) + 2 * 1024 * 1024,
+                                bnd, 1000)
+
+    def test_receive_link_creation_ignores_disk_cap(self):
+        # 回归测试：/api/receive 只创建接收链接、不收文件，这个动作本身
+        # 不占磁盘。磁盘快满时它不该被"剩余空间"上限卡住而报 413；
+        # 而真正的上传（/api/share）仍受磁盘上限约束，且 413 文案应说明
+        # 是磁盘满了，而不是"文件太大"。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----t"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nt\r\n"
+                  f"--{bnd}--\r\n").encode()
+            with patch.object(app, "upload_limit", return_value=(50, 50)):
+                # 建链接：纯表单约 100 字节 > 磁盘上限 50，旧代码 413
+                c.request("POST", "/api/receive", body=mp,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                self.assertEqual(r.status, 200, r.read())
+                r.read()
+                # 真上传 100 字节文件：磁盘只剩 50，413 且文案说明磁盘不足
+                mp2 = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                       f"filename=\"a.txt\"\r\n\r\n" + "x" * 100 +
+                       f"\r\n--{bnd}--\r\n").encode()
+                c.request("POST", "/api/share", body=mp2,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                self.assertEqual(r.status, 413)
+                self.assertIn("磁盘剩余空间不足", r.read().decode("utf-8"))
+            c.close()
+
+    def test_share_page_has_no_footer(self):
+        # 分享页不再显示"由 minishare 提供"字样
+        now = int(time.time())
+        body = app.share_page("abC123-_",
+                              {"id": "abC123-_", "type": "send", "title": "t",
+                               "created": now, "expires": 0},
+                              []).decode("utf-8")
+        self.assertNotIn("由 minishare 提供", body)
+
     def test_chpw_kills_other_sessions(self):
         # 改密码后其他会话立即失效（旧密码可能已泄露），当前会话不断线
         with self.server("127.0.0.1") as port:
