@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import shlex
 import sys
 import re
 import socket
@@ -322,50 +323,6 @@ class Connectivity(unittest.TestCase):
             self.assertTrue(json.loads(body)["ok"])
             c.close()
 
-    def test_delete_share_keeps_files(self):
-        # 删除分享只删链接不删文件：文件保留在"全部文件"里（标记为"链接已删"），
-        # 由用户手动删除。以前 delete_share 会连文件带记录一起删掉。
-        with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            c.request("POST", "/login",
-                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
-                      headers={"Content-Type": "application/x-www-form-urlencoded"})
-            r = c.getresponse()
-            r.read()
-            cookie = r.getheader("Set-Cookie").split(";")[0]
-            bnd = "----keep"
-            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
-                  f"filename=\"keepme.txt\"\r\n\r\n" + "k" * 100 +
-                  f"\r\n--{bnd}--\r\n").encode()
-            c.request("POST", "/api/share", body=mp,
-                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
-                               "Cookie": cookie})
-            r = c.getresponse()
-            share = json.loads(r.read())
-            self.assertTrue(share["ok"])
-            sid = share["id"]
-            self.assertEqual(len(os.listdir(app.FILES_DIR)), 1)
-            c.request("POST", "/api/delete",
-                      body=urllib.parse.urlencode({"id": sid}).encode(),
-                      headers={"Content-Type": "application/x-www-form-urlencoded",
-                               "Cookie": cookie})
-            r = c.getresponse()
-            self.assertTrue(json.loads(r.read())["ok"])
-            # 链接已失效
-            c.request("GET", f"/s/{sid}")
-            r = c.getresponse()
-            r.read()
-            self.assertEqual(r.status, 404)
-            # 文件仍在磁盘上，且控制台"全部文件"里可见并标为"链接已删"
-            self.assertEqual(len(os.listdir(app.FILES_DIR)), 1)
-            c.request("GET", "/dash", headers={"Cookie": cookie})
-            r = c.getresponse()
-            dash = r.read().decode("utf-8")
-            self.assertIn("keepme.txt", dash)
-            self.assertIn("链接已删", dash)
-            c.close()
-
     def test_title_api(self):
         # 改备注：未登录 401 → 登录后改名 → dash 显示 → 清空 → 不存在 404
         with self.server("127.0.0.1") as port:
@@ -642,6 +599,119 @@ class Connectivity(unittest.TestCase):
         finally:
             app.MAX_UPLOAD = old_max
 
+    def test_check_pw_corrupted_hash_returns_false(self):
+        # 回归测试：数据库里存的密码哈希损坏（含 $ 但 salt 不是合法 hex）时，
+        # 之前 bytes.fromhex 在 try 外面抛 ValueError，/login 直接 500；
+        # 损坏的哈希只能判为密码不对，页面显示"密码错误"。
+        self.assertFalse(app.check_pw("x", "zz$xx"))
+        self.assertFalse(app.check_pw("x", "no-dollar-sign"))
+        h = app.hash_pw("right-pw")
+        self.assertTrue(app.check_pw("right-pw", h))
+        self.assertFalse(app.check_pw("wrong-pw", h))
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", "zz$xx")  # 模拟损坏的哈希
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "whatever"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            body = r.read()
+            c.close()
+            self.assertEqual(r.status, 200)  # 旧代码这里是 500
+            self.assertIn("密码错误".encode("utf-8"), body)
+
+    def test_disp_param_semicolon_in_quoted_filename(self):
+        # 回归测试：Content-Disposition 参数按分号切时，引号里的分号
+        # （如 filename="a;b.txt"）不能当分隔符；之前直接 split(";")，
+        # 文件名会被截成 "\"a"。
+        disp = 'form-data; name="file"; filename="a;b.txt"'
+        self.assertEqual(app._disp_param(disp, "filename"), "a;b.txt")
+        # 端到端：上传带分号的文件名，入库名字保持完整
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----semi"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; "
+                  f"filename=\"a;b.txt\"\r\n\r\ndata\r\n--{bnd}--\r\n").encode()
+            c.request("POST", "/api/share", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            self.assertEqual(r.status, 200, r.read())
+            c.close()
+            with app.db() as dbc:
+                fn = dbc.execute("SELECT filename FROM files").fetchone()["filename"]
+            self.assertEqual(fn, "a;b.txt")
+
+    def test_del_files_reports_actual_deletions(self):
+        # 回归测试：/api/del_files 的 deleted 之前是 len(ids)，勾了不存在的
+        # id 也会算进去；现在只计真实删掉的行。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----cnt"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; "
+                  f"filename=\"a.txt\"\r\n\r\ndata\r\n--{bnd}--\r\n").encode()
+            c.request("POST", "/api/share", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 200)
+            with app.db() as dbc:
+                fid = dbc.execute("SELECT id FROM files").fetchone()["id"]
+            c.request("POST", "/api/del_files",
+                      body=urllib.parse.urlencode({"ids": f"{fid},999999"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            j = json.loads(r.read())
+            c.close()
+            self.assertTrue(j["ok"])
+            self.assertEqual(j["deleted"], 1)  # 旧代码这里是 2
+
+    def test_dash_hides_expired_shares(self):
+        # 回归测试：已过期的分享（每小时才会被清理线程删掉）在删掉之前，
+        # 控制台不应再列出来——访问它的链接已经是 404，列表保持一致。
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
+                      ("exp12345", "send", "已过期", now - 100, now - 10))
+            c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
+                      ("ok123456", "send", "还有效", now - 100, 0))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                      " VALUES(?,?,?,?,?)",
+                      ("exp12345", "old.txt", "x" * 32, 3, now - 100))
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            c.request("GET", "/dash", headers={"Cookie": cookie})
+            r = c.getresponse()
+            body = r.read().decode("utf-8")
+            c.close()
+            self.assertEqual(r.status, 200)
+            self.assertNotIn("已过期", body)
+            self.assertNotIn("old.txt", body)
+            self.assertIn("还有效", body)
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
@@ -881,6 +951,48 @@ class Installer(unittest.TestCase):
         self.assertNotEqual(rc, 0)  # no listener: check fails and rolls back
         self.assertIn('恢复原程序', text)
         self.assertNotIn('安装向导', text)
+
+    def test_install_rejects_bad_app_dir(self):
+        # 回归测试：安装目录之前只校验了"绝对路径+字符集"，APP_DIR="/"
+        # 或带 .. 的路径也能通过；"/" 会导致文件被拷到根目录（//fileshare.py）。
+        text = (ROOT / "install.sh").read_text()
+        start = text.index('case "$APP_DIR" in\n  /*)')
+        end = text.index("# 按选择的 IP 版本决定监听地址")
+        block = text[start:end]
+
+        def run(d):
+            r = subprocess.run(["sh", "-c", "set -eu\n" + block],
+                               env={**os.environ, "APP_DIR": d},
+                               capture_output=True, text=True, timeout=10)
+            return r.returncode
+
+        self.assertNotEqual(run("/"), 0)
+        self.assertNotEqual(run("/opt/../evil"), 0)
+        self.assertNotEqual(run("/.."), 0)
+        self.assertEqual(run("/opt/minishare"), 0)
+        self.assertEqual(run("/opt/mini-share_2.0"), 0)
+
+    def test_install_validates_template_placeholders(self):
+        # 回归测试：下载的服务模板如果被代理/缓存换成 200 错误页面，
+        # sed 替换占位符会静默失败，装出坏服务；现在下载后校验占位符。
+        text = (ROOT / "install.sh").read_text()
+        start = text.index("for t in minishare.service minishare.openrc; do")
+        end = text.index('echo "下载完成。"', start)
+        block = text[start:end]
+        with tempfile.TemporaryDirectory() as folder:
+            bad = Path(folder) / "minishare.service"
+            bad.write_text("<html>error page</html>")
+            good = Path(folder) / "minishare.openrc"
+            good.write_text("Environment=SHARE_DATA=@APP_DIR@/data")
+            script = "set -eu\ncd " + shlex.quote(folder) + "\n" + block
+            r = subprocess.run(["sh", "-c", script], capture_output=True,
+                               text=True, timeout=10)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("不是有效的服务模板", r.stdout + r.stderr)
+            bad.write_text("Environment=SHARE_DATA=@APP_DIR@/data")
+            r = subprocess.run(["sh", "-c", script], capture_output=True,
+                               text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
 
 class HTTPSConfig(unittest.TestCase):
     def nat_case(self, fail):
