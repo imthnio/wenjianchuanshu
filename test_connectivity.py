@@ -756,6 +756,36 @@ class Connectivity(unittest.TestCase):
             self.assertNotIn("old.txt", body)
             self.assertIn("还有效", body)
 
+    def test_receive_page_shows_upload_limit(self):
+        # 需求：分享出去的接收链接页面，要提示对方可上传的最大值
+        #（配置上限与服务器剩余空间取小者），免得传了超大文件才发现传不上去。
+        # 1) 函数级：upload_limit() == min(MAX_UPLOAD, 剩余空间)
+        limit, free = app.upload_limit()
+        used, total = app.disk_usage()
+        self.assertEqual(free, max(total - used, 0))
+        self.assertEqual(limit, min(app.MAX_UPLOAD, free))
+        # 2) 页面级：GET /r/<sid> 渲染出提示行，且数字与函数返回值一致
+        with self.server("127.0.0.1") as port:
+            def req(method, path, body=None, headers=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request(method, path, body=body, headers=dict(headers or {}))
+                r = c.getresponse()
+                data = r.read()
+                c.close()
+                return r.status, data
+
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            # 直接入库一个接收分享（省去 multipart 建链接的步骤）
+            with app.db() as c:
+                c.execute("INSERT INTO shares(id,type,title,created,expires)"
+                          " VALUES(?,?,?,?,?)",
+                          ("recvlim1", "receive", "收文件", int(time.time()), 0))
+            s, data = req("GET", "/r/recvlim1")
+            self.assertEqual(s, 200)
+            self.assertIn("单次最多可上传".encode("utf-8"), data)
+            self.assertIn(app.hsize(limit).encode(), data)
+            self.assertIn(app.hsize(free).encode(), data)
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
