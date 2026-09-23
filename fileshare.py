@@ -75,10 +75,13 @@ def init_db():
             filename TEXT, stored TEXT, size INTEGER, created INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_id)")
         # 兼容老版本数据库：补上新增的列
-        for table, col in (("sessions", "user_id"), ("shares", "owner_id")):
+        for table, col, typ in (("sessions", "user_id", "INTEGER"),
+                                ("shares", "owner_id", "INTEGER"),
+                                ("users", "remark", "TEXT"),
+                                ("users", "pw_plain", "TEXT")):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER")
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         _migrate_to_multiuser(c)
 
 def _migrate_to_multiuser(c):
@@ -134,20 +137,35 @@ def has_users():
 def list_users():
     with db() as c:
         return c.execute(
-            "SELECT id, is_admin, created FROM users ORDER BY id").fetchall()
+            "SELECT id, is_admin, created, remark FROM users ORDER BY id").fetchall()
 
-def create_user(pw, is_admin=False):
+def create_user(pw, is_admin=False, remark=""):
     # 密码即账号身份：密码不能与现有任何账号重复，否则登录时无法区分。
+    # remark 是管理员给账号的备注名（比如给了谁），仅展示用。
+    # pw_plain 存明文：管理员要点"眼睛"查看用户密码（用户改密码时同步更新）。
     if len(pw) < 4:
         raise ValueError("密码至少 4 位")
+    remark = (remark or "").strip()[:50]
     with db() as c:
         for r in c.execute("SELECT pw FROM users"):
             if check_pw(pw, r["pw"]):
                 raise ValueError("这个密码已经被别的账号用了，换一个")
         now = int(time.time())
-        cur = c.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)",
-                        (hash_pw(pw), 1 if is_admin else 0, now))
+        cur = c.execute("INSERT INTO users(pw,pw_plain,is_admin,created,remark) VALUES(?,?,?,?,?)",
+                        (hash_pw(pw), pw, 1 if is_admin else 0, now, remark))
         return {"id": cur.lastrowid, "is_admin": bool(is_admin)}
+
+def get_user_pw(uid):
+    # 取账号的明文密码（仅管理员调用；老版本迁移来的账号明文未知时返回 None）。
+    with db() as c:
+        r = c.execute("SELECT pw_plain FROM users WHERE id=?", (uid,)).fetchone()
+        return r["pw_plain"] if r else None
+
+def set_user_remark(uid, remark):
+    # 管理员给账号改备注名：只展示用，不影响登录（登录只认密码）。
+    with db() as c:
+        c.execute("UPDATE users SET remark=? WHERE id=?",
+                  ((remark or "").strip()[:50], uid))
 
 def find_user_by_pw(pw):
     with db() as c:
@@ -168,7 +186,9 @@ def set_user_pw(uid, pw):
         for r in c.execute("SELECT id, pw FROM users WHERE id!=?", (uid,)):
             if check_pw(pw, r["pw"]):
                 raise ValueError("这个密码已经被别的账号用了，换一个")
-        c.execute("UPDATE users SET pw=? WHERE id=?", (hash_pw(pw), uid))
+        # 同步更新明文：管理员点"眼睛"看到的永远是当前密码
+        c.execute("UPDATE users SET pw=?, pw_plain=? WHERE id=?",
+                  (hash_pw(pw), pw, uid))
 
 def delete_user(uid):
     # 删账号：踢掉他的所有会话；他的分享链接失效（文件按现有规则保留，
@@ -596,6 +616,9 @@ def disk_usage():
 
 def disk_foot():
     used, total = disk_usage()
+    if total <= 0:
+        # statvfs 失败、磁盘大小未知：不能显示"剩余 0B"，那是误导。
+        return "<div class='diskfoot'>💾 磁盘信息不可用</div>"
     free = max(total - used, 0)
     pct = min(used * 100 // total, 100) if total else 0
     return (f"<div class='diskfoot'>💾 剩余 {hsize(free)} / 已用 {hsize(used)}"
@@ -604,19 +627,21 @@ def disk_foot():
 def upload_limit():
     # 实际可上传的最大字节数：配置上限与磁盘剩余空间取小者。
     # 磁盘快满时，MAX_UPLOAD 再大也传不上去，页面上就该直接告诉对方真实数字。
+    # 返回 (上限字节数, 磁盘剩余字节数)：statvfs 失败、磁盘大小未知时剩余为
+    # None（未知），绝不能按"剩余 0"处理，否则一次失败的 statvfs 会让所有
+    # 上传直接 413、整个上传功能被误杀。
     used, total = disk_usage()
     if total <= 0:
-        # statvfs 失败、磁盘大小未知：不能按"剩余 0"处理，否则一次失败的
-        # statvfs 会让所有上传直接 413，整个上传功能被误杀。未知时退回配置上限。
-        return MAX_UPLOAD, 0
+        return MAX_UPLOAD, None
     free = max(total - used, 0)
     return min(MAX_UPLOAD, free), free
 
 def too_large_msg():
     # 413 时的错误文案：区分"磁盘满了"和"文件超配置上限"，
     # 否则磁盘满时用户会对着几 MB 的文件困惑"到底哪里大了"。
+    # 磁盘剩余未知（statvfs 失败）时不能谎称"剩余 0B"，给通用文案。
     _, free = upload_limit()
-    if free < MAX_UPLOAD:
+    if free is not None and free < MAX_UPLOAD:
         return "磁盘剩余空间不足（剩余 %s），无法上传" % hsize(free)
     return "文件太大，超出上限"
 
@@ -701,24 +726,30 @@ def dash_page(shares, user):
     if is_admin:
         urows = []
         for u in list_users():
+            remark = (u["remark"] or "").strip()
+            rmk = (f"<span class='badge' id='rmk-{u['id']}'>{html.escape(remark)}</span> "
+                   if remark else f"<span class='muted' id='rmk-{u['id']}'></span>")
             if u["is_admin"]:
                 mark, who = "<span class='badge'>管理员</span>", "管理员"
                 ops = ("<span class='muted'>这是你，改密码请用下面的「修改密码」</span>"
                        if u["id"] == user["id"] else "")
             else:
                 mark, who = f"<span class='badge recv'>用户#{u['id']}</span>", "普通用户"
-                ops = (f"<button class='ghost' onclick=\"resetPw({u['id']})\">重设密码</button> "
+                ops = (f"<button class='ghost' onclick=\"togglePw({u['id']},this)\" title='查看密码'>👁</button> "
+                       f"<button class='ghost' onclick=\"editRemark({u['id']})\">改备注</button> "
+                       f"<button class='ghost' onclick=\"resetPw({u['id']})\">重设密码</button> "
                        f"<button class='danger' onclick=\"userDel({u['id']})\">删除用户</button>")
             urows.append(f"""<div class='file'><div>
-{mark}<b>{who}</b>
-<div class='muted'>创建于 {htime(u['created'])}</div><div id='urp-{u['id']}'></div></div>
+{mark}<b>{who}</b> {rmk}
+<div class='muted'>创建于 {htime(u['created'])}</div><div id='urp-{u['id']}'></div><div id='urm-{u['id']}'></div><div id='upw-{u['id']}'></div></div>
 <div style='white-space:nowrap'>{ops}</div></div>""")
         users_card = f"""<div class='card'><h2>👥 用户管理</h2>
-<p class='muted'>没有注册入口，账号只能由你添加。登录没有用户名：不同的密码就是不同的账号。</p>
+<p class='muted'>没有注册入口，账号只能由你添加。登录没有用户名：不同的密码就是不同的账号。备注名只给你自己看（比如这个账号给了谁），不影响登录。</p>
 {''.join(urows)}
 <form id='userAddForm'>
 <input type='password' name='pw1' placeholder='新用户密码（至少4位）' required minlength='4'>
 <input type='password' name='pw2' placeholder='再次输入' required minlength='4'>
+<input type='text' name='remark' placeholder='备注名（可选，如：张三）' maxlength='50'>
 <button class='ghost' style='width:100%'>添加用户</button></form><div id='userRes'></div></div>
 """
     return page("控制台", f"""<div class='topbar'><h1>🗂️ 文件分享</h1>
@@ -927,6 +958,61 @@ function saveResetPw(id){{
     body:'id='+encodeURIComponent(id)+'&pw1='+encodeURIComponent(a)+'&pw2='+encodeURIComponent(b)}})
     .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'重设失败');}});
 }}
+// 备注名：只给管理员自己看（比如这个账号给了谁），不影响登录（登录只认密码）。
+function editRemark(id){{
+  var box=document.getElementById('urm-'+id);
+  box.innerHTML='';
+  var cur=document.getElementById('rmk-'+id);
+  cur=cur?cur.textContent:'';
+  var inp=document.createElement('input');
+  inp.id='rmi-'+id; inp.maxLength=50; inp.style.width='60%';
+  inp.placeholder='备注名，如：张三（留空则清除）'; inp.value=cur;
+  var ok=document.createElement('button'); ok.className='ghost'; ok.textContent='确定';
+  ok.onclick=function(){{saveRemark(id);}};
+  var no=document.createElement('button'); no.className='ghost'; no.textContent='取消';
+  no.onclick=function(){{cancelRemark(id);}};
+  box.appendChild(inp); box.appendChild(document.createTextNode(' '));
+  box.appendChild(ok); box.appendChild(document.createTextNode(' ')); box.appendChild(no);
+  inp.focus();
+}}
+function cancelRemark(id){{document.getElementById('urm-'+id).innerHTML='';}}
+function saveRemark(id){{
+  var v=document.getElementById('rmi-'+id).value.trim();
+  fetch('/api/user_remark',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)+'&remark='+encodeURIComponent(v)}})
+    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'保存失败');}});
+}}
+// 眼睛：管理员查看某个账号的当前密码。只在管理员的"用户管理"里有这个按钮，
+// 普通用户登录后根本看不到这一整块，所以用户本人不会知道。
+function togglePw(id, btn){{
+  var box=document.getElementById('upw-'+id);
+  if(box.dataset.open==='1'){{box.innerHTML='';box.dataset.open='';btn.textContent='👁';return;}}
+  fetch('/api/user_pw',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)}})
+    .then(r=>r.json()).then(j=>{{
+      if(!j.ok){{alert(j.error||'查看失败');return;}}
+      box.dataset.open='1'; btn.textContent='👁‍🗨';
+      box.innerHTML='';
+      var t=document.createElement('span');
+      t.className='muted'; t.textContent='密码：';
+      var b=document.createElement('b');
+      b.textContent=j.pw||'（老账号，明文未知，改一次密码后可见）';
+      var cp=document.createElement('button');
+      cp.className='ghost'; cp.textContent='复制'; cp.style.marginLeft='8px';
+      cp.onclick=function(){{
+        var done=function(){{cp.textContent='已复制';}};
+        if(navigator.clipboard&&navigator.clipboard.writeText){{
+          navigator.clipboard.writeText(j.pw).then(done,function(){{cp.textContent='复制失败';}});
+        }}else{{
+          var ta=document.createElement('textarea');ta.value=j.pw;document.body.appendChild(ta);
+          ta.select();try{{document.execCommand('copy');done();}}catch(e){{cp.textContent='复制失败';}}
+          document.body.removeChild(ta);
+        }}
+      }};
+      box.appendChild(t); box.appendChild(b);
+      if(j.pw)box.appendChild(cp);
+    }});
+}}
 var _uaf=document.getElementById('userAddForm');
 if(_uaf){{_uaf.addEventListener('submit', function(ev){{
   ev.preventDefault();
@@ -937,16 +1023,21 @@ if(_uaf){{_uaf.addEventListener('submit', function(ev){{
 
 # 能安全在线查看的文件类型（按扩展名判断）。
 # svg 故意不算图片：内联打开时 SVG 里的脚本会在本站域名下执行，有风险，只给下载。
+# pdf 单独一种：浏览器自带的 PDF 阅读器打开是安全的（不会执行页面脚本），
+# 所以给"查看"按钮；但分享列表里不内联嵌入（整文件嵌进去太重），只给按钮。
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VID_EXTS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv"}
+PDF_EXTS = {".pdf"}
 
 def _view_kind(filename):
-    """返回 'img' / 'vid'，不能在线查看的返回 None。"""
+    """返回 'img' / 'vid' / 'pdf'，不能在线查看的返回 None。"""
     ext = os.path.splitext(filename)[1].lower()
     if ext in IMG_EXTS:
         return "img"
     if ext in VID_EXTS:
         return "vid"
+    if ext in PDF_EXTS:
+        return "pdf"
     return None
 
 def share_page(sid, share, files, user=None):
@@ -1127,6 +1218,9 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             return None
         if not user["is_admin"]:
+            # 管理员接口的请求体还没读（如 /api/del_files 的表单）：
+            # 关连接，防残留 body 污染同一 keep-alive 连接上的下一个请求。
+            self._close_if_body_pending()
             self._json({"ok": False, "error": "需要管理员权限"}, 403)
             return None
         return user
@@ -1135,6 +1229,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header("Location", loc)
         self.send_header("Content-Length", "0")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
 
     def _set_sid(self, tok):
@@ -1155,6 +1251,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", "sid=; HttpOnly; Path=/; Max-Age=0")
         self.send_header("Location", "/")
         self.send_header("Content-Length", "0")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
 
     def _form(self):
@@ -1217,8 +1315,9 @@ class Handler(BaseHTTPRequestHandler):
         """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。"""
         size = os.path.getsize(path)
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        if ctype.split("/")[0] not in ("image", "video"):
-            # 非图片/视频：不内联，退回普通下载（防 MIME 混淆）
+        if ctype.split("/")[0] not in ("image", "video") and ctype != "application/pdf":
+            # 非图片/视频/PDF：不内联，退回普通下载（防 MIME 混淆）。
+            # PDF 例外：浏览器用自带阅读器渲染，不会执行页面脚本，安全。
             return self._send_file(path, filename)
         start, end, status = 0, size - 1, 200
         rh = (self.headers.get("Range") or "").strip()
@@ -1429,6 +1528,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, login_page("密码错误"))
 
             if p == "/logout":
+                # 退出链接是 GET，一般没 body；但有人 POST 带 body 时也要
+                # 关连接，防残留污染同一 keep-alive 连接上的下一个请求。
+                self._close_if_body_pending()
                 return self._clear_sid()
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/add", p)
@@ -1440,8 +1542,12 @@ class Handler(BaseHTTPRequestHandler):
                 sid = m.group(1)
                 s = self._valid_share(sid, "send")
                 if not s:
+                    # 请求体还没读：关连接，防残留 body 污染同一 keep-alive
+                    # 连接上的下一个请求（同 /r/<sid>/upload 的 404 路径）。
+                    self._close_if_body_pending()
                     return self._json({"ok": False, "error": "分享不存在"}, 404)
                 if not can_manage_share(user, s):
+                    self._close_if_body_pending()
                     return self._json({"ok": False, "error": "只能操作自己的分享"}, 403)
                 try:
                     _, files = self._multipart()
@@ -1661,10 +1767,45 @@ class Handler(BaseHTTPRequestHandler):
                 if f.get("pw1", "") != f.get("pw2", ""):
                     return self._json({"ok": False, "error": "两次输入不一致"}, 400)
                 try:
-                    u = create_user(f.get("pw1", ""), is_admin=False)
+                    u = create_user(f.get("pw1", ""), is_admin=False,
+                                    remark=f.get("remark", ""))
                 except ValueError as e:
                     return self._json({"ok": False, "error": str(e)}, 400)
                 return self._json({"ok": True, "id": u["id"]})
+
+            if p == "/api/user_remark":
+                # 管理员给账号改备注名（比如这个账号给了谁）：只展示用，
+                # 不影响登录，登录永远只认密码。
+                if not self._require_admin():
+                    return
+                f = self._form()
+                try:
+                    uid = int(f.get("id", ""))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "bad id"}, 400)
+                if not get_user(uid):
+                    return self._json({"ok": False, "error": "用户不存在"}, 404)
+                set_user_remark(uid, f.get("remark", ""))
+                return self._json({"ok": True})
+
+            if p == "/api/user_pw":
+                # 管理员点"眼睛"查看某个账号的当前密码。
+                # 只有管理员能调（普通用户看不到眼睛按钮）；用户改密码/
+                # 管理员重设密码时明文会同步更新，所以看到的永远是当前密码。
+                # 老版本迁移来的账号明文未知：返回空，让他改一次密码后就能看。
+                if not self._require_admin():
+                    return
+                f = self._form()
+                try:
+                    uid = int(f.get("id", ""))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "bad id"}, 400)
+                target = get_user(uid)
+                if not target:
+                    return self._json({"ok": False, "error": "用户不存在"}, 404)
+                if target["is_admin"]:
+                    return self._json({"ok": False, "error": "这是管理员账号"}, 403)
+                return self._json({"ok": True, "pw": get_user_pw(uid) or ""})
 
             if p == "/api/user_del":
                 if not self._require_admin():
