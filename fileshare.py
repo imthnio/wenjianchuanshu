@@ -211,6 +211,8 @@ def _disp_param(disp, key):
     return None
 
 def _clean_filename(fn):
+    # 去掉控制字符：恶意文件名里的 CR/LF 会污染下载响应头（响应拆分攻击）
+    fn = re.sub(r"[\x00-\x1f\x7f]", "", fn)
     fn = os.path.basename(fn.replace("\\", "/")).strip() or "unnamed"
     return fn[:200]
 
@@ -467,11 +469,12 @@ def dash_page(shares):
         cls = "" if s["type"] == "send" else "recv"
         link = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
         items.append(f"""<div class='file'><div>
-<span class='badge {cls}'>{typ}</span><b>{html.escape(s['title'] or '(无备注)')}</b>
+<span class='badge {cls}'>{typ}</span><b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
 <div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
-<div class='linkbox' id='lk-{s['id']}'></div></div>
+<div class='linkbox' id='lk-{s['id']}'></div><div id='ti-{s['id']}'></div></div>
 <div style='white-space:nowrap'>
 <button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
+<button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
 <button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
 <button class='danger' onclick="delShare('{s['id']}')">删除</button>
 </div></div>""")
@@ -556,10 +559,36 @@ function editExpiry(id){{
   box.innerHTML="<select id='exs-"+id+"'><option value='1'>1 天后过期</option>"
     +"<option value='7' selected>7 天后过期</option><option value='30'>30 天后过期</option>"
     +"<option value='0'>永久有效</option></select> "
-    +"<button class='ghost' onclick=\\\"saveExpiry(\\\"+id+\\\"')\\\">确定</button>"
-    +"<button class='ghost' onclick=\\\"cancelExpiry(\\\"+id+\\\"')\\\">取消</button>";
+    +"<button class='ghost' onclick=\\\"saveExpiry('\\\"+id+\\\"')\\\">确定</button>"
+    +"<button class='ghost' onclick=\\\"cancelExpiry('\\\"+id+\\\"')\\\">取消</button>";
 }}
 function cancelExpiry(id){{document.getElementById('ex-'+id).innerHTML="";}}
+function editTitle(id){{
+  var box=document.getElementById('ti-'+id);
+  box.innerHTML='';
+  var cur=document.getElementById('ttl-'+id).textContent;
+  if(cur=='(无备注)')cur='';
+  var inp=document.createElement('input');
+  inp.id='tin-'+id;inp.maxLength=100;inp.style.width='60%';inp.value=cur;
+  inp.placeholder='输入备注名，留空则清除';
+  var ok=document.createElement('button');ok.className='ghost';ok.textContent='确定';
+  ok.onclick=function(){{saveTitle(id);}};
+  var no=document.createElement('button');no.className='ghost';no.textContent='取消';
+  no.onclick=function(){{cancelTitle(id);}};
+  box.appendChild(inp);box.appendChild(document.createTextNode(' '));
+  box.appendChild(ok);box.appendChild(document.createTextNode(' '));box.appendChild(no);
+  inp.focus();
+}}
+function cancelTitle(id){{document.getElementById('ti-'+id).innerHTML='';}}
+function saveTitle(id){{
+  var v=document.getElementById('tin-'+id).value.trim();
+  fetch('/api/title',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:'id='+encodeURIComponent(id)+'&title='+encodeURIComponent(v)}})
+  .then(function(r){{return r.json().then(function(d){{return {{s:r.status,d:d}};}});}})
+  .then(function(x){{
+    if(x.d.ok){{location.reload();}}else{{alert('保存失败：'+(x.d.error||x.s));}}
+  }});
+}}
 function saveExpiry(id){{
   var v=document.getElementById('exs-'+id).value;
   fetch('/api/expiry',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
@@ -713,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _form(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > 1_000_000:
+            raise BadUpload("form too large")
         raw = self.rfile.read(n) if n > 0 else b""
         d = parse_qs(raw.decode("utf-8", "replace"))
         return {k: v[0] for k, v in d.items()}
@@ -722,13 +753,15 @@ class Handler(BaseHTTPRequestHandler):
         m = re.search(r"boundary=([^;]+)", ctype)
         if not m:
             raise BadUpload("no boundary")
-        boundary = m.group(1).strip().strip('"').encode("latin1")
+        try:
+            boundary = m.group(1).strip().strip('"').encode("latin1")
+        except UnicodeEncodeError:
+            raise BadUpload("bad boundary")
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             raise BadUpload("empty body")
-        if self.headers.get("Expect", "").lower() == "100-continue":
-            self.send_response_only(100)
-            self.end_headers()
+        # 注：BaseHTTPRequestHandler 在收到 Expect: 100-continue 时已自动
+        # 回过 100，这里不再手动发，避免重复的 interim 响应。
         return parse_multipart(self.rfile, n, boundary, MAX_UPLOAD)
 
     def _send_file(self, path, filename):
@@ -932,6 +965,22 @@ class Handler(BaseHTTPRequestHandler):
                               (now + days * 86400 if days else 0, sid))
                 return self._json({"ok": True})
 
+            if p == "/api/title":
+                # 改分享的备注名（发送/接收通用），空字符串表示清除备注
+                if not self._authed():
+                    return self._json({"ok": False, "error": "未登录"}, 401)
+                f = self._form()
+                sid = f.get("id", "")
+                title = f.get("title", "")[:100]
+                if not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid):
+                    return self._json({"ok": False, "error": "bad id"}, 400)
+                with db() as c:
+                    r = c.execute("UPDATE shares SET title=? WHERE id=?",
+                                  (title, sid))
+                    if r.rowcount == 0:
+                        return self._json({"ok": False, "error": "分享不存在"}, 404)
+                return self._json({"ok": True})
+
             if p == "/api/chpw":
                 if not self._authed():
                     return self._json({"ok": False, "error": "未登录"}, 401)
@@ -965,6 +1014,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "count": len(files)})
 
             return self._json({"ok": False, "error": "unknown"}, 404)
+        except BadUpload as e:
+            # 表单/分块解析失败（超大、缺 boundary 等）统一 400，各接口内部的
+            # except BadUpload 会先捕获，这里只处理漏网的
+            self._json({"ok": False, "error": str(e) or "请求无效"}, 400)
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as e:
