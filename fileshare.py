@@ -136,13 +136,9 @@ def is_expired(share):
     return share["expires"] and share["expires"] < time.time()
 
 def delete_share(sid):
+    # 只删除分享链接：文件保留在"全部文件"里，由用户手动删除。
+    # 过期自动清理也走这里：链接失效，文件同样保留。
     with db() as c:
-        for f in c.execute("SELECT stored FROM files WHERE share_id=?", (sid,)).fetchall():
-            try:
-                os.unlink(os.path.join(FILES_DIR, f["stored"]))
-            except OSError:
-                pass
-        c.execute("DELETE FROM files WHERE share_id=?", (sid,))
         c.execute("DELETE FROM shares WHERE id=?", (sid,))
 
 def all_files():
@@ -529,17 +525,22 @@ def dash_page(shares):
 <button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
 <button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
 <button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
-<button class='danger' onclick="delShare('{s['id']}')">删除</button>
+<button class='danger' onclick="delShare('{s['id']}')">删除链接</button>
 </div></div>""")
     frows = []
     for fr in all_files():
         fid, fn, fsz, fct, stype, stitle = fr["id"], fr["filename"], fr["size"], fr["created"], fr["type"], fr["title"]
-        ftyp = "发送" if stype == "send" else "接收"
-        fcls = "" if stype == "send" else "recv"
+        if stype is None:
+            # 归属的分享链接已被删除，文件仍保留在这里等待手动清理
+            ftyp, fcls, fsrc = "链接已删", "recv", "分享链接已删除"
+        else:
+            ftyp = "发送" if stype == "send" else "接收"
+            fcls = "" if stype == "send" else "recv"
+            fsrc = f"{ftyp}「{html.escape(stitle or '(无备注)')}」"
         frows.append(f"""<div class='file'><div>
 <input type='checkbox' class='fileck' value='{fid}'>
 <span class='badge {fcls}'>{ftyp}</span><b>{html.escape(fn)}</b>
-<div class='muted'>{hsize(fsz)} · 来自{ftyp}「{html.escape(stitle or '(无备注)')}」 · {htime(fct)}</div>
+<div class='muted'>{hsize(fsz)} · 来自{fsrc} · {htime(fct)}</div>
 </div>
 <button class='danger' onclick="delOneFile({fid})">删除</button></div>""")
     flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
@@ -601,7 +602,7 @@ function copyLink(id, p){{
   copyText(t, el);
 }}
 function delShare(id){{
-  if(!confirm('确定删除这个分享吗？文件也会一起删除。')) return;
+  if(!confirm('确定删除这个分享链接吗？文件会保留，可在「全部文件」里手动删除。')) return;
   fetch('/api/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
     body:'id='+encodeURIComponent(id)}}).then(r=>r.json()).then(()=>location.reload());
 }}
