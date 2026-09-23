@@ -95,6 +95,92 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(r.status, 400)
             c.close()
 
+    def test_error_paths_close_connection(self):
+        # 请求体没读完就报错（超大上传）时必须关连接并带 Connection: close，
+        # 否则残留的请求体会污染同一 keep-alive 连接上的下一个请求
+        # （曾实测到服务端把请求体当成新请求解析，吐出 400/414 垃圾）。
+        old_max = app.MAX_UPLOAD
+        app.MAX_UPLOAD = 200
+        try:
+            with self.server("127.0.0.1") as port:
+                app.meta_set("pw", app.hash_pw("pw123456"))
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/login",
+                          body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+                r = c.getresponse()
+                r.read()
+                cookie = r.getheader("Set-Cookie").split(";")[0]
+                bnd = "----t"
+                mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                      f"filename=\"a.txt\"\r\n\r\n" + "x" * 500 +
+                      f"\r\n--{bnd}--\r\n").encode()
+                c.request("POST", "/api/share", body=mp,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                self.assertEqual(r.status, 413)
+                self.assertEqual(r.getheader("Connection"), "close")
+                r.read()
+                c.close()
+        finally:
+            app.MAX_UPLOAD = old_max
+
+    def test_chpw_kills_other_sessions(self):
+        # 改密码后其他会话立即失效（旧密码可能已泄露），当前会话不断线
+        with self.server("127.0.0.1") as port:
+            def login(pw):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/login",
+                          body=urllib.parse.urlencode({"pw": pw}).encode(),
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+                r = c.getresponse()
+                r.read()
+                self.assertEqual(r.status, 302)
+                return r.getheader("Set-Cookie").split(";")[0].split("=")[1], c
+            app.meta_set("pw", app.hash_pw("oldpw123"))
+            sess_a, ca = login("oldpw123")
+            sess_b, cb = login("oldpw123")
+            ca.request("POST", "/api/chpw",
+                       body=urllib.parse.urlencode(
+                           {"new1": "newpw123", "new2": "newpw123"}).encode(),
+                       headers={"Content-Type": "application/x-www-form-urlencoded",
+                                "Cookie": f"sid={sess_a}"})
+            r = ca.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(json.loads(r.read())["ok"])
+            cb.request("GET", "/dash", headers={"Cookie": f"sid={sess_b}"})
+            r = cb.getresponse()
+            r.read()
+            self.assertEqual(r.status, 302)
+            ca.request("GET", "/dash", headers={"Cookie": f"sid={sess_a}"})
+            r = ca.getresponse()
+            r.read()
+            self.assertEqual(r.status, 200)
+            ca.close()
+            cb.close()
+
+    def test_del_files_rejects_non_ascii_ids(self):
+        # str.isdigit() 对 "²" 返回 True 但 int() 会炸：非法 id 应忽略而非 500
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            c.request("POST", "/api/del_files",
+                      body=urllib.parse.urlencode({"ids": "²,abc"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            body = r.read()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(json.loads(body)["ok"])
+            c.close()
+
     def test_title_api(self):
         # 改备注：未登录 401 → 登录后改名 → dash 显示 → 清空 → 不存在 404
         with self.server("127.0.0.1") as port:
@@ -150,6 +236,58 @@ class Connectivity(unittest.TestCase):
         # 文件名里的 CR/LF 若不清理，会污染下载时的 Content-Disposition 响应头
         self.assertEqual(app._clean_filename('evil\r\nX-Injected: 1.txt'),
                          'evilX-Injected: 1.txt')
+
+    def test_dash_shows_disk_usage_in_corner(self):
+        # 控制台左下角固定角标显示已用/总空间；公开分享页不暴露磁盘信息
+        with self.server("127.0.0.1") as port:
+            def req(method, path, body=None, headers=None, cookie=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                h = dict(headers or {})
+                if cookie:
+                    h["Cookie"] = cookie
+                c.request(method, path, body=body, headers=h)
+                r = c.getresponse()
+                data = r.read()
+                ck = r.getheader("Set-Cookie")
+                c.close()
+                return r.status, ck, data
+
+            form = {"Content-Type": "application/x-www-form-urlencoded"}
+            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234"}).encode()
+            s, ck, _ = req("POST", "/setup", body, form)
+            self.assertEqual(s, 302)
+            cookie = ck.split(";")[0]
+
+            s, _, b = req("GET", "/dash", cookie=cookie)
+            self.assertEqual(s, 200)
+            html = b.decode("utf-8")
+            used, total = app.disk_usage()
+            self.assertIn("class='diskfoot'", html)
+            self.assertIn("已用", html)
+            self.assertIn(app.hsize(used), html)
+            self.assertIn(app.hsize(total), html)
+
+            # 未登录访问公开分享页，不应出现磁盘信息
+            mp = ("------b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nt\r\n"
+                  "------b--\r\n").encode()
+            s, _, b = req("POST", "/api/receive", mp,
+                          {"Content-Type": "multipart/form-data; boundary=----b"}, cookie)
+            sid = json.loads(b)["id"]
+            s, _, b = req("GET", f"/r/{sid}")
+            self.assertEqual(s, 200)
+            self.assertNotIn(b"class='diskfoot'", b)
+            self.assertNotIn("已用".encode(), b)
+
+    def test_dash_linkbox_prefilled(self):
+        # 回归测试：分享卡片的虚线链接框以前是空的占位 div，
+        # 点"复制链接"之前一直是个空框让人困惑；现在渲染时就填好链接
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        body = app.dash_page(shares).decode("utf-8")
+        self.assertIn("<div class='linkbox' id='lk-abC123-_'>/s/abC123-_</div>", body)
         self.assertEqual(app._clean_filename('../../etc/passwd'), 'passwd')
         self.assertEqual(app._clean_filename('正常 文件名.pdf'), '正常 文件名.pdf')
 
