@@ -492,6 +492,13 @@ def disk_foot():
     return (f"<div class='diskfoot'>💾 剩余 {hsize(free)} / 已用 {hsize(used)}"
             f"<span class='diskbar'><i style='width:{pct}%'></i></span></div>")
 
+def upload_limit():
+    # 接收端实际可上传的最大字节数：配置上限与磁盘剩余空间取小者。
+    # 磁盘快满时，MAX_UPLOAD 再大也传不上去，页面上就该直接告诉对方真实数字。
+    used, total = disk_usage()
+    free = max(total - used, 0)
+    return min(MAX_UPLOAD, free), free
+
 def setup_page(err=""):
     e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
     return page("初始设置", f"""<div class='card' style='max-width:420px;margin:40px auto'>
@@ -710,9 +717,11 @@ def share_page(sid, share, files, base):
 <p class='muted' style='margin-top:16px'>由 minishare 提供 · {html.escape(base)}</p></div>""")
 
 def receive_page(sid, share):
+    limit, free = upload_limit()
     return page("上传文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📤 {html.escape(share['title'] or '文件接收')}</h1>
 <p class='muted'>选择文件上传，上传完成后对方即可收到。到期：{htime(share['expires'])}</p>
+<p class='muted'>📦 单次最多可上传 <b>{hsize(limit)}</b>（上传上限 {hsize(MAX_UPLOAD)} · 服务器剩余空间 {hsize(free)}）</p>
 <form id='upForm'><input type='file' name='file' multiple required>
 <button>开始上传</button>
 <progress id='prog' value='0' max='100' style='display:none'></progress></form>
