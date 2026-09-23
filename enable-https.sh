@@ -380,7 +380,10 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable caddy >/dev/null 2>&1 || true
-  systemctl restart caddy
+  # 不能裸写 systemctl restart caddy：失败时 set -e 会直接退出脚本，
+  # 后面 [5b] 的"是否真在跑"检查和日志打印就永远跑不到了。
+  # 这里故意 || true，把"起没起来"的判断和报错统一交给 [5b]。
+  systemctl restart caddy || true
 elif command -v rc-update >/dev/null 2>&1; then
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
@@ -397,7 +400,8 @@ depend() {
 EOF
   chmod +x /etc/init.d/caddy
   rc-update add caddy default >/dev/null
-  rc-service caddy restart || rc-service caddy start
+  # 同上：restart/start 都失败也别让 set -e 直接掐死脚本，交给 [8b] 统一报错+回滚
+  rc-service caddy restart || rc-service caddy start || true
 else
   echo "没检测到 systemd 或 OpenRC，请手动后台运行："
   echo "  nohup /usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/var/log/caddy.log 2>&1 &"
@@ -416,7 +420,12 @@ else
   CADDY_MANAGED=0
 fi
 if [ "$CADDY_MANAGED" = "1" ] && [ "$CADDY_OK" != "1" ]; then
-  echo "Caddy 没能启动，请检查日志；即将自动恢复原配置。"
+  echo "Caddy 没能启动，日志如下；即将自动恢复原配置。"
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    journalctl -u caddy -n 30 --no-pager || true
+  else
+    tail -n 30 /var/log/messages 2>/dev/null || true
+  fi
   exit 1
 fi
 if [ "$CADDY_MANAGED" != "1" ]; then
@@ -515,7 +524,14 @@ else
 fi
 for p in 80 443; do
   if [ -n "$_LISTEN" ] && printf '%s\n' "$_LISTEN" | grep -q ":$p "; then
-    echo "端口 $p 已被占用。HTTPS 需要 80 和 443，请先停掉占用它们的程序（如 nginx / apache），再重新运行。"
+    if [ "$PORT" = "$p" ]; then
+      # 占着端口的正是 minishare 自己：让用户停掉它没有意义，
+      # 必须重装换个端口（Caddy 要独占 80/443）。
+      echo "minishare 自己就装在端口 $p 上，而 HTTPS 需要 Caddy 独占 80 和 443。"
+      echo "请先重装 minishare 换个端口（比如 18080），再重新运行本脚本。"
+    else
+      echo "端口 $p 已被占用。HTTPS 需要 80 和 443，请先停掉占用它们的程序（如 nginx / apache），再重新运行。"
+    fi
     exit 1
   fi
 done
@@ -577,6 +593,12 @@ case "$SRV_HOST" in
   *) UPSTREAM="$SRV_HOST:$PORT" ;;
 esac
 mkdir -p /etc/caddy
+if [ -f /etc/caddy/Caddyfile ] && [ ! -f /etc/caddy/Caddyfile.bak ]; then
+  # 别直接覆盖：这台机器可能已经有别的 Caddy 配置（比如之前跑过 NAT 模式），
+  # 先备份，出问题还能找回来。
+  cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak
+  echo "已备份原有 Caddyfile 到 /etc/caddy/Caddyfile.bak"
+fi
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
 	reverse_proxy $UPSTREAM
@@ -605,7 +627,10 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable caddy >/dev/null 2>&1 || true
-  systemctl restart caddy
+  # 不能裸写 systemctl restart caddy：失败时 set -e 会直接退出脚本，
+  # 后面 [5b] 的"是否真在跑"检查和日志打印就永远跑不到了。
+  # 这里故意 || true，把"起没起来"的判断和报错统一交给 [5b]。
+  systemctl restart caddy || true
 elif command -v rc-update >/dev/null 2>&1; then
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
@@ -622,7 +647,8 @@ depend() {
 EOF
   chmod +x /etc/init.d/caddy
   rc-update add caddy default >/dev/null
-  rc-service caddy restart || rc-service caddy start
+  # 同上：restart/start 都失败也别让 set -e 直接掐死脚本，交给 [5b] 统一报错
+  rc-service caddy restart || rc-service caddy start || true
 else
   echo "没检测到 systemd 或 OpenRC，请手动后台运行："
   echo "  nohup /usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/var/log/caddy.log 2>&1 &"
