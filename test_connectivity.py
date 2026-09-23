@@ -1812,6 +1812,178 @@ class Connectivity(unittest.TestCase):
             foot = app.disk_foot()
             self.assertIn("磁盘信息不可用", foot)
 
+    def test_login_rate_limited_after_many_failures(self):
+        # 回归：登录是"密码即账号"（无用户名），以前无限次试密码还没限流，
+        # 每次尝试还烧 20 万轮 pbkdf2。现在同一 IP 10 分钟内错 20 次就 429，
+        # 登录成功清零（限流器放 Server 实例上，每个测试新实例互不干扰）。
+        with self.server("127.0.0.1") as port:
+            app.create_user("right-pw-123", is_admin=True)
+
+            def login(pw):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    c.request("POST", "/login",
+                              body=urllib.parse.urlencode({"pw": pw}).encode(),
+                              headers={"Content-Type":
+                                       "application/x-www-form-urlencoded"})
+                    r = c.getresponse()
+                    st, body = r.status, r.read().decode("utf-8", "replace")
+                    return st, body
+                finally:
+                    c.close()
+
+            for _ in range(19):
+                st, _ = login("wrong")
+                self.assertEqual(st, 200)
+            # 成功登录一次，计数清零
+            st, _ = login("right-pw-123")
+            self.assertEqual(st, 302)
+            for _ in range(20):
+                st, _ = login("wrong")
+                self.assertEqual(st, 200)
+            # 第 21 次：429，且页面上明确告诉用户等 10 分钟
+            st, body = login("wrong")
+            self.assertEqual(st, 429)
+            self.assertIn("10 分钟", body)
+            # 限流期间即使密码正确也进不去（先查限流器，避免被拿来烧 CPU）
+            st, _ = login("right-pw-123")
+            self.assertEqual(st, 429)
+
+    def test_upload_too_many_files_rejected(self):
+        # 回归：以前单次上传的文件 part 数量不限，每个 part 都在磁盘建临时
+        # 文件——几千万个空 part 能把 inode 和 SQLite 拖死。现在超过 200 个
+        # 直接 400，已落盘的临时文件要清理干净。
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----many"
+            parts = []
+            for i in range(201):
+                parts.append(f'--{bnd}\r\nContent-Disposition: form-data; name="f"; '
+                             f'filename="f{i}.txt"\r\n\r\nx\r\n')
+            parts.append(f"--{bnd}--\r\n")
+            mp = "".join(parts).encode()
+            c.request("POST", "/api/share", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            self.assertEqual(r.status, 400)
+            self.assertIn("too many files", r.read().decode("utf-8"))
+            left = os.listdir(app.FILES_DIR) if os.path.isdir(app.FILES_DIR) else []
+            self.assertEqual(left, [])
+            c.close()
+
+    def test_form_too_many_fields_rejected(self):
+        # 回归：以前 urlencoded 表单的字段数不限，1MB 全是碎字段的 body
+        # 会让 parse_qs 造出十几万个 dict 条目。现在超过 2000 个直接 400。
+        try:
+            urllib.parse.parse_qs(b"a=1", max_num_fields=1)
+        except TypeError:
+            self.skipTest("python < 3.10.7 没有 max_num_fields")
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            body = "&".join(f"k{i}=v" for i in range(3000)).encode()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("POST", "/login", body=body,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 400)
+            r.read()
+            c.close()
+
+    def test_dl_expired_share_404_but_orphan_ok(self):
+        # 回归：/dl/<fid> 以前不看分享是否过期——控制台"全部文件"隐藏了
+        # 过期分享的文件，但记下 /dl/ 链接的人照样能下。现在过期分享的
+        # 文件走 /dl/ 也 404（并顺手删掉过期分享）；分享已删的孤儿文件
+        # 不受影响，照样能下。
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+
+            def get(path):
+                c2 = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    c2.request("GET", path, headers={"Cookie": cookie})
+                    r2 = c2.getresponse()
+                    return r2.status, r2.getheader("X-Content-Type-Options"), r2.read()
+                finally:
+                    c2.close()
+
+            os.makedirs(app.FILES_DIR, exist_ok=True)
+            now = int(time.time())
+            with app.db() as dbc:
+                # 已过期的分享 + 文件
+                dbc.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                            " VALUES(?,?,?,?,?,?)",
+                            ("expired01", "send", "t", now, now - 10, 1))
+                stored1 = "stored-expired-1"
+                open(os.path.join(app.FILES_DIR, stored1), "wb").write(b"expired-data")
+                dbc.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                            " VALUES(?,?,?,?,?)",
+                            ("expired01", "a.txt", stored1, 12, now))
+                fid_exp = dbc.execute("SELECT id FROM files WHERE stored=?",
+                                      (stored1,)).fetchone()[0]
+                # 孤儿文件：分享行已删
+                stored2 = "stored-orphan-2"
+                open(os.path.join(app.FILES_DIR, stored2), "wb").write(b"orphan-data")
+                dbc.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                            " VALUES(?,?,?,?,?)",
+                            ("gone-share", "b.txt", stored2, 11, now))
+                fid_orphan = dbc.execute("SELECT id FROM files WHERE stored=?",
+                                         (stored2,)).fetchone()[0]
+            st, _, _ = get(f"/dl/{fid_exp}")
+            self.assertEqual(st, 404)
+            # 过期分享被顺手删掉，文件变成孤儿后反而能下了（和控制台一致）
+            st, nosniff, body = get(f"/dl/{fid_exp}")
+            self.assertEqual(st, 200)
+            self.assertEqual(body, b"expired-data")
+            st, nosniff, body = get(f"/dl/{fid_orphan}")
+            self.assertEqual(st, 200)
+            self.assertEqual(nosniff, "nosniff")
+            self.assertEqual(body, b"orphan-data")
+            c.close()
+
+    def test_share_file_del_expired_share_404(self):
+        # 回归：/api/share_file_del 以前用 get_share 不看过期——分享页对
+        # 过期分享已经 404 了，但清理线程跑之前还能调接口删里面的文件。
+        # 现在跟分享页一致：404。
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            now = int(time.time())
+            with app.db() as dbc:
+                dbc.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                            " VALUES(?,?,?,?,?,?)",
+                            ("expired02", "send", "t", now, now - 10, 1))
+            c.request("POST", "/api/share_file_del",
+                      body=urllib.parse.urlencode({"sid": "expired02",
+                                                   "id": "1"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            self.assertEqual(r.status, 404)
+            self.assertIn("已过期", r.read().decode("utf-8"))
+            c.close()
+
+
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
         with tempfile.TemporaryDirectory() as folder:
@@ -2275,6 +2447,41 @@ class HTTPSConfig(unittest.TestCase):
                 continue
             if 'systemctl restart caddy' in s or 'rc-service caddy restart' in s:
                 self.assertIn('|| true', s, f'line {i}: {s}')
+
+
+    def test_normal_mode_restores_caddyfile_on_failure(self):
+        # 回归：普通模式 [5b] Caddy 没起来时，以前直接 exit 1——但 [4] 已经
+        # 把 Caddyfile 覆盖了。如果机器之前跑的是别的 Caddy 配置（比如之前
+        # 成功跑过的 NAT 模式），原来的 HTTPS 反而被这次失败的运行搞挂了。
+        # 现在失败时必须先把 Caddyfile.bak 恢复回去并尽量重启 Caddy。
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('if [ "$CADDY_CHECKABLE" = "1" ]')
+        end = text.index('exit 1\nfi', start) + len('exit 1\nfi')
+        block = text[start:end]
+        with tempfile.TemporaryDirectory() as folder:
+            caddy_dir = Path(folder) / 'caddy'
+            caddy_dir.mkdir()
+            (caddy_dir / 'Caddyfile').write_text('new broken config\n')
+            (caddy_dir / 'Caddyfile.bak').write_text('old working config\n')
+            bindir = Path(folder) / 'bin'
+            bindir.mkdir()
+            # 假 systemctl：盖住测试机上真家伙，记录调用并让 restart 失败——
+            # 失败也不能杀死脚本（|| true 由另一个回归测试保证），恢复流程
+            # 必须照样走完。
+            (bindir / 'systemctl').write_text(
+                '#!/bin/sh\necho "$@" >> "$RC_LOG"\nexit 1\n')
+            (bindir / 'systemctl').chmod(0o755)
+            block2 = block.replace('/etc/caddy', str(caddy_dir))
+            r = subprocess.run(['sh', '-c', 'set -eu\n' + block2],
+                               env={**os.environ,
+                                    'PATH': str(bindir) + ':/usr/bin:/bin',
+                                    'CADDY_CHECKABLE': '1', 'CADDY_OK': '0',
+                                    'RC_LOG': str(Path(folder) / 'rc.log')},
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertEqual((caddy_dir / 'Caddyfile').read_text(),
+                             'old working config\n')
+            self.assertIn('restart caddy', (Path(folder) / 'rc.log').read_text())
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
