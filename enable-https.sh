@@ -50,7 +50,7 @@ echo ""
 DOMAIN=""
 while [ -z "$DOMAIN" ]; do
   printf "你的域名是什么？（例如：file.example.com）\n> "
-  read DOMAIN
+  read -r DOMAIN || { echo ""; echo "输入已取消。"; exit 1; }
   DOMAIN="$(printf '%s' "$DOMAIN" | tr -d '[:space:]')"
 done
 echo "域名：$DOMAIN"
