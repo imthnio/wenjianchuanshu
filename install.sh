@@ -78,7 +78,8 @@ if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   echo "=== minishare 安装向导 ==="
   echo "下面只有 3 个问题，第 2 问（端口）没有默认值，必须自己输入。"
   printf "1/3 装到哪个目录？[%s]：" "$APP_DIR"
-  read -r ans; [ -n "$ans" ] && APP_DIR="$ans"
+  read -r ans || { echo ""; echo "输入已取消，安装退出。"; exit 1; }
+  [ -n "$ans" ] && APP_DIR="$ans"
   if [ -z "$PORT" ]; then
     while :; do
       printf "2/3 网页用哪个端口？（必须输入，例如 18080）："
@@ -92,7 +93,7 @@ if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
     echo "2/3 网页用哪个端口？${PORT}（已通过环境变量 PORT 指定）"
   fi
   printf "3/3 用 IPv4 还是 IPv6？（输入1回车是ipv4,输入2回车是ipv6）："
-  read -r ans
+  read -r ans || { echo ""; echo "输入已取消，安装退出。"; exit 1; }
   case "$ans" in
     2) IPVER=6 ;;
     *) IPVER=4 ;;
