@@ -79,7 +79,7 @@ case "$SRV_HOST" in *:*) DETECTED_VER=6 ;; esac
 IPVER="${IPVER:-$DETECTED_VER}"
 if [ -t 0 ] && [ -z "${NONINTERACTIVE:-}" ]; then
   printf "域名解析用 IPv4 还是 IPv6？（跟装 minishare 时保持一致）[%s]：" "$DETECTED_VER"
-  read -r ans
+  read -r ans || ans=""
   case "$ans" in
     6) IPVER=6 ;;
     4) IPVER=4 ;;
@@ -115,11 +115,11 @@ if [ -t 0 ] && [ -z "${NONINTERACTIVE:-}" ]; then
   if [ "$NAT_DETECTED" = "1" ]; then
     echo "检测到这台机器是 NAT（内网 IP 出网），80/443 可能从外网连不进来。"
     printf "用 NAT 模式开启 HTTPS 吗？（Caddy 直接用端口 %s，证书走 Cloudflare DNS 申请）[Y/n]：" "$PORT"
-    read -r ans
+    read -r ans || ans=""
     case "$ans" in n|N) NAT=0 ;; *) NAT=1 ;; esac
   else
     printf "这是 NAT 机器吗？（80/443 从外网连不进来那种；是就输入 y）[y/N]："
-    read -r ans
+    read -r ans || ans=""
     case "$ans" in y|Y) NAT=1 ;; *) NAT=0 ;; esac
   fi
   echo ""
@@ -184,7 +184,7 @@ else
   echo "  3) 选“编辑区域 DNS”模板，区域资源里选你的域名所在的区域"
   echo "  4) 继续 → 创建，把生成的令牌复制出来（只显示一次）"
   printf "把令牌粘贴到这里：\n> "
-  read -r CFTOKEN
+  read -r CFTOKEN || CFTOKEN=""
   CFTOKEN="$(printf '%s' "$CFTOKEN" | tr -d '[:space:]')"
   if [ -z "$CFTOKEN" ]; then echo "令牌不能为空。"; exit 1; fi
   printf 'dns_cloudflare_api_token = %s\n' "$CFTOKEN" > "$TOKEN_FILE"
