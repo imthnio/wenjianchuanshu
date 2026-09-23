@@ -683,12 +683,24 @@ if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
     # 让原来的配置先恢复可用，再排查这次失败的原因。
     echo "正在恢复之前的 Caddy 配置…"
     cp /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile
+    RESTORED=0
+    # 注意：不能写成 `systemctl restart ... && RESTORED=1` 裸放在分支末尾：
+    # set -e 下它是分支的最后一条命令，失败会导致整个 if 非零、脚本直接退出。
+    # 用 if 包起来，条件位置不受 set -e 影响。
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-      systemctl restart caddy >/dev/null 2>&1 || true
+      if systemctl restart caddy >/dev/null 2>&1; then RESTORED=1; fi
     elif command -v rc-service >/dev/null 2>&1; then
-      rc-service caddy restart >/dev/null 2>&1 || rc-service caddy start >/dev/null 2>&1 || true
+      if rc-service caddy restart >/dev/null 2>&1 || rc-service caddy start >/dev/null 2>&1; then RESTORED=1; fi
     fi
-    echo "已恢复之前的 Caddy 配置（/etc/caddy/Caddyfile.bak）。"
+    if [ "$RESTORED" = "1" ]; then
+      echo "已恢复之前的 Caddy 配置（/etc/caddy/Caddyfile.bak），Caddy 已重启。"
+    else
+      # 之前吞掉了重启失败（|| true），用户会误以为"已恢复=可用"，
+      # 实际上 Caddy 还停着、原来的 HTTPS 也是断的：必须明确说出来。
+      echo "已恢复之前的 Caddy 配置，但 Caddy 重启失败，它现在是停的。"
+      echo "请手动执行：systemctl start caddy  （OpenRC：rc-service caddy start）"
+      echo "再看日志排查：journalctl -u caddy -n 50"
+    fi
   fi
   exit 1
 fi
