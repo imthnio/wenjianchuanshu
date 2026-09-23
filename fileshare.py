@@ -310,6 +310,18 @@ class BadUpload(Exception):
 # 因为信封多出几百字节就被 413。
 _PRECHECK_SLACK = 1024 * 1024
 
+# 单次上传请求里最多带多少个文件 part：每个文件 part 都会在磁盘上
+# 建一个临时文件再写 DB，不设上限的话，攻击者可以用 10GB 的请求体塞
+# 下几千万个空文件 part（每个只占一百多字节），把磁盘 inode 和
+# SQLite 拖死。正常人一次传 200 个文件绰绰有余。
+MAX_FILES_PER_REQUEST = 200
+
+# urlencoded 表单最多解析多少个字段：1MB 的 body 全是 a0=1&a1=1… 这种
+# 碎字段时，parse_qs 会造出十几万个 dict 条目（几十 MB 临时内存）。
+# 我们的表单字段从不超过两位数，2000 是留足余量的上限。
+# max_num_fields 参数是 Python 3.10.7+ 才有的，老版本没有就退回不限。
+_MAX_FORM_FIELDS = 2000
+
 def _fix_header_encoding(v):
     """HTTP 头是按 latin1 解码的；如果里面实际是 UTF-8 字节（如中文文件名），还原它。"""
     try:
@@ -382,6 +394,7 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     buf = bytearray()
     remaining = total
     fields, files = {}, []
+    n_files = 0
     created_paths = []
     budget = max_bytes  # 实际文件字节的剩余额度（信封开销不计入）
     def charge(n):
@@ -531,6 +544,10 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
             name = _disp_param(disp, "name") or ""
             filename = _disp_param(disp, "filename")
             if filename:
+                n_files += 1
+                if n_files > MAX_FILES_PER_REQUEST:
+                    # 已落盘的临时文件由外层 except BaseException 清理
+                    raise BadUpload("too many files")
                 filename = _clean_filename(filename)
                 stored = secrets.token_hex(16)
                 path = os.path.join(FILES_DIR, stored)
@@ -1212,6 +1229,37 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": False, "error": "未登录"}, 401)
         return None
 
+    # ---- 登录限流（防暴力破解）----
+    # 登录是"密码即账号"（无用户名），天然是暴力破解目标；而且每次尝试
+    # 都要做 20 万轮 pbkdf2，不限流会被拿来烧 CPU。规则：同一 IP 10 分钟
+    # 内密码错误超过 20 次，该 IP 的登录请求回 429；登录成功清零。
+    _LOGIN_FAIL_LIMIT = 20
+    _LOGIN_FAIL_WINDOW = 600
+
+    def _login_allowed(self):
+        ip = self.client_address[0]
+        now = time.time()
+        with self.server._login_lock:
+            fails = self.server._login_fail
+            # 顺手清理过期记录，dict 不会无限增长
+            for k in [k for k, ts in fails.items()
+                      if not ts or now - ts[-1] >= self._LOGIN_FAIL_WINDOW]:
+                del fails[k]
+            ts = [t for t in fails.get(ip, [])
+                  if now - t < self._LOGIN_FAIL_WINDOW]
+            fails[ip] = ts
+            return len(ts) < self._LOGIN_FAIL_LIMIT
+
+    def _login_failed(self):
+        ip = self.client_address[0]
+        with self.server._login_lock:
+            self.server._login_fail.setdefault(ip, []).append(time.time())
+
+    def _login_ok(self):
+        ip = self.client_address[0]
+        with self.server._login_lock:
+            self.server._login_fail.pop(ip, None)
+
     def _require_admin(self):
         # 仅管理员：通过返回账号字典，否则 401/403
         user = self._require_auth()
@@ -1265,7 +1313,15 @@ class Handler(BaseHTTPRequestHandler):
         if n < 0 or n > 1_000_000:
             raise BadUpload("form too large")
         raw = self.rfile.read(n) if n > 0 else b""
-        d = parse_qs(raw.decode("utf-8", "replace"))
+        try:
+            d = parse_qs(raw.decode("utf-8", "replace"),
+                         max_num_fields=_MAX_FORM_FIELDS)
+        except TypeError:
+            # Python < 3.10.7 没有 max_num_fields 参数：退回不限
+            d = parse_qs(raw.decode("utf-8", "replace"))
+        except ValueError:
+            # 字段数超过上限（碎字段 DoS）：畸形请求应 400
+            raise BadUpload("too many fields")
         return {k: v[0] for k, v in d.items()}
 
     def _multipart(self, cap=None):
@@ -1301,6 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(size))
         self.send_header("Accept-Ranges", "none")
+        self.send_header("X-Content-Type-Options", "nosniff")
         disp = "attachment; filename*=UTF-8''%s" % quote(filename)
         self.send_header("Content-Disposition", disp)
         self.end_headers()
@@ -1428,9 +1485,18 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._user():
                     return self._redirect("/login")
                 with db() as c:
-                    f = c.execute("SELECT * FROM files WHERE id=?",
+                    f = c.execute("SELECT f.*, s.expires FROM files f"
+                                  " LEFT JOIN shares s ON s.id=f.share_id"
+                                  " WHERE f.id=?",
                                   (int(m.group(1)),)).fetchone()
                 if not f:
+                    return self._send(404, not_found())
+                if f["expires"] and f["expires"] < time.time():
+                    # 所属分享已过期（清理线程每小时才跑一轮）：跟控制台
+                    # "全部文件"隐藏过期分享保持一致，这里也 404，同时把
+                    # 过期分享删掉。分享已删的孤儿文件 expires 为 NULL，
+                    # 不受影响，照样能下。
+                    delete_share(f["share_id"])
                     return self._send(404, not_found())
                 path = os.path.join(FILES_DIR, f["stored"])
                 if not os.path.isfile(path):
@@ -1522,9 +1588,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if p == "/login" and has_users():
                 f = self._form()
+                if not self._login_allowed():
+                    # body 已经由 _form() 读完，直接回登录页（带 429 状态），
+                    # 不用关连接
+                    return self._send(429, login_page("密码试错太多次，10 分钟后再试"))
                 user = find_user_by_pw(f.get("pw", ""))
                 if user:
+                    self._login_ok()
                     return self._set_sid(new_session(user["id"]))
+                self._login_failed()
                 return self._send(200, login_page("密码错误"))
 
             if p == "/logout":
@@ -1583,9 +1655,9 @@ class Handler(BaseHTTPRequestHandler):
                 fid = f.get("id", "")
                 if not re.fullmatch(r"[0-9]+", fid or ""):
                     return self._json({"ok": False, "error": "参数错误"}, 400)
-                s = get_share(sid)
+                s = self._valid_share(sid)
                 if not s:
-                    return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
                 if not can_manage_share(user, s):
                     return self._json({"ok": False, "error": "只能操作自己的分享"}, 403)
                 with db() as c:
@@ -1914,6 +1986,11 @@ class Server(ThreadingHTTPServer):
     def __init__(self, server_address, handler, bind_and_activate=True):
         self.address_family = (socket.AF_INET6 if ":" in server_address[0]
                                else socket.AF_INET)
+        # 登录失败计数（防暴力破解）：ip -> [失败时间戳]。
+        # 放 Server 实例上而不是模块全局：每个 Server 独立计数，测试里
+        # 每个用例起一个新 Server 就不会互相污染。
+        self._login_fail = {}
+        self._login_lock = threading.Lock()
         super().__init__(server_address, handler, bind_and_activate)
 
     def get_request(self):
