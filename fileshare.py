@@ -717,11 +717,11 @@ def share_page(sid, share, files, base):
 <p class='muted' style='margin-top:16px'>由 minishare 提供 · {html.escape(base)}</p></div>""")
 
 def receive_page(sid, share):
-    limit, free = upload_limit()
+    limit, _ = upload_limit()
     return page("上传文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📤 {html.escape(share['title'] or '文件接收')}</h1>
 <p class='muted'>选择文件上传，上传完成后对方即可收到。到期：{htime(share['expires'])}</p>
-<p class='muted'>📦 单次最多可上传 <b>{hsize(limit)}</b>（上传上限 {hsize(MAX_UPLOAD)} · 服务器剩余空间 {hsize(free)}）</p>
+<p class='muted'>📦最大可上传 <b>{hsize(limit)}</b>文件</p>
 <form id='upForm'><input type='file' name='file' multiple required>
 <button>开始上传</button>
 <progress id='prog' value='0' max='100' style='display:none'></progress></form>
@@ -880,7 +880,11 @@ class Handler(BaseHTTPRequestHandler):
             raise BadUpload("empty body")
         # 注：BaseHTTPRequestHandler 在收到 Expect: 100-continue 时已自动
         # 回过 100，这里不再手动发，避免重复的 interim 响应。
-        return parse_multipart(self.rfile, n, boundary, MAX_UPLOAD)
+        # 实际生效的上限是 min(配置上限, 磁盘剩余空间)，与接收页面上
+        # 显示给对方的数字一致：超过剩余空间的上传直接 413 拒绝，
+        # 而不是让对方传一半才遇到 500。
+        limit, _ = upload_limit()
+        return parse_multipart(self.rfile, n, boundary, limit)
 
     def _send_file(self, path, filename):
         size = os.path.getsize(path)
