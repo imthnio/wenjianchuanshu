@@ -5,7 +5,10 @@
 set -eu
 [ "$(id -u)" = 0 ] || { echo "请用 root 运行。"; exit 1; }
 ok=0
-for u in "https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh" "https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh"; do
+# raw.githubusercontent.com 有约 5 分钟 CDN 缓存：刚推上去的修复，
+# 用户立刻重装会拿到旧脚本。时间戳参数绕过边缘缓存、回源拿最新。
+TS="$(date +%s)"
+for u in "https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh?t=$TS" "https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh"; do
   if command -v curl >/dev/null 2>&1; then
     curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o /tmp/minishare-install.sh "$u" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
