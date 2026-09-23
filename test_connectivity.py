@@ -85,6 +85,18 @@ class Connectivity(unittest.TestCase):
         self.assertIn('cancelExpiry(\'\\"+id+\\"\')', body)
         self.assertNotIn('saveExpiry(\\"+id+\\")', body)
 
+    def test_dash_resetpw_buttons_have_valid_onclick(self):
+        # 回归测试：用户管理里"重设密码"的确定/取消按钮由 JS 拼出 onclick，
+        # id 必须加引号传参，否则点确定没反应（chunk 上传改造时曾把引号改丢）。
+        with self.server("127.0.0.1"):
+            app.create_user("user0001")
+            with app.db() as c:
+                shares = c.execute("SELECT * FROM shares").fetchall()
+            body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
+            self.assertIn('saveResetPw(\'\\"+id+\\"\')', body)
+            self.assertIn('cancelResetPw(\'\\"+id+\\"\')', body)
+            self.assertNotIn('saveResetPw("+id+")', body)
+
     def test_copy_button_has_insecure_context_fallback(self):
         # 回归测试：复制链接按钮之前直接调 navigator.clipboard.writeText，
         # 而剪贴板 API 只在安全上下文（HTTPS/localhost）可用；默认用
@@ -103,7 +115,9 @@ class Connectivity(unittest.TestCase):
         self.assertIn("function copyText", js)
         self.assertIn("window.isSecureContext", js)
         self.assertIn("copyText(t, el)", js)  # 卡片上的复制链接走 copyText
-        self.assertIn("copyText(fullLink(", js)  # 上传成功后的复制按钮也走 copyText
+        # 上传成功后的复制按钮也走 copyText：直接读链接框文本，不再把链接
+        # 拼进 onclick 字符串（免引号转义问题）
+        self.assertIn("copyText(this.previousElementSibling.textContent", js)
         # 唯一的 writeText 调用必须落在 isSecureContext 保护分支内
         idx = js.index("navigator.clipboard.writeText(t)")
         guard = js.rindex("if (", 0, idx)
@@ -1276,10 +1290,13 @@ class Connectivity(unittest.TestCase):
                  {"id": 2, "filename": "b.mp4", "size": 20},
                  {"id": 3, "filename": "c.txt", "size": 5}]
         body = app.share_page(sid, share, files).decode("utf-8")
-        self.assertIn("<video", body)
-        self.assertIn("<img", body)
+        # 图片和视频都不在页面里直接内联显示：没点"查看"就不加载，
+        # 只留查看按钮
+        self.assertNotIn("<video", body)
+        self.assertNotIn("<img", body)
         self.assertIn(f"/s/{sid}/v/1", body)
         self.assertIn(f"/s/{sid}/v/2", body)
+        self.assertIn("查看", body)
         # txt 没有查看入口，但下载链接还在
         self.assertNotIn(f"/s/{sid}/v/3", body)
         self.assertIn(f"/s/{sid}/f/3", body)
@@ -1982,6 +1999,373 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(r.status, 404)
             self.assertIn("已过期", r.read().decode("utf-8"))
             c.close()
+
+
+    # ---------- 分片上传（大文件不再整文件一次 POST，避免被反代掐 522）----------
+
+    def _chunk_login(self, port, pw):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("POST", "/login",
+                  body=urllib.parse.urlencode({"pw": pw}).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        r.read()
+        ck = r.getheader("Set-Cookie").split(";")[0]
+        c.close()
+        return ck
+
+    def _chunk_post(self, port, path, fields=None, raw=None, ctype=None,
+                    cookie=None):
+        # 小 helper：发 urlencoded 表单或原始 body，返回 (status, body)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        h = {}
+        if cookie:
+            h["Cookie"] = cookie
+        if fields is not None:
+            body = urllib.parse.urlencode(fields).encode()
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = raw or b""
+            h["Content-Type"] = ctype or "application/octet-stream"
+        try:
+            c.request("POST", path, body=body, headers=h)
+            r = c.getresponse()
+            return r.status, r.read()
+        except (http.client.RemoteDisconnected, BrokenPipeError,
+                ConnectionResetError):
+            # 服务端按惯例在错误时直接关连接（防 keep-alive 污染），
+            # 客户端看到连接重置也算拒绝成功
+            return "RESET", b""
+        finally:
+            c.close()
+
+    def _chunk_make_share(self, port, cookie):
+        s, b = self._chunk_post(port, "/api/share_create",
+                                {"title": "t", "expiry": "7"}, cookie=cookie)
+        self.assertEqual(s, 200)
+        j = json.loads(b.decode("utf-8"))
+        self.assertTrue(j["ok"])
+        self.assertIn("/s/", j["link"])
+        return j["id"]
+
+    def test_share_create_api(self):
+        # /api/share_create：只建分享不收文件，返回 sid 和链接，
+        # 给控制台分片上传先用
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            with app.db() as dbc:
+                row = dbc.execute(
+                    "SELECT type,owner_id FROM shares WHERE id=?", (sid,)).fetchone()
+            self.assertEqual(row["type"], "send")
+            self.assertEqual(row["owner_id"], 1)
+            # 未登录不能建
+            s, _ = self._chunk_post(port, "/api/share_create",
+                                    {"title": "t", "expiry": "7"})
+            self.assertEqual(s, 401)
+
+    def test_chunk_upload_full_flow(self):
+        # 完整流程：init -> 逐片 -> done，落盘字节与源文件完全一致，
+        # 分享页能看到该文件
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            payload = os.urandom(9 * 1024 * 1024 + 123)  # 3 片：4M+4M+1M+123B
+            nchunks = 3
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "大文件.bin",
+                 "size": str(len(payload)), "chunks": str(nchunks)},
+                cookie=cookie)
+            self.assertEqual(s, 200)
+            up = json.loads(b.decode("utf-8"))["up"]
+            sent = 0
+            for i in range(nchunks):
+                part = payload[i * 4 * 1024 * 1024:(i + 1) * 4 * 1024 * 1024]
+                s, b = self._chunk_post(
+                    port, "/api/chunk?up=%s&i=%d" % (up, i), raw=part,
+                    cookie=cookie)
+                self.assertEqual(s, 200)
+                sent += len(part)
+                self.assertEqual(
+                    json.loads(b.decode("utf-8"))["recvd"], sent)
+            s, b = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            with app.db() as dbc:
+                row = dbc.execute(
+                    "SELECT filename,stored,size FROM files WHERE share_id=?",
+                    (sid,)).fetchone()
+            self.assertEqual(row["filename"], "大文件.bin")
+            self.assertEqual(row["size"], len(payload))
+            disk = open(os.path.join(app.FILES_DIR, row["stored"]), "rb").read()
+            self.assertEqual(disk, payload)
+            # 分享页能看到
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/s/" + sid)
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertIn("大文件.bin", r.read().decode("utf-8"))
+            c.close()
+
+    def test_chunk_upload_receive_link_no_login(self):
+        # 接收链接的分片上传免登录（kind=upload）
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            now = int(time.time())
+            with app.db() as dbc:
+                dbc.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                            " VALUES(?,?,?,?,?,?)",
+                            ("recv01", "receive", "t", now, 0, 1))
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": "recv01", "kind": "upload", "name": "r.txt",
+                 "size": "5", "chunks": "1"})
+            self.assertEqual(s, 200)
+            up = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up,
+                                    raw=b"hello")
+            self.assertEqual(s, 200)
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up})
+            self.assertEqual(s, 200)
+            with app.db() as dbc:
+                row = dbc.execute(
+                    "SELECT size FROM files WHERE share_id='recv01'").fetchone()
+            self.assertEqual(row["size"], 5)
+
+    def test_chunk_authz(self):
+        # kind=add 必须登录，且只能给自己的分享追加
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            app.create_user("user9999")
+            admin_ck = self._chunk_login(port, "pw123456")
+            user_ck = self._chunk_login(port, "user9999")
+            sid = self._chunk_make_share(port, admin_ck)
+            base = {"sid": sid, "kind": "add", "name": "x",
+                    "size": "10", "chunks": "1"}
+            # 未登录 -> 401
+            s, _ = self._chunk_post(port, "/api/chunk_init", base)
+            self.assertEqual(s, 401)
+            # 普通用户动管理员的分享 -> 403
+            s, b = self._chunk_post(port, "/api/chunk_init", base,
+                                    cookie=user_ck)
+            self.assertEqual(s, 403)
+            # 管理员给自己的分享 -> 200
+            s, _ = self._chunk_post(port, "/api/chunk_init", base,
+                                    cookie=admin_ck)
+            self.assertEqual(s, 200)
+            # kind 与链接类型错配 -> 404
+            bad = dict(base, kind="upload")
+            s, _ = self._chunk_post(port, "/api/chunk_init", bad,
+                                    cookie=admin_ck)
+            self.assertEqual(s, 404)
+
+    def test_chunk_rejects_bad_requests(self):
+        # 错误请求：序号错、token 错、没传完就 done、超大、片大小不对
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "x.bin",
+                 "size": "100", "chunks": "1"}, cookie=cookie)
+            up = json.loads(b.decode("utf-8"))["up"]
+            # 序号错（应先传 0 片）：400 或连接重置，会话不受影响
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=1" % up,
+                                    raw=b"z" * 10, cookie=cookie)
+            self.assertIn(s, (400, "RESET"))
+            # 之后正常传第 0 片仍然成功（单片文件必须发满声明的 100 字节）
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up,
+                                    raw=b"z" * 100, cookie=cookie)
+            self.assertEqual(s, 200)
+            # 收齐后正常完成，临时文件转正
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            # token 不存在：400（实现里与失效会话统一按"分片已失效"处理）
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % ("0" * 32),
+                                    raw=b"z", cookie=cookie)
+            self.assertIn(s, (400, "RESET"))
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": "0" * 32},
+                                    cookie=cookie)
+            self.assertEqual(s, 400)
+            # 另一个文件：没传完就 done -> 400，且临时文件被清理
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "half.bin",
+                 "size": "100", "chunks": "1"}, cookie=cookie)
+            up2 = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up2},
+                                    cookie=cookie)
+            self.assertEqual(s, 400)
+            leftovers = [fn for fn in os.listdir(app.FILES_DIR)
+                         if fn.startswith("chunk_")]
+            self.assertEqual(leftovers, [])
+            # 谎报片数与大小不自洽 -> 400
+            s, _ = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "lie.bin",
+                 "size": "100", "chunks": "5"}, cookie=cookie)
+            self.assertEqual(s, 400)
+            # 超上限 -> 413（片数必须与大小自洽：238418580）
+            s, _ = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "big.bin",
+                 "size": str(10 ** 15), "chunks": "238418580"}, cookie=cookie)
+            self.assertEqual(s, 413)
+
+    def test_chunk_duplicate_retry_is_idempotent(self):
+        # 某片成功后客户端没收到响应会重传该片：直接回成功，
+        # 不能重复写盘导致文件损坏
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            p0 = os.urandom(4 * 1024 * 1024)
+            p1 = os.urandom(100)
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "d.bin",
+                 "size": str(len(p0) + len(p1)), "chunks": "2"},
+                cookie=cookie)
+            up = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up, raw=p0,
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            # 重发第 0 片：应 200 且 recvd 不变
+            s, b = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up, raw=p0,
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            self.assertEqual(json.loads(b.decode("utf-8"))["recvd"], len(p0))
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=1" % up, raw=p1,
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            with app.db() as dbc:
+                stored = dbc.execute(
+                    "SELECT stored FROM files WHERE share_id=?", (sid,)).fetchone()[0]
+            disk = open(os.path.join(app.FILES_DIR, stored), "rb").read()
+            self.assertEqual(disk, p0 + p1)
+
+    def test_chunk_done_rechecks_permission(self):
+        # 完成阶段重新鉴权：初始化分片时有权限，传完时用户已被删、
+        # 会话已失效——done 必须拒绝，文件不能入库。
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            app.create_user("user9999")
+            user_ck = self._chunk_login(port, "user9999")
+            s, b = self._chunk_post(port, "/api/share_create",
+                                    {"title": "t", "expiry": "7"}, cookie=user_ck)
+            sid = json.loads(b.decode("utf-8"))["id"]
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "x.bin",
+                 "size": "10", "chunks": "1"}, cookie=user_ck)
+            up = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up,
+                                    raw=b"z" * 10, cookie=user_ck)
+            self.assertEqual(s, 200)
+            # 管理员删掉该用户：其会话一并作废
+            admin_ck = self._chunk_login(port, "pw123456")
+            s, _ = self._chunk_post(port, "/api/user_del", {"id": "2"},
+                                    cookie=admin_ck)
+            self.assertEqual(s, 200)
+            # 原会话已失效：done 被拒绝，文件不入库，临时文件被清理
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=user_ck)
+            self.assertIn(s, (401, 403))
+            with app.db() as dbc:
+                n = dbc.execute("SELECT COUNT(*) FROM files WHERE share_id=?",
+                                (sid,)).fetchone()[0]
+            self.assertEqual(n, 0)
+            leftovers = [fn for fn in os.listdir(app.FILES_DIR)
+                         if fn.startswith("chunk_")]
+            self.assertEqual(leftovers, [])
+
+    def test_chunk_zero_byte_file(self):
+        # 空文件：1 片 0 字节，能正常入库
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "空.txt",
+                 "size": "0", "chunks": "1"}, cookie=cookie)
+            self.assertEqual(s, 200)
+            up = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up, raw=b"",
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            with app.db() as dbc:
+                row = dbc.execute(
+                    "SELECT size FROM files WHERE share_id=?", (sid,)).fetchone()
+            self.assertEqual(row["size"], 0)
+
+    def test_upload_pages_use_chunked_flow(self):
+        # 三个上传入口都走分片：页面里有百分比、完成提示，
+        # 不再用整文件一次 POST 的旧写法
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0, 1))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        admin = {"id": 1, "is_admin": True}
+        # 分享页：添加文件
+        body = app.share_page(
+            "abC123-_", {"title": "t", "expires": 0}, [], admin).decode("utf-8")
+        self.assertIn("function chunkUpload", body)
+        self.assertIn("/api/chunk_init", body)
+        self.assertIn("addPct", body)
+        self.assertIn("上传完成", body)
+        self.assertNotIn("location.pathname+'/add'", body)
+        # 接收页
+        body = app.receive_page(
+            "abC123-_", {"title": "t", "expires": 0}).decode("utf-8")
+        self.assertIn("function chunkUpload", body)
+        self.assertIn("upPct", body)
+        self.assertIn("上传完成", body)
+        self.assertNotIn("location.pathname+'/upload'", body)
+        # 控制台：发送文件走 /api/share_create + 分片
+        body = app.dash_page(shares, admin).decode("utf-8")
+        self.assertIn("function chunkUpload", body)
+        self.assertIn("/api/share_create", body)
+        self.assertIn("sendPct", body)
+        self.assertNotIn("bindXhr('sendForm','/api/share'", body)
+
+    def test_dash_partial_upload_failure_shows_link(self):
+        # 控制台先建分享再分片传：某文件失败时，已传的文件已入库，
+        # 页面必须把分享链接展示出来，不能只报一个错让用户找不到分享。
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0, 1))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
+        self.assertIn("createdLink", body)
+        self.assertIn("已上传的文件已保留", body)
+
+    def test_video_not_embedded_until_view_clicked(self):
+        # 视频和图片一样：分享页不内联 <video>，打开页面时不加载任何媒体，
+        # 只留"查看"按钮，点了才看。
+        body = app.share_page(
+            "abC123-_", {"title": "t", "expires": 0},
+            [{"id": 1, "filename": "v.mp4", "size": 10}],
+            {"id": 1, "is_admin": True}).decode("utf-8")
+        self.assertNotIn("<video", body)
+        self.assertNotIn("<img", body)
+        self.assertIn("/s/abC123-_/v/1", body)
+        self.assertIn("查看", body)
 
 
 class Installer(unittest.TestCase):
