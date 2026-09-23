@@ -130,9 +130,16 @@ if [ "$NAT" = "1" ] && [ "$IPVER" = "6" ]; then
 fi
 ORIG_PORT="$PORT"
 if [ "$NAT" = "1" ] && [ -f /etc/minishare-nat-port ]; then
-  PORT="$(cat /etc/minishare-nat-port)"
-  case "$PORT" in ''|*[!0-9]*) echo "保存的 HTTPS 端口无效。"; exit 1 ;; esac
-  if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then exit 1; fi
+  # 只有 minishare 当前仍被收在 127.0.0.1（即之前跑过本脚本的 NAT 模式），
+  # 才沿用上次保存的 HTTPS 公开端口；若监听地址不是 127.0.0.1，
+  # 说明用户后来重装/改了端口，用服务文件里的新端口（文末会更新保存文件）。
+  case "${SRV_HOST:-}" in
+    127.0.0.1)
+      PORT="$(cat /etc/minishare-nat-port)"
+      case "$PORT" in ''|*[!0-9]*) echo "保存的 HTTPS 端口无效。"; exit 1 ;; esac
+      if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then exit 1; fi
+      ;;
+  esac
 fi
 if [ "$NAT" = "1" ]; then
   echo "使用 NAT 模式：https://$DOMAIN:$PORT"
@@ -158,9 +165,16 @@ if [ -z "$DNSIP" ]; then
   exit 1
 fi
 if [ -n "$PUBIP" ] && [ "$DNSIP" != "$PUBIP" ]; then
-  echo "域名现在解析到 ${DNSIP}，但本机公网 IP 是 ${PUBIP}，对不上。"
-  echo "证书申请会失败。请先把 $REC 记录改成 ${PUBIP}，等生效后再运行。"
-  exit 1
+  if [ "$NAT" = "1" ]; then
+    # NAT 机器出口 IP 和入站 IP 经常不是同一个，而证书走 DNS 验证、
+    # 根本不依赖 IP 一致：只警告不阻断，文末的 https 实际访问验证会兜底。
+    echo "注意：域名解析到 ${DNSIP}，本机出口 IP 是 ${PUBIP}，两者不一致。"
+    echo "NAT 模式证书走 DNS 验证，不依赖 IP 一致，继续。"
+  else
+    echo "域名现在解析到 ${DNSIP}，但本机公网 IP 是 ${PUBIP}，对不上。"
+    echo "证书申请会失败。请先把 $REC 记录改成 ${PUBIP}，等生效后再运行。"
+    exit 1
+  fi
 fi
 echo "域名解析正常（$DOMAIN -> ${DNSIP}）。"
 echo ""
