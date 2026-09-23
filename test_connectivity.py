@@ -759,12 +759,14 @@ class Connectivity(unittest.TestCase):
     def test_receive_page_shows_upload_limit(self):
         # 需求：分享出去的接收链接页面，要提示对方可上传的最大值
         #（配置上限与服务器剩余空间取小者），免得传了超大文件才发现传不上去。
+        # 页面只显示一行"📦最大可上传 X文件"，括号里的明细不要。
         # 1) 函数级：upload_limit() == min(MAX_UPLOAD, 剩余空间)
         limit, free = app.upload_limit()
         used, total = app.disk_usage()
         self.assertEqual(free, max(total - used, 0))
         self.assertEqual(limit, min(app.MAX_UPLOAD, free))
-        # 2) 页面级：GET /r/<sid> 渲染出提示行，且数字与函数返回值一致
+        # 2) 页面级：GET /r/<sid> 渲染出提示行，且数字与函数返回值一致，
+        #    且不含括号明细（"上传上限"/"服务器剩余空间"）
         with self.server("127.0.0.1") as port:
             def req(method, path, body=None, headers=None):
                 c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -782,9 +784,45 @@ class Connectivity(unittest.TestCase):
                           ("recvlim1", "receive", "收文件", int(time.time()), 0))
             s, data = req("GET", "/r/recvlim1")
             self.assertEqual(s, 200)
-            self.assertIn("单次最多可上传".encode("utf-8"), data)
-            self.assertIn(app.hsize(limit).encode(), data)
-            self.assertIn(app.hsize(free).encode(), data)
+            text = data.decode("utf-8")
+            self.assertIn("📦最大可上传", text)
+            self.assertIn(app.hsize(limit) + "</b>文件", text)
+            self.assertNotIn("上传上限", text)
+            self.assertNotIn("服务器剩余空间", text)
+
+    def test_upload_beyond_free_space_rejected_413(self):
+        # 回归测试：_multipart 的实际解析上限是 min(MAX_UPLOAD, 磁盘剩余空间)，
+        # 与接收页面显示给对方的数字一致。磁盘快满时，超过剩余空间的上传
+        # 应在请求头阶段就 413 拒绝，而不是让对方传一半才遇到 500。
+        # 之前上限只看 MAX_UPLOAD：比如剩余 1GB 时传 2GB 的文件，
+        # 会一直传到写满磁盘才 500。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            with app.db() as c:
+                c.execute("INSERT INTO shares(id,type,title,created,expires)"
+                          " VALUES(?,?,?,?,?)",
+                          ("recvfull", "receive", "收文件", int(time.time()), 0))
+            bnd = "----full"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                  f"filename=\"big.bin\"\r\n\r\n" + "z" * 2000 +
+                  f"\r\n--{bnd}--\r\n").encode()
+            headers = {"Content-Type": f"multipart/form-data; boundary={bnd}"}
+            # 模拟磁盘只剩 100 字节：2KB 的请求体应直接 413
+            with patch.object(app, "disk_usage", return_value=(900, 1000)):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/r/recvfull/upload", body=mp, headers=headers)
+                r = c.getresponse()
+                self.assertEqual(r.status, 413)
+                self.assertEqual(r.getheader("Connection"), "close")
+                r.read()
+                c.close()
+            # 磁盘空间正常时：同一个包应正常接收
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/r/recvfull/upload", body=mp, headers=headers)
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(json.loads(r.read())["ok"])
+            c.close()
 
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
