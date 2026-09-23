@@ -77,6 +77,11 @@ else
   for f in fileshare.py minishare.service minishare.openrc; do
     dl "$f" || { echo ""; echo "下载 $f 失败：连不上 GitHub 和镜像站，请检查服务器网络后重试。"; exit 1; }
   done
+  # 服务模板如果被代理/缓存换成 200 错误页面，sed 替换占位符会静默失败、
+  # 装出来的服务是坏的：先验一下 @APP_DIR@ 占位符在不在。
+  for t in minishare.service minishare.openrc; do
+    grep -q "@APP_DIR@" "$t" || { echo "下载的 $t 不是有效的服务模板（可能是代理返回了错误页面），请检查网络后重试。"; exit 1; }
+  done
   echo "下载完成。"
 fi
 
@@ -244,6 +249,13 @@ case "$APP_DIR" in
 esac
 case "$APP_DIR" in
   *[!a-zA-Z0-9_./-]*) echo "安装目录只能含英文字母、数字、下划线、点、斜杠和短横线。"; exit 1 ;;
+esac
+# "/" 会导致文件被拷到根目录（//fileshare.py），带 ".." 的路径会装到意料之外的位置
+case "$APP_DIR" in
+  /) echo "安装目录不能是根目录 /，请用例如 /opt/minishare。"; exit 1 ;;
+esac
+case "$APP_DIR" in
+  *..*) echo "安装目录不能包含 ..。"; exit 1 ;;
 esac
 
 # 按选择的 IP 版本决定监听地址
