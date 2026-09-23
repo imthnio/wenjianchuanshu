@@ -681,11 +681,12 @@ def dash_page(shares, user):
         ck = f"<input type='checkbox' class='fileck' value='{fid}'>" if is_admin else ""
         delbtn = (f"<button class='danger' onclick=\"delOneFile({fid})\">删除</button>"
                   if is_admin else "")
+        dlbtn = f"<a href='/dl/{fid}'><button class='ghost'>下载</button></a> "
         frows.append(f"""<div class='file'><div>
 {ck}<span class='badge {fcls}'>{ftyp}</span>{ownermk}<b>{html.escape(fn)}</b>
 <div class='muted'>{hsize(fsz)} · 来自{fsrc} · {htime(fct)}</div>
 </div>
-{delbtn}</div>""")
+<div style='white-space:nowrap'>{dlbtn}{delbtn}</div></div>""")
     flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
     lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
     role = "👑 管理员" if is_admin else "👤 普通用户"
@@ -859,13 +860,52 @@ function bindXhr(fid, url, resId, progId, okText){{
 }}
 bindXhr('sendForm','/api/share','sendRes','sendProg','上传成功，分享链接：');
 bindXhr('recvForm','/api/receive','recvRes',null,'接收链接已生成：');
+// 表单 POST 通用封装：手动拼 application/x-www-form-urlencoded，
+// 不依赖 new FormData 迭代；提交时按钮禁用并显示“处理中”，
+// 任何失败（HTTP 错误、返回非 JSON、网络错误）都在页面上明确提示，
+// 不会“点了没反应”。
+function postForm(url, form, resId, okHtml){{
+  var res=document.getElementById(resId);
+  var btn=form.querySelector('button');
+  var parts=[], els=form.elements, i, el;
+  for(i=0;i<els.length;i++){{
+    el=els[i];
+    if(!el.name||el.disabled)continue;
+    if((el.type=='checkbox'||el.type=='radio')&&!el.checked)continue;
+    parts.push(encodeURIComponent(el.name)+'='+encodeURIComponent(el.value));
+  }}
+  var oldT=btn?btn.textContent:'';
+  if(btn){{btn.disabled=true;btn.textContent='处理中…';}}
+  res.innerHTML="<div class='muted'>处理中…</div>";
+  return fetch(url,{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:parts.join('&')}})
+  .then(function(r){{
+    // 先读文本：HTTP 错误时也尽量把服务端返回的 error 文案展示出来，
+    // 而不是只显示一个干巴巴的 HTTP 状态码。
+    return r.text().then(function(t){{
+      var j=null;try{{j=JSON.parse(t);}}catch(e){{}}
+      if(!r.ok)throw new Error((j&&j.error)||('HTTP '+r.status));
+      if(!j)throw new Error('服务器返回异常');
+      return j;
+    }});
+  }})
+  .then(function(j){{
+    if(j.ok){{res.innerHTML=okHtml;}}
+    else{{res.innerHTML="<div class='err'>"+(j.error||'失败')+"</div>";}}
+    return j;
+  }})
+  .catch(function(e){{
+    res.innerHTML="<div class='err'>请求失败："+(e&&e.message?e.message:'网络错误')+"</div>";
+    return {{ok:false}};
+  }})
+  .then(function(j){{
+    if(btn){{btn.disabled=false;btn.textContent=oldT;}}
+    return j;
+  }});
+}}
 document.getElementById('pwForm').addEventListener('submit', function(ev){{
   ev.preventDefault();
-  var fd=new FormData(this);
-  fetch('/api/chpw',{{method:'POST',body:new URLSearchParams([...fd])}})
-    .then(r=>r.json()).then(j=>{{
-      document.getElementById('pwRes').innerHTML = j.ok?"<div class='ok'>密码已修改</div>":"<div class='err'>"+(j.error||'失败')+"</div>";
-    }});
+  postForm('/api/chpw', this, 'pwRes', "<div class='ok'>密码已修改</div>");
 }});
 function userDel(id){{
   if(!confirm('确定删除这个用户吗？他的分享链接会失效，文件会保留在「全部文件」里。'))return;
@@ -890,26 +930,93 @@ function saveResetPw(id){{
 var _uaf=document.getElementById('userAddForm');
 if(_uaf){{_uaf.addEventListener('submit', function(ev){{
   ev.preventDefault();
-  var fd=new FormData(this);
-  fetch('/api/user_add',{{method:'POST',body:new URLSearchParams([...fd])}})
-    .then(r=>r.json()).then(j=>{{
-      document.getElementById('userRes').innerHTML = j.ok?"<div class='ok'>用户已添加，记得把密码告诉他</div>":"<div class='err'>"+(j.error||'失败')+"</div>";
-      if(j.ok)setTimeout(()=>location.reload(), 1200);
-    }});
+  postForm('/api/user_add', this, 'userRes', "<div class='ok'>用户已添加，记得把密码告诉他</div>")
+  .then(function(j){{if(j.ok)setTimeout(function(){{location.reload();}},1200);}});
 }});}}
 </script>{disk_foot()}""")
 
-def share_page(sid, share, files):
+# 能安全在线查看的文件类型（按扩展名判断）。
+# svg 故意不算图片：内联打开时 SVG 里的脚本会在本站域名下执行，有风险，只给下载。
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+VID_EXTS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv"}
+
+def _view_kind(filename):
+    """返回 'img' / 'vid'，不能在线查看的返回 None。"""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in IMG_EXTS:
+        return "img"
+    if ext in VID_EXTS:
+        return "vid"
+    return None
+
+def share_page(sid, share, files, user=None):
+    # user 能管理这个分享（本人或管理员）时，页面上可以追加和删除文件
+    manage = user is not None and can_manage_share(user, share)
     rows = []
     for f in files:
-        rows.append(f"""<div class='file'><div>📄 {html.escape(f['filename'])}
+        name = html.escape(f["filename"])
+        kind = _view_kind(f["filename"])
+        media = ""
+        if kind == "img":
+            media = (f"<a href='/s/{sid}/v/{f['id']}' target='_blank'>"
+                     f"<img src='/s/{sid}/v/{f['id']}' loading='lazy' alt='{name}' "
+                     "style='max-width:100%;max-height:340px;border-radius:8px;"
+                     "display:block;margin-bottom:8px'></a>")
+        elif kind == "vid":
+            media = (f"<video controls preload='metadata' src='/s/{sid}/v/{f['id']}' "
+                     "style='max-width:100%;max-height:340px;border-radius:8px;"
+                     "display:block;margin-bottom:8px'></video>")
+        view_btn = (f"<a href='/s/{sid}/v/{f['id']}' target='_blank'>"
+                    "<button class='ghost'>查看</button></a> " if kind else "")
+        del_btn = (f"<button class='ghost' onclick='delShareFile({f['id']},this)'>删除</button> "
+                   if manage else "")
+        rows.append(f"""<div class='file' style='display:block'>{media}<div>📄 {name}
 <div class='muted'>{hsize(f['size'])}</div></div>
-<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div>""")
+<div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div></div>""")
+    add_form = ""
+    if manage:
+        add_form = """<div class='card' style='max-width:560px;margin:16px auto'>
+<h3>➕ 添加文件</h3>
+<form id='addForm'><input type='file' name='file' multiple required>
+<button>上传</button>
+<progress id='addProg' value='0' max='100' style='display:none'></progress></form>
+<div id='addRes'></div></div>
+<script>
+function delShareFile(fid, el){
+  if(!confirm('确定删除这个文件吗？')) return;
+  el.disabled = true;
+  fetch('/api/share_file_del', {method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'sid='+encodeURIComponent('""" + sid + """')+'&id='+fid})
+  .then(function(r){return r.json();})
+  .then(function(j){
+    if(j.ok) location.reload();
+    else { el.disabled = false; alert(j.error || '删除失败'); }
+  })
+  .catch(function(){ el.disabled = false; alert('请求失败'); });
+}
+document.getElementById('addForm').addEventListener('submit', function(ev){
+  ev.preventDefault();
+  var res=document.getElementById('addRes'), prog=document.getElementById('addProg');
+  res.innerHTML=''; prog.style.display='block'; prog.value=0;
+  var xhr=new XMLHttpRequest(); xhr.open('POST', location.pathname+'/add');
+  xhr.upload.onprogress=function(e){if(e.lengthComputable)prog.value=e.loaded/e.total*100;};
+  xhr.onload=function(){
+    prog.style.display='none';
+    try{var j=JSON.parse(xhr.responseText);
+      if(j.ok) location.reload();
+      else res.innerHTML="<div class='err'>"+(j.error||'上传失败')+"</div>";
+    }catch(e){res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}
+  };
+  xhr.onerror=function(){prog.style.display='none';res.innerHTML="<div class='err'>网络错误</div>";};
+  xhr.send(new FormData(this));
+});
+</script>"""
     return page("下载文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📥 {html.escape(share['title'] or '文件分享')}</h1>
 <p class='muted'>共 {len(files)} 个文件 · 到期：{htime(share['expires'])}</p>
-{''.join(rows) if rows else "<p class='muted'>文件已被删除</p>"}
-</div>""")
+{''.join(rows) if rows else "<p class='muted'>📭 文件都被删除啦</p>"}
+</div>{add_form}""")
 
 def receive_page(sid, share):
     limit, _ = upload_limit()
@@ -1106,6 +1213,59 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _send_file_inline(self, path, filename):
+        """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。"""
+        size = os.path.getsize(path)
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if ctype.split("/")[0] not in ("image", "video"):
+            # 非图片/视频：不内联，退回普通下载（防 MIME 混淆）
+            return self._send_file(path, filename)
+        start, end, status = 0, size - 1, 200
+        rh = (self.headers.get("Range") or "").strip()
+        if rh:
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", rh)
+            if not m or (not m.group(1) and not m.group(2)):
+                return self._send(416, "Range 不合法", "text/plain; charset=utf-8")
+            if m.group(1):
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else size - 1
+            else:
+                # bytes=-N：文件最后 N 字节
+                start = max(size - int(m.group(2)), 0)
+            end = min(end, size - 1)
+            if start >= size or end < start:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Disposition", "inline")
+        # 防 MIME 嗅探：浏览器只能按声明的 Content-Type 处理
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (ConnectionResetError, BrokenPipeError):
+                    # 客户端提前关了（比如只预读了视频开头）
+                    break
+                remaining -= len(chunk)
+
     def _valid_share(self, sid, want_type=None):
         s = get_share(sid)
         if not s:
@@ -1162,6 +1322,22 @@ class Handler(BaseHTTPRequestHandler):
                             (user["id"], int(time.time()))).fetchall()
                 return self._send(200, dash_page(shares, user))
 
+            m = re.fullmatch(r"/dl/(\d+)", p)
+            if m:
+                # 控制台"全部文件"的下载按钮：登录即可下载，
+                # 分享链接已删的孤儿文件也能下（/s/<sid>/f/<fid> 走不通）
+                if not self._user():
+                    return self._redirect("/login")
+                with db() as c:
+                    f = c.execute("SELECT * FROM files WHERE id=?",
+                                  (int(m.group(1)),)).fetchone()
+                if not f:
+                    return self._send(404, not_found())
+                path = os.path.join(FILES_DIR, f["stored"])
+                if not os.path.isfile(path):
+                    return self._send(404, not_found())
+                return self._send_file(path, f["filename"])
+
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})", p)
             if m:
                 sid = m.group(1)
@@ -1170,7 +1346,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, not_found())
                 if s["type"] == "receive":
                     return self._redirect(f"/r/{sid}")
-                return self._send(200, share_page(sid, s, share_files(sid)))
+                return self._send(200, share_page(sid, s, share_files(sid),
+                                                  self._user()))
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/f/(\d+)", p)
             if m:
@@ -1188,6 +1365,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isfile(path):
                     return self._send(404, not_found())
                 return self._send_file(path, f["filename"])
+
+            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/v/(\d+)", p)
+            if m:
+                # 在线查看：图片直接显示，视频用 <video> 播放
+                sid, fid = m.group(1), int(m.group(2))
+                s = self._valid_share(sid, "send")
+                if not s:
+                    return self._send(404, not_found())
+                with db() as c:
+                    f = c.execute(
+                        "SELECT * FROM files WHERE id=? AND share_id=?",
+                        (fid, sid)).fetchone()
+                if not f:
+                    return self._send(404, not_found())
+                path = os.path.join(FILES_DIR, f["stored"])
+                if not os.path.isfile(path):
+                    return self._send(404, not_found())
+                return self._send_file_inline(path, f["filename"])
 
             m = re.fullmatch(r"/r/([A-Za-z0-9_\-]{1,16})", p)
             if m:
@@ -1235,6 +1430,65 @@ class Handler(BaseHTTPRequestHandler):
 
             if p == "/logout":
                 return self._clear_sid()
+
+            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/add", p)
+            if m:
+                # 给已创建的分享追加文件：本人或管理员才能操作
+                user = self._require_auth()
+                if not user:
+                    return
+                sid = m.group(1)
+                s = self._valid_share(sid, "send")
+                if not s:
+                    return self._json({"ok": False, "error": "分享不存在"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能操作自己的分享"}, 403)
+                try:
+                    _, files = self._multipart()
+                except UploadTooLarge:
+                    return self._fail_close({"ok": False, "error": too_large_msg()}, 413)
+                except BadUpload as e:
+                    return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                if not files:
+                    return self._json({"ok": False, "error": "没有收到文件"}, 400)
+                now = int(time.time())
+                try:
+                    with db() as c:
+                        for fo in files:
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                                      " VALUES(?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                except Exception:
+                    for fo in files:
+                        try:
+                            os.unlink(os.path.join(FILES_DIR, fo["stored"]))
+                        except OSError:
+                            pass
+                    raise
+                return self._json({"ok": True, "count": len(files)})
+
+            if p == "/api/share_file_del":
+                # 删除分享里的单个文件：本人或管理员才能操作
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid = f.get("sid", "")
+                fid = f.get("id", "")
+                if not re.fullmatch(r"[0-9]+", fid or ""):
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                s = get_share(sid)
+                if not s:
+                    return self._json({"ok": False, "error": "分享不存在"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能操作自己的分享"}, 403)
+                with db() as c:
+                    row = c.execute("SELECT id FROM files WHERE id=? AND share_id=?",
+                                    (int(fid), sid)).fetchone()
+                if not row:
+                    return self._json({"ok": False, "error": "文件不存在"}, 404)
+                delete_files([int(fid)])
+                return self._json({"ok": True})
 
             if p == "/api/share":
                 user = self._require_auth()
