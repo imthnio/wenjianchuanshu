@@ -423,6 +423,10 @@ progress{width:100%;height:10px;margin:6px 0}
 .badge.recv{background:#f6ffed;color:#389e0d}
 input.fileck{width:auto;margin:0 8px 2px 0;vertical-align:-2px}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.diskfoot{position:fixed;left:12px;bottom:12px;background:rgba(30,34,40,.82);color:#fff;font-size:12px;
+  padding:7px 12px;border-radius:20px;z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.diskbar{width:90px;height:5px;border-radius:3px;background:rgba(255,255,255,.25);overflow:hidden}
+.diskbar i{display:block;height:100%;background:#40c463;border-radius:3px}
 """
 
 def page(title, body):
@@ -442,6 +446,21 @@ def htime(ts):
     if not ts:
         return "永久"
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+def disk_usage():
+    try:
+        st = os.statvfs(DATA_DIR)
+        total = st.f_frsize * st.f_blocks
+        free = st.f_frsize * st.f_bavail
+        return max(total - free, 0), total
+    except OSError:
+        return 0, 0
+
+def disk_foot():
+    used, total = disk_usage()
+    pct = min(used * 100 // total, 100) if total else 0
+    return (f"<div class='diskfoot'>💾 已用 {hsize(used)} / 共 {hsize(total)}"
+            f"<span class='diskbar'><i style='width:{pct}%'></i></span></div>")
 
 def setup_page(err=""):
     e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
@@ -471,7 +490,7 @@ def dash_page(shares):
         items.append(f"""<div class='file'><div>
 <span class='badge {cls}'>{typ}</span><b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
 <div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
-<div class='linkbox' id='lk-{s['id']}'></div><div id='ti-{s['id']}'></div></div>
+<div class='linkbox' id='lk-{s['id']}'>{link}</div><div id='ti-{s['id']}'></div></div>
 <div style='white-space:nowrap'>
 <button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
 <button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
@@ -625,7 +644,7 @@ document.getElementById('pwForm').addEventListener('submit', function(ev){{
       document.getElementById('pwRes').innerHTML = j.ok?"<div class='ok'>密码已修改</div>":"<div class='err'>"+(j.error||'失败')+"</div>";
     }});
 }});
-</script>""")
+</script>{disk_foot()}""")
 
 def share_page(sid, share, files, base):
     rows = []
@@ -707,12 +726,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # 出错路径（请求体没读完）会关连接：明确告诉客户端不要复用，
+            # 否则它会把残留的请求体当成下一个请求的响应来读。
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False),
                    "application/json; charset=utf-8")
+
+    def _fail_close(self, obj, code):
+        # 请求体没读完就报错（超大上传/超大表单）：必须关连接，否则残留的
+        # 请求体会被当成同一 keep-alive 连接上的下一个 HTTP 请求来解析。
+        self.close_connection = True
+        return self._json(obj, code)
 
     def _redirect(self, loc):
         self.send_response(302)
@@ -862,6 +891,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             self.log_message("GET %s error: %s", self.path, e)
+            # 出错时请求体不一定读完了，关连接防污染同一连接的下一个请求
+            self.close_connection = True
             try:
                 self._send(500, page("出错", "<div class='card'><h1>😵 出错了</h1></div>"))
             except Exception:
@@ -896,7 +927,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     fields, files = self._multipart()
                 except UploadTooLarge:
-                    return self._json({"ok": False, "error": "文件太大，超出上限"}, 413)
+                    return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
                     return self._json({"ok": False, "error": f"上传解析失败: {e}"}, 400)
                 if not files:
@@ -921,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     fields, _ = self._multipart()
                 except (UploadTooLarge, BadUpload) as e:
-                    return self._json({"ok": False, "error": str(e)}, 400)
+                    return self._fail_close({"ok": False, "error": str(e)}, 400)
                 title = (fields.get("title") or "").strip()[:100]
                 days = _expiry_days(fields.get("expiry"))
                 now = int(time.time())
@@ -944,7 +975,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._authed():
                     return self._json({"ok": False, "error": "未登录"}, 401)
                 f = self._form()
-                ids = [int(x) for x in (f.get("ids") or "").split(",") if x.strip().isdigit()]
+                # 注意：str.isdigit() 对 "²" 这类 Unicode 数字也返回 True，
+                # 但 int() 转不了，会抛 ValueError 变成 500。用 ASCII 数字校验。
+                ids = [int(x) for x in (f.get("ids") or "").split(",")
+                       if re.fullmatch(r"[0-9]+", x.strip() or "")]
                 delete_files(ids)
                 return self._json({"ok": True, "deleted": len(ids)})
 
@@ -971,7 +1005,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "未登录"}, 401)
                 f = self._form()
                 sid = f.get("id", "")
-                title = f.get("title", "")[:100]
+                title = (f.get("title", "") or "").strip()[:100]
                 if not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid):
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 with db() as c:
@@ -989,6 +1023,14 @@ class Handler(BaseHTTPRequestHandler):
                 if len(f.get("new1", "")) < 4 or f.get("new1") != f.get("new2"):
                     return self._json({"ok": False, "error": "新密码至少4位且两次一致"})
                 meta_set("pw", hash_pw(f["new1"]))
+                # 改密码很可能是因为旧密码泄露：让其他设备/浏览器上的旧会话
+                # 立即失效，只保留当前这一个会话不断线。
+                me = self._cookie().get("sid")
+                with db() as c:
+                    if me:
+                        c.execute("DELETE FROM sessions WHERE token!=?", (me,))
+                    else:
+                        c.execute("DELETE FROM sessions")
                 return self._json({"ok": True})
 
             m = re.fullmatch(r"/r/([A-Za-z0-9_\-]{1,16})/upload", p)
@@ -1000,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _, files = self._multipart()
                 except UploadTooLarge:
-                    return self._json({"ok": False, "error": "文件太大，超出上限"}, 413)
+                    return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
                     return self._json({"ok": False, "error": f"上传解析失败: {e}"}, 400)
                 if not files:
@@ -1016,12 +1058,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": "unknown"}, 404)
         except BadUpload as e:
             # 表单/分块解析失败（超大、缺 boundary 等）统一 400，各接口内部的
-            # except BadUpload 会先捕获，这里只处理漏网的
-            self._json({"ok": False, "error": str(e) or "请求无效"}, 400)
+            # except BadUpload 会先捕获，这里只处理漏网的。请求体可能没读完，
+            # 关连接防污染。
+            self._fail_close({"ok": False, "error": str(e) or "请求无效"}, 400)
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as e:
             self.log_message("POST %s error: %s", self.path, e)
+            # 出错时请求体不一定读完了，关连接是最稳妥的
+            self.close_connection = True
             try:
                 self._json({"ok": False, "error": "服务器错误"}, 500)
             except Exception:
