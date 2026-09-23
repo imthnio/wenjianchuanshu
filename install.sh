@@ -388,7 +388,7 @@ def url(host, number):
 print("\n===================================")
 print("安装完成，本机 HTTP 检查通过；外网连通性尚未验证。")
 if public_host:
-    host = public_host.strip("[]")
+    host = public_host.strip().strip("[]")
     parsed = urlsplit(url(host, public_port))
     if parsed.hostname != host or parsed.username or parsed.path or parsed.query or parsed.fragment:
         sys.exit("PUBLIC_HOST 必须是纯 IP 或域名，不含协议、端口或路径。")
