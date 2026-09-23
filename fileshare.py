@@ -464,8 +464,9 @@ def disk_usage():
 
 def disk_foot():
     used, total = disk_usage()
+    free = max(total - used, 0)
     pct = min(used * 100 // total, 100) if total else 0
-    return (f"<div class='diskfoot'>💾 已用 {hsize(used)} / 共 {hsize(total)}"
+    return (f"<div class='diskfoot'>💾 剩余 {hsize(free)} / 已用 {hsize(used)}"
             f"<span class='diskbar'><i style='width:{pct}%'></i></span></div>")
 
 def setup_page(err=""):
@@ -749,6 +750,26 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         return self._json(obj, code)
 
+    def _close_if_body_pending(self):
+        # 调用方不打算读请求体时用：如果客户端发了 body，
+        # 关掉这个 keep-alive 连接，否则残留的 body 会被当成
+        # 同一连接上的下一个 HTTP 请求来解析（实测曾因此返回 501）。
+        try:
+            pending = int(self.headers.get("Content-Length") or 0) > 0
+        except (TypeError, ValueError):
+            pending = True
+        if pending:
+            self.close_connection = True
+
+    def _require_auth(self):
+        # API 鉴权：通过返回 True；未登录回 401，
+        # 且 body 没读时关连接（同 _close_if_body_pending 的道理）。
+        if self._authed():
+            return True
+        self._close_if_body_pending()
+        self._json({"ok": False, "error": "未登录"}, 401)
+        return False
+
     def _redirect(self, loc):
         self.send_response(302)
         self.send_header("Location", loc)
@@ -839,6 +860,9 @@ class Handler(BaseHTTPRequestHandler):
     # ---- GET ----
     def do_GET(self):
         try:
+            # 本应用的 GET 接口都不读请求体：带 body 的 GET 直接标记关连接，
+            # 否则残留 body 会污染同一 keep-alive 连接上的下一个请求。
+            self._close_if_body_pending()
             p = urlparse(self.path).path
             if p == "/healthz":
                 # Check SQLite too: a listening socket alone does not mean the app works.
@@ -937,8 +961,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._clear_sid()
 
             if p == "/api/share":
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 try:
                     fields, files = self._multipart()
                 except UploadTooLarge:
@@ -953,28 +977,46 @@ class Handler(BaseHTTPRequestHandler):
                 title = (fields.get("title") or "").strip()[:100]
                 days = _expiry_days(fields.get("expiry"))
                 now = int(time.time())
-                sid = new_share_id()
-                with db() as c:
-                    c.execute("INSERT INTO shares(id,type,title,created,expires)"
-                              " VALUES(?,?,?,?,?)",
-                              (sid, "send", title, now, now + days * 86400 if days else 0))
-                    for fo in files:
-                        c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                try:
+                    sid = new_share_id()
+                    with db() as c:
+                        c.execute("INSERT INTO shares(id,type,title,created,expires)"
                                   " VALUES(?,?,?,?,?)",
-                                  (sid, fo["filename"], fo["stored"], fo["size"], now))
+                                  (sid, "send", title, now, now + days * 86400 if days else 0))
+                        for fo in files:
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                                      " VALUES(?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                except Exception:
+                    # 入库失败（如磁盘满）：删掉已落盘的文件，不能留孤儿占空间
+                    for fo in files:
+                        try:
+                            os.unlink(os.path.join(FILES_DIR, fo["stored"]))
+                        except OSError:
+                            pass
+                    raise
                 return self._json({"ok": True, "link": f"/s/{sid}", "id": sid})
 
             if p == "/api/receive":
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 try:
-                    fields, _ = self._multipart()
+                    fields, files = self._multipart()
                 except UploadTooLarge:
                     # 与 /api/share、/r/<sid>/upload 一致：超大上传返回 413
                     #（之前这里是 400，且错误信息是空字符串）
                     return self._fail_close({"ok": False, "error": "文件太大，超出上限"}, 413)
                 except BadUpload as e:
                     return self._fail_close({"ok": False, "error": str(e)}, 400)
+                if files:
+                    # 创建接收链接不需要传文件：删掉已落盘的孤儿文件，
+                    # 不能让它们留在磁盘上谁也看不见、也清不掉。
+                    for fo in files:
+                        try:
+                            os.unlink(os.path.join(FILES_DIR, fo["stored"]))
+                        except OSError:
+                            pass
+                    return self._json({"ok": False, "error": "创建接收链接不需要上传文件"}, 400)
                 title = (fields.get("title") or "").strip()[:100]
                 days = _expiry_days(fields.get("expiry"))
                 now = int(time.time())
@@ -986,16 +1028,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "link": f"/r/{sid}", "id": sid})
 
             if p == "/api/delete":
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 f = self._form()
                 if f.get("id"):
                     delete_share(f["id"])
                 return self._json({"ok": True})
 
             if p == "/api/del_files":
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 f = self._form()
                 # 注意：str.isdigit() 对 "²" 这类 Unicode 数字也返回 True，
                 # 但 int() 转不了，会抛 ValueError 变成 500。用 ASCII 数字校验。
@@ -1006,8 +1048,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if p == "/api/expiry":
                 # 管理员手动调整已创建分享的过期时间（延长或缩短）
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 f = self._form()
                 sid = f.get("id", "")
                 with db() as c:
@@ -1023,8 +1065,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if p == "/api/title":
                 # 改分享的备注名（发送/接收通用），空字符串表示清除备注
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 f = self._form()
                 sid = f.get("id", "")
                 title = (f.get("title", "") or "").strip()[:100]
@@ -1038,8 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
 
             if p == "/api/chpw":
-                if not self._authed():
-                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if not self._require_auth():
+                    return
                 f = self._form()
                 # 已登录即视为管理员身份，不再校验当前密码
                 if len(f.get("new1", "")) < 4 or f.get("new1") != f.get("new2"):
@@ -1060,6 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = m.group(1)
                 s = self._valid_share(sid, "receive")
                 if not s:
+                    self._close_if_body_pending()
                     return self._json({"ok": False, "error": "链接不存在或已过期"}, 404)
                 try:
                     _, files = self._multipart()
@@ -1071,13 +1114,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 now = int(time.time())
-                with db() as c:
+                try:
+                    with db() as c:
+                        for fo in files:
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                                      " VALUES(?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                except Exception:
+                    # 入库失败（如磁盘满）：删掉已落盘的文件，不能留孤儿占空间
                     for fo in files:
-                        c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                                  " VALUES(?,?,?,?,?)",
-                                  (sid, fo["filename"], fo["stored"], fo["size"], now))
+                        try:
+                            os.unlink(os.path.join(FILES_DIR, fo["stored"]))
+                        except OSError:
+                            pass
+                    raise
                 return self._json({"ok": True, "count": len(files)})
 
+            # 未知路径：body 没读的话关连接，防残留污染 keep-alive
+            self._close_if_body_pending()
             return self._json({"ok": False, "error": "unknown"}, 404)
         except BadUpload as e:
             # 表单/分块解析失败（超大、缺 boundary 等）统一 400，各接口内部的
