@@ -84,6 +84,41 @@ class Connectivity(unittest.TestCase):
         self.assertIn('cancelExpiry(\'\\"+id+\\"\')', body)
         self.assertNotIn('saveExpiry(\\"+id+\\")', body)
 
+    def test_copy_button_has_insecure_context_fallback(self):
+        # 回归测试：复制链接按钮之前直接调 navigator.clipboard.writeText，
+        # 而剪贴板 API 只在安全上下文（HTTPS/localhost）可用；默认用
+        # http://IP:端口 打开时 navigator.clipboard 是 undefined，
+        # 点了抛 TypeError 没任何反应。现在必须先判断再调，
+        # 不可用时明确提示手动复制，且链接一直可见。
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        body = app.dash_page(shares).decode("utf-8")
+        m = re.search(r"<script>(.*)</script>", body, re.S)
+        self.assertIsNotNone(m)
+        js = m.group(1)
+        self.assertIn("function copyText", js)
+        self.assertIn("window.isSecureContext", js)
+        self.assertIn("copyText(t, el)", js)  # 卡片上的复制链接走 copyText
+        self.assertIn("copyText(fullLink(", js)  # 上传成功后的复制按钮也走 copyText
+        # 唯一的 writeText 调用必须落在 isSecureContext 保护分支内
+        idx = js.index("navigator.clipboard.writeText(t)")
+        guard = js.rindex("if (", 0, idx)
+        self.assertIn("window.isSecureContext", js[guard:idx])
+        if shutil.which("node"):
+            with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                             delete=False) as f:
+                f.write(js)
+                path = f.name
+            try:
+                r = subprocess.run(["node", "--check", path],
+                                   capture_output=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr.decode())
+            finally:
+                os.unlink(path)
+
     def test_oversized_form_rejected_without_reading(self):
         # 普通表单超过 1MB 直接 400，不读进内存
         with self.server("127.0.0.1") as port:
@@ -862,6 +897,67 @@ class HTTPSConfig(unittest.TestCase):
                 'SRV_HOST': '::', 'PORT': '18080', 'DOMAIN': 'test.example.com'}, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('reverse_proxy [::1]:18080', (Path(folder) / 'Caddyfile').read_text())
+
+    def nat_port_block(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('ORIG_PORT="$PORT"')
+        end = text.index('if [ "$NAT" = "1" ]; then\n  echo "使用 NAT 模式')
+        return text[start:end]
+
+    def run_nat_port(self, block, srv_host, service_port, saved_port):
+        with tempfile.TemporaryDirectory() as folder:
+            saved = Path(folder) / 'nat-port'
+            saved.write_text(saved_port + '\n')
+            script = ('set -eu\n' + block.replace('/etc/minishare-nat-port', str(saved))
+                      + '\nprintf "PORT=%s\\n" "$PORT"\n')
+            r = subprocess.run(['sh', '-c', script],
+                               env={**os.environ, 'NAT': '1',
+                                    'SRV_HOST': srv_host, 'PORT': service_port},
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip().splitlines()[-1]
+
+    def test_nat_rerun_after_reinstall_uses_new_port(self):
+        # 回归测试：用户重装改了端口后，旧保存文件里的端口不能再覆盖新端口
+        #（之前会静默用回旧端口，Caddy 监听的和用户刚选的不一致）。
+        block = self.nat_port_block()
+        self.assertEqual(self.run_nat_port(block, '0.0.0.0', '20000', '19332'),
+                         'PORT=20000')
+
+    def test_nat_rerun_without_reinstall_keeps_saved_port(self):
+        # 没重装（minishare 仍在 127.0.0.1）时，沿用上次的 HTTPS 公开端口。
+        block = self.nat_port_block()
+        self.assertEqual(self.run_nat_port(block, '127.0.0.1', '45678', '19332'),
+                         'PORT=19332')
+
+    def dns_check_block(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('if [ -n "$PUBIP" ] && [ "$DNSIP" != "$PUBIP" ]; then')
+        end = text.index('echo "域名解析正常', start)
+        return text[start:end]
+
+    def run_dns_check(self, block, nat):
+        script = 'set -eu\n' + block + '\necho STILL_ALIVE\n'
+        return subprocess.run(['sh', '-c', script],
+                              env={**os.environ, 'NAT': nat, 'PUBIP': '5.6.7.8',
+                                   'DNSIP': '1.2.3.4', 'DOMAIN': 'd.test', 'REC': 'A'},
+                              capture_output=True, text=True, timeout=10)
+
+    def test_nat_dns_mismatch_warns_but_continues(self):
+        # 回归测试：NAT 机器出口 IP 与域名入站 IP 不同是常态，证书走 DNS
+        # 验证不依赖 IP 一致；之前直接退出，还误导用户把 A 记录改成出口 IP。
+        block = self.dns_check_block()
+        r = self.run_dns_check(block, '1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('STILL_ALIVE', r.stdout)
+        self.assertIn('注意', r.stdout)
+
+    def test_normal_dns_mismatch_still_blocks(self):
+        # 普通模式走 HTTP 验证，IP 对不上证书确实下不来，保持硬阻断。
+        block = self.dns_check_block()
+        r = self.run_dns_check(block, '0')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn('STILL_ALIVE', r.stdout)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
