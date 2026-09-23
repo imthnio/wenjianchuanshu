@@ -322,6 +322,50 @@ class Connectivity(unittest.TestCase):
             self.assertTrue(json.loads(body)["ok"])
             c.close()
 
+    def test_delete_share_keeps_files(self):
+        # 删除分享只删链接不删文件：文件保留在"全部文件"里（标记为"链接已删"），
+        # 由用户手动删除。以前 delete_share 会连文件带记录一起删掉。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----keep"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                  f"filename=\"keepme.txt\"\r\n\r\n" + "k" * 100 +
+                  f"\r\n--{bnd}--\r\n").encode()
+            c.request("POST", "/api/share", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            share = json.loads(r.read())
+            self.assertTrue(share["ok"])
+            sid = share["id"]
+            self.assertEqual(len(os.listdir(app.FILES_DIR)), 1)
+            c.request("POST", "/api/delete",
+                      body=urllib.parse.urlencode({"id": sid}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            self.assertTrue(json.loads(r.read())["ok"])
+            # 链接已失效
+            c.request("GET", f"/s/{sid}")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 404)
+            # 文件仍在磁盘上，且控制台"全部文件"里可见并标为"链接已删"
+            self.assertEqual(len(os.listdir(app.FILES_DIR)), 1)
+            c.request("GET", "/dash", headers={"Cookie": cookie})
+            r = c.getresponse()
+            dash = r.read().decode("utf-8")
+            self.assertIn("keepme.txt", dash)
+            self.assertIn("链接已删", dash)
+            c.close()
+
     def test_title_api(self):
         # 改备注：未登录 401 → 登录后改名 → dash 显示 → 清空 → 不存在 404
         with self.server("127.0.0.1") as port:
