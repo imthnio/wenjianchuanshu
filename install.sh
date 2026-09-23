@@ -1,14 +1,16 @@
 #!/bin/sh
-# minishare 一键安装：Debian / Ubuntu / Alpine / CentOS / Arch 通用
+# minishare 一键安装/修复：Debian / Ubuntu / Alpine / CentOS / Arch 通用
 #
-# 小白用法：SSH 连上服务器（root 用户）后，粘贴下面这一段，回车，
-# 然后按提示操作（端口必须自己输入）：
-#
-#   (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-install.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh) && sh /tmp/minishare-install.sh
+# 小白用法：SSH 连上服务器（root 用户）后，粘贴 README 里的那一段命令，回车。
+# 脚本会自动识别：
+#   - 没装过 minishare → 全新安装向导（3 个问题，端口必须自己输入）；
+#   - 已装过 minishare → 保留数据修复：只更新 Python 程序，保留现有监听
+#     地址、端口、密码和上传文件；先备份原程序，重启后检查失败则自动恢复。
 #
 # 进阶：非交互安装可用环境变量预设
 #   APP_DIR / PORT / IPVER(4 或 6，默认 4) / BIND / MINISHARE_REPO / NONINTERACTIVE=1
 #   PUBLIC_HOST / PUBLIC_PORT：NAT 入站地址和外部映射端口，可选
+#   FORCE_INSTALL=1：即使已装过也强制走全新安装（例如要换端口重装）
 set -e
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -16,9 +18,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+TMPD=""
+RTMP=""
+cleanup() { [ -n "$TMPD" ] && rm -rf "$TMPD"; [ -n "$RTMP" ] && rm -rf "$RTMP"; }
+trap cleanup EXIT
+
 APP_DIR="${APP_DIR:-/opt/minishare}"
-# 注意：PORT 没有默认值，安装时必须由用户输入（向导第 2 问），
-# 或非交互安装时用环境变量 PORT 指定。
+# 注意：PORT 没有默认值，全新安装时必须由用户输入（向导第 2 问），
+# 或非交互安装时用环境变量 PORT 指定。修复模式沿用现有端口，不需要 PORT。
 PORT="${PORT:-}"
 IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
@@ -65,7 +72,6 @@ else
     return 1
   }
   TMPD="$(mktemp -d)"
-  trap 'rm -rf "$TMPD"' EXIT
   cd "$TMPD"
   for f in fileshare.py minishare.service minishare.openrc; do
     dl "$f" || { echo ""; echo "下载 $f 失败：连不上 GitHub 和镜像站，请检查服务器网络后重试。"; exit 1; }
@@ -73,7 +79,114 @@ else
   echo "下载完成。"
 fi
 
-# ---- 1. 安装向导：只有 3 个问题 ----
+# ---- 1. 安装 python3（缺了自己装） ----
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "正在安装 python3..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update && apt-get install -y python3
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache python3
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y python3
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm python
+  else
+    echo "找不到包管理器，请手动安装 python3 后重试"
+    exit 1
+  fi
+fi
+PYTHON="$(command -v python3)"
+
+# ---- 2. 自动识别：已装过 → 保留数据修复；没装过 → 全新安装 ----
+MODE=install
+if [ -z "${FORCE_INSTALL:-}" ]; then
+  if [ -d /run/systemd/system ] && [ -f /etc/systemd/system/minishare.service ]; then
+    SERVICE=/etc/systemd/system/minishare.service
+    INIT=systemd
+    MODE=repair
+  elif [ -f /etc/init.d/minishare ]; then
+    SERVICE=/etc/init.d/minishare
+    INIT=openrc
+    MODE=repair
+  fi
+fi
+
+if [ "$MODE" = repair ]; then
+  # ---- 保留数据修复：只更新 Python 程序，保留现有监听地址、端口、密码和上传文件 ----
+  echo "检测到已安装的 minishare，进入保留数据修复模式。"
+  echo "只更新 Python 程序，保留现有监听地址、端口、密码和上传文件；"
+  echo "先备份原程序，重启后检查失败则自动恢复原程序。"
+  RTMP=$(mktemp -d)
+  # 把已知格式的服务文件当数据解析，绝不执行 / source 它。
+  "$PYTHON" - "$SERVICE" "$RTMP" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+values = {}
+for name in ('SHARE_HOST', 'SHARE_PORT', 'SHARE_DATA'):
+    match = re.search(r'^(?:Environment=|export )' + name + r'=(.+)$', text, re.M)
+    if not match:
+        sys.exit('无法读取现有配置：' + name)
+    values[name] = match.group(1).strip().strip('"')
+app = pathlib.Path(values['SHARE_DATA']).parent
+if not (app / 'fileshare.py').is_file():
+    sys.exit('找不到程序文件，未作修改。')
+for name, value in {**values, 'APP_DIR': str(app)}.items():
+    pathlib.Path(sys.argv[2], name).write_text(value)
+PY
+  APP_DIR=$(cat "$RTMP/APP_DIR")
+  BIND=$(cat "$RTMP/SHARE_HOST")
+  PORT=$(cat "$RTMP/SHARE_PORT")
+  echo "现有配置：监听 $BIND，端口 $PORT，目录 $APP_DIR"
+  # 先校验新程序，确认没问题才动现有安装。
+  "$PYTHON" - fileshare.py <<'PY'
+import ast, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    ast.parse(f.read())
+PY
+  BACKUP="$APP_DIR/fileshare.py.backup.$(date +%Y%m%d%H%M%S).$$"
+  cp "$APP_DIR/fileshare.py" "$BACKUP"
+  cp fileshare.py "$APP_DIR/fileshare.py.new"
+  chmod 644 "$APP_DIR/fileshare.py.new"
+  mv "$APP_DIR/fileshare.py.new" "$APP_DIR/fileshare.py"
+  echo "原程序已备份：$BACKUP"
+  restart() {
+    if [ "$INIT" = systemd ]; then systemctl restart minishare; else rc-service minishare restart; fi
+  }
+  if ! restart || ! "$PYTHON" "$APP_DIR/fileshare.py" --check "$BIND" "$PORT"; then
+    echo "更新后检查未通过，恢复原程序。"
+    cp "$BACKUP" "$APP_DIR/fileshare.py"
+    restart || true
+    if [ "$INIT" = systemd ]; then journalctl -u minishare -n 30 --no-pager || true; else tail -n 30 /var/log/minishare.log /var/log/messages 2>/dev/null || true; fi
+    exit 1
+  fi
+  # 只给现有的非回环 IPv6 监听补防火墙规则。
+  case "$BIND" in
+    ::1|127.*) ;;
+    *:*)
+      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        ufw allow "$PORT"/tcp
+      elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+        firewall-cmd --permanent --add-port="$PORT"/tcp && firewall-cmd --reload
+      elif command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || echo "IPv6 防火墙放行失败，请检查主机规则。"
+        echo "请确认 IPv6 防火墙规则在重启后仍保留。"
+      fi ;;
+  esac
+  case "$BIND" in *:*) DISP="[$BIND]" ;; *) DISP="$BIND" ;; esac
+  echo ""
+  echo "==================================="
+  echo "修复完成：程序已更新到最新版，本机 HTTP 检查通过。"
+  echo "原监听地址、端口、密码和上传文件都保留。"
+  echo "访问地址：http://$DISP:$PORT"
+  echo "（NAT 小鸡请用外部映射端口访问；主机防火墙和服务商安全组仍需自行核对。）"
+  echo "如果曾开启 HTTPS 且仍打不开，请重新运行新版 enable-https.sh。"
+  echo "==================================="
+  exit 0
+fi
+
+# ---- 3. 安装向导：只有 3 个问题 ----
 if [ -t 0 ] && [ -z "$NONINTERACTIVE" ]; then
   echo "=== minishare 安装向导 ==="
   echo "下面只有 3 个问题，第 2 问（端口）没有默认值，必须自己输入。"
@@ -126,25 +239,6 @@ case "$IPVER" in
   *) IPVER=4; BIND="${BIND:-0.0.0.0}" ;;
 esac
 
-# ---- 2. 安装 python3 ----
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "正在安装 python3..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update && apt-get install -y python3
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache python3
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y python3
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y python3
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm python
-  else
-    echo "找不到包管理器，请手动安装 python3 后重试"
-    exit 1
-  fi
-fi
-PYTHON="$(command -v python3)"
 # Validate before touching an existing installation.
 "$PYTHON" - "$BIND" <<'PY'
 import ipaddress, sys
@@ -168,12 +262,12 @@ else
   exit 1
 fi
 
-# ---- 3. 拷文件 ----
+# ---- 4. 拷文件 ----
 mkdir -p "$APP_DIR/data/files"
 if [ "$(pwd)" != "$APP_DIR" ]; then cp fileshare.py "$APP_DIR/fileshare.py"; fi
 chmod 644 "$APP_DIR/fileshare.py"
 
-# ---- 4. 开机自启 ----
+# ---- 5. 开机自启 ----
 if [ "$INIT" = "systemd" ]; then
   sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@BIND@|$BIND|g" \
       -e "s|@PORT@|$PORT|g" -e "s|@PYTHON@|$PYTHON|g" \
@@ -210,7 +304,7 @@ if ! "$PYTHON" "$APP_DIR/fileshare.py" --check "$BIND" "$PORT"; then
   exit 1
 fi
 
-# ---- 5. 放行端口 ----
+# ---- 6. 放行端口 ----
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$PORT"/tcp >/dev/null
   echo "ufw 已放行 ${PORT}。"
@@ -232,7 +326,7 @@ else
   fi
 fi
 
-# ---- 6. 生成经过校验的地址；公网出口不等于 NAT 入站地址 ----
+# ---- 7. 生成经过校验的地址；公网出口不等于 NAT 入站地址 ----
 "$PYTHON" - "$IPVER" "$PORT" "${PUBLIC_HOST:-}" "${PUBLIC_PORT:-$PORT}" <<'PYADDR'
 import ipaddress, json, socket, subprocess, sys
 from urllib.parse import urlsplit
