@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -151,6 +152,84 @@ class Installer(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('TEST_STARTUP_LOG', r.stdout)
         self.assertNotIn('安装完成', r.stdout)
+
+    def run_install_repair(self, with_listener=False):
+        """Sandbox with a fake pre-installed minishare service on disk."""
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        source = root / 'source'
+        shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns('.git', '__pycache__'))
+        bin_dir = root / 'bin'
+        bin_dir.mkdir()
+        def command(name, body):
+            p = bin_dir / name
+            p.write_text('#!/bin/sh\n' + body + '\n')
+            p.chmod(0o755)
+        command('id', 'echo 0')
+        command('systemctl', 'exit 0')
+        command('journalctl', 'echo TEST_STARTUP_LOG')
+        script = (source / 'install.sh').read_text()
+        marker = root / 'run-systemd'
+        marker.mkdir()
+        units = root / 'units'
+        units.mkdir()
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        app_dir = root / 'app'
+        (app_dir / 'data' / 'files').mkdir(parents=True)
+        (units / 'minishare.service').write_text(
+            'Environment=SHARE_HOST=127.0.0.1\n'
+            'Environment=SHARE_PORT=%d\n'
+            'Environment=SHARE_DATA=%s\n' % (port, app_dir / 'data'))
+        installed_py = app_dir / 'fileshare.py'
+        installed_py.write_text('# installed version\n' + (ROOT / 'fileshare.py').read_text())
+        marker_text = '# updated by repair test\n'
+        (source / 'fileshare.py').write_text(
+            (ROOT / 'fileshare.py').read_text() + marker_text)
+        script = script.replace('/run/systemd/system', str(marker)).replace('/etc/systemd/system', str(units))
+        script = script.replace('elif command -v rc-service >/dev/null 2>&1; then', 'elif false; then')
+        (source / 'install.sh').write_text(script)
+        server_proc = None
+        if with_listener:
+            server_proc = subprocess.Popen(
+                [sys.executable, str(installed_py)],
+                env={**os.environ, 'SHARE_HOST': '127.0.0.1', 'SHARE_PORT': str(port),
+                     'SHARE_DATA': str(app_dir / 'data'), 'PYTHONDONTWRITEBYTECODE': '1'},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.addCleanup(server_proc.terminate)
+            for _ in range(60):
+                probe = subprocess.run(
+                    [sys.executable, str(installed_py), '--check', '127.0.0.1', str(port)],
+                    capture_output=True, timeout=10)
+                if probe.returncode == 0:
+                    break
+                time.sleep(0.5)
+            else:
+                self.fail('test server did not become ready')
+        result = subprocess.run(['sh', str(source / 'install.sh')], cwd=root,
+            env={**os.environ, 'PATH': str(bin_dir) + ':' + os.environ['PATH'],
+                 'NONINTERACTIVE': '1', 'PYTHONDONTWRITEBYTECODE': '1'},
+            capture_output=True, text=True, timeout=60)
+        return result, root, marker_text, port
+
+    def test_repair_mode_detected_for_existing_install(self):
+        r, root, _, _ = self.run_install_repair(with_listener=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('保留数据修复', r.stdout)
+        self.assertIn('恢复原程序', r.stdout)
+        self.assertTrue((root / 'app' / 'fileshare.py').read_text().startswith('# installed version'))
+        self.assertEqual(len(list((root / 'app').glob('fileshare.py.backup.*'))), 1)
+
+    def test_repair_mode_updates_program_when_check_passes(self):
+        r, root, marker_text, port = self.run_install_repair(with_listener=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('修复完成', r.stdout)
+        self.assertIn(str(port), r.stdout)
+        content = (root / 'app' / 'fileshare.py').read_text()
+        self.assertIn(marker_text.strip(), content)
+        self.assertFalse(content.startswith('# installed version'))
 
 class HTTPSConfig(unittest.TestCase):
     def nat_case(self, fail):
