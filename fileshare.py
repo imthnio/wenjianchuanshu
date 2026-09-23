@@ -938,8 +938,7 @@ function copyLink(id, p){{
 }}
 function delShare(id){{
   if(!confirm('确定删除这个分享链接吗？文件会保留，可在「全部文件」里手动删除。')) return;
-  fetch('/api/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)}}).then(r=>r.json()).then(()=>location.reload());
+  apiPost('/api/delete','id='+encodeURIComponent(id));
 }}
 function toggleAllFiles(){{
   var cks=document.querySelectorAll('.fileck'), all=true, i;
@@ -955,9 +954,7 @@ function delFiles(){{
 }}
 function delFilesByIds(ids){{
   if(!confirm('确定彻底删除选中的 '+ids.length+' 个文件吗？删除后无法恢复。'))return;
-  fetch('/api/del_files',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'ids='+encodeURIComponent(ids.join(','))}})
-    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'删除失败');}});
+  apiPost('/api/del_files','ids='+encodeURIComponent(ids.join(',')));
 }}
 function editExpiry(id){{
   var box=document.getElementById('ex-'+id);
@@ -987,18 +984,11 @@ function editTitle(id){{
 function cancelTitle(id){{document.getElementById('ti-'+id).innerHTML='';}}
 function saveTitle(id){{
   var v=document.getElementById('tin-'+id).value.trim();
-  fetch('/api/title',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)+'&title='+encodeURIComponent(v)}})
-  .then(function(r){{return r.json().then(function(d){{return {{s:r.status,d:d}};}});}})
-  .then(function(x){{
-    if(x.d.ok){{location.reload();}}else{{alert('保存失败：'+(x.d.error||x.s));}}
-  }});
+  apiPost('/api/title','id='+encodeURIComponent(id)+'&title='+encodeURIComponent(v));
 }}
 function saveExpiry(id){{
   var v=document.getElementById('exs-'+id).value;
-  fetch('/api/expiry',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)+'&expiry='+encodeURIComponent(v)}})
-    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'修改失败');}});
+  apiPost('/api/expiry','id='+encodeURIComponent(id)+'&expiry='+encodeURIComponent(v));
 }}
 function bindXhr(fid, url, resId, progId, okText){{
   var f=document.getElementById(fid);
@@ -1108,15 +1098,37 @@ function postForm(url, form, resId, okHtml){{
     return j;
   }});
 }}
+// 简单 POST 通用封装（删分享/删文件/改备注/改过期/用户管理等操作）：
+// 任何失败（HTTP 错误、返回非 JSON、网络错误）都弹明确提示，
+// 不会“点了没反应”。成功则刷新页面。
+function apiPost(url, body){{
+  return fetch(url,{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+    body:body}})
+  .then(function(r){{
+    // 先读文本：HTTP 错误时也尽量把服务端返回的 error 文案展示出来，
+    // 而不是只显示一个干巴巴的 HTTP 状态码。
+    return r.text().then(function(t){{
+      var j=null;try{{j=JSON.parse(t);}}catch(e){{}}
+      if(!r.ok)throw new Error((j&&j.error)||('HTTP '+r.status));
+      if(!j)throw new Error('服务器返回异常');
+      return j;
+    }});
+  }})
+  .then(function(j){{
+    if(j.ok){{location.reload();}}
+    else{{alert('操作失败：'+(j.error||'未知错误'));}}
+  }})
+  .catch(function(e){{
+    alert('请求失败：'+(e&&e.message?e.message:'网络错误')+'，请检查网络后重试');
+  }});
+}}
 document.getElementById('pwForm').addEventListener('submit', function(ev){{
   ev.preventDefault();
   postForm('/api/chpw', this, 'pwRes', "<div class='ok'>密码已修改</div>");
 }});
 function userDel(id){{
   if(!confirm('确定删除这个用户吗？他的分享链接会失效，文件会保留在「全部文件」里。'))return;
-  fetch('/api/user_del',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)}})
-    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'删除失败');}});
+  apiPost('/api/user_del','id='+encodeURIComponent(id));
 }}
 function resetPw(id){{
   var box=document.getElementById('urp-'+id);
@@ -1128,9 +1140,7 @@ function resetPw(id){{
 function cancelResetPw(id){{document.getElementById('urp-'+id).innerHTML='';}}
 function saveResetPw(id){{
   var a=document.getElementById('rp1-'+id).value, b=document.getElementById('rp2-'+id).value;
-  fetch('/api/user_resetpw',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)+'&pw1='+encodeURIComponent(a)+'&pw2='+encodeURIComponent(b)}})
-    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'重设失败');}});
+  apiPost('/api/user_resetpw','id='+encodeURIComponent(id)+'&pw1='+encodeURIComponent(a)+'&pw2='+encodeURIComponent(b));
 }}
 // 备注名：只给管理员自己看（比如这个账号给了谁），不影响登录（登录只认密码）。
 function editRemark(id){{
@@ -1152,9 +1162,7 @@ function editRemark(id){{
 function cancelRemark(id){{document.getElementById('urm-'+id).innerHTML='';}}
 function saveRemark(id){{
   var v=document.getElementById('rmi-'+id).value.trim();
-  fetch('/api/user_remark',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-    body:'id='+encodeURIComponent(id)+'&remark='+encodeURIComponent(v)}})
-    .then(r=>r.json()).then(j=>{{if(j.ok)location.reload();else alert(j.error||'保存失败');}});
+  apiPost('/api/user_remark','id='+encodeURIComponent(id)+'&remark='+encodeURIComponent(v));
 }}
 // 眼睛：管理员查看某个账号的当前密码。只在管理员的"用户管理"里有这个按钮，
 // 普通用户登录后根本看不到这一整块，所以用户本人不会知道。
@@ -1850,6 +1858,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._fail_close({"ok": False, "error": too_large_msg()}, 413)
                 except BadUpload as e:
                     return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                except OSError as oe:
+                    if oe.errno == errno.ENOSPC:
+                        # 写盘中途磁盘满：parse_multipart 已清理已落盘的临时文件。
+                        # 请求体没读完，关连接防污染（同 UploadTooLarge 路径）。
+                        return self._fail_close(
+                            {"ok": False, "error": "服务器磁盘空间不足，上传失败"}, 507)
+                    raise
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 now = int(time.time())
@@ -1904,6 +1919,11 @@ class Handler(BaseHTTPRequestHandler):
                     # 必须关连接，否则残留的请求体会污染同一 keep-alive 连接上
                     # 的下一个请求（实测：服务端曾把残留 body 当成新请求解析）。
                     return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                except OSError as oe:
+                    if oe.errno == errno.ENOSPC:
+                        return self._fail_close(
+                            {"ok": False, "error": "服务器磁盘空间不足，上传失败"}, 507)
+                    raise
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 title = (fields.get("title") or "").strip()[:100]
@@ -1987,9 +2007,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 f = self._form()
                 sid = f.get("id", "")
-                s = get_share(sid)
+                # 用 _valid_share：过期的分享在这里直接 404（并顺手删掉），
+                # 与 /api/share_file_del 等接口保持一致
+                s = self._valid_share(sid)
                 if not s:
-                    return self._json({"ok": False, "error": "分享不存在"}, 404)
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
                 # 普通用户只能取消自己的分享链接，管理员可以取消任何人的
                 if not can_manage_share(user, s):
                     return self._json({"ok": False, "error": "只能删除自己的分享"}, 403)
@@ -2016,15 +2038,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 f = self._form()
                 sid = f.get("id", "")
+                # 必须查有效期：之前直接查库不看过期，已过期的分享在清理线程
+                # 跑之前还能调这个接口把过期时间改到未来，等于"复活"。
+                s = self._valid_share(sid)
+                if not s:
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
+                days = _expiry_days(f.get("expiry"))
+                now = int(time.time())
                 with db() as c:
-                    s = c.execute("SELECT id, owner_id FROM shares WHERE id=?",
-                                  (sid,)).fetchone()
-                    if not s:
-                        return self._json({"ok": False, "error": "分享不存在"}, 404)
-                    if not can_manage_share(user, s):
-                        return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
-                    days = _expiry_days(f.get("expiry"))
-                    now = int(time.time())
                     c.execute("UPDATE shares SET expires=? WHERE id=?",
                               (now + days * 86400 if days else 0, sid))
                 return self._json({"ok": True})
@@ -2040,13 +2063,13 @@ class Handler(BaseHTTPRequestHandler):
                 title = (f.get("title", "") or "").strip()[:100]
                 if not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid):
                     return self._json({"ok": False, "error": "bad id"}, 400)
+                # 同 /api/expiry：过期分享在清理前不许再改（之前直接查库不看过期）
+                s = self._valid_share(sid)
+                if not s:
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
                 with db() as c:
-                    s = c.execute("SELECT owner_id FROM shares WHERE id=?",
-                                  (sid,)).fetchone()
-                    if not s:
-                        return self._json({"ok": False, "error": "分享不存在"}, 404)
-                    if not can_manage_share(user, s):
-                        return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
                     c.execute("UPDATE shares SET title=? WHERE id=?", (title, sid))
                 return self._json({"ok": True})
 
@@ -2177,6 +2200,11 @@ class Handler(BaseHTTPRequestHandler):
                 except BadUpload as e:
                     # 同 /api/share：解析失败可能没读完请求体，关连接防污染
                     return self._fail_close({"ok": False, "error": f"上传解析失败: {e}"}, 400)
+                except OSError as oe:
+                    if oe.errno == errno.ENOSPC:
+                        return self._fail_close(
+                            {"ok": False, "error": "服务器磁盘空间不足，上传失败"}, 507)
+                    raise
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 now = int(time.time())
@@ -2245,7 +2273,10 @@ class Handler(BaseHTTPRequestHandler):
                     tmp = os.path.join(FILES_DIR, "chunk_" + token)
                     try:
                         open(tmp, "wb").close()
-                    except OSError:
+                    except OSError as oe:
+                        if oe.errno == errno.ENOSPC:
+                            return self._json(
+                                {"ok": False, "error": "服务器磁盘空间不足，上传失败"}, 507)
                         return self._json({"ok": False, "error": "服务器错误"}, 500)
                     st[token] = {"sid": sid, "kind": kind, "filename": name,
                                  "size": size, "chunks": chunks, "next": 0,
@@ -2480,21 +2511,36 @@ def check_server(host, port, attempts=10):
     return 1
 
 
+def _sweep_startup_files():
+    # 启动时清理上次异常退出留下的分片临时文件：内存里的上传会话
+    # 已丢失，这些 chunk_* 文件永远不会被认领，不清会一直占磁盘。
+    # 另外清理"孤儿文件"：_chunk_finalize 里 rename 成功、但 INSERT 入库前
+    # 进程崩溃，或者 multipart 上传文件已落盘、但入库事务没提交就崩溃，
+    # 都会留下一个有文件、无 DB 行的孤儿。启动时没有任何上传在进行中，
+    # FILES_DIR 里非 chunk_ 前缀、且 DB 里没有对应行的文件一定是孤儿，
+    # 可以删。
+    try:
+        with db() as c:
+            known = {r[0] for r in c.execute("SELECT stored FROM files")}
+        for fn in os.listdir(FILES_DIR):
+            # chunk_*：分片临时文件，内存会话已丢失，永远不会被认领，删；
+            # 非 chunk_ 但 DB 无对应行：崩溃留下的孤儿文件，删；
+            # DB 有行的正常文件：保留。
+            if not fn.startswith("chunk_") and fn in known:
+                continue
+            try:
+                os.unlink(os.path.join(FILES_DIR, fn))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--check":
         sys.exit(check_server(sys.argv[2], int(sys.argv[3])))
     init_db()
-    # 启动时清理上次异常退出留下的分片临时文件：内存里的上传会话
-    # 已丢失，这些 chunk_* 文件永远不会被认领，不清会一直占磁盘。
-    try:
-        for fn in os.listdir(FILES_DIR):
-            if fn.startswith("chunk_"):
-                try:
-                    os.unlink(os.path.join(FILES_DIR, fn))
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    _sweep_startup_files()
     cleanup_expired()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     srv = Server((HOST, PORT), Handler)
