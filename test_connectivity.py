@@ -59,7 +59,7 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn(b"action='/setup'", body)
             self.assertEqual(app.check_server(bind, port, attempts=1), 0)
-            app.meta_set('pw', app.hash_pw('test-local-only'))
+            app.create_user('test-local-only', is_admin=True)
             self.assertEqual(self.request(client, port, '/')[0], 302)
             self.assertEqual(self.request(client, port, '/login')[0], 200)
             self.assertEqual(app.check_server(bind, port, attempts=1), 0)
@@ -80,7 +80,7 @@ class Connectivity(unittest.TestCase):
             c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
                       ("abC123-_", "send", "t", now, 0))
             shares = c.execute("SELECT * FROM shares").fetchall()
-        body = app.dash_page(shares).decode("utf-8")
+        body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
         self.assertIn('saveExpiry(\'\\"+id+\\"\')', body)
         self.assertIn('cancelExpiry(\'\\"+id+\\"\')', body)
         self.assertNotIn('saveExpiry(\\"+id+\\")', body)
@@ -96,7 +96,7 @@ class Connectivity(unittest.TestCase):
             c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
                       ("abC123-_", "send", "t", now, 0))
             shares = c.execute("SELECT * FROM shares").fetchall()
-        body = app.dash_page(shares).decode("utf-8")
+        body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
         m = re.search(r"<script>(.*)</script>", body, re.S)
         self.assertIsNotNone(m)
         js = m.group(1)
@@ -139,7 +139,7 @@ class Connectivity(unittest.TestCase):
         app.MAX_UPLOAD = 200
         try:
             with self.server("127.0.0.1") as port:
-                app.meta_set("pw", app.hash_pw("pw123456"))
+                app.create_user("pw123456", is_admin=True)
                 c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 c.request("POST", "/login",
                           body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -167,7 +167,7 @@ class Connectivity(unittest.TestCase):
         # 后被直接丢弃，变成谁也看不见、清不掉的孤儿文件占着磁盘。
         # 现在应 400，且磁盘上不留文件。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -241,7 +241,7 @@ class Connectivity(unittest.TestCase):
         # 回归测试：文件落盘后入库失败（如主键冲突/磁盘满），
         # 不能留下孤儿文件占空间。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -312,7 +312,7 @@ class Connectivity(unittest.TestCase):
         # 而真正的上传（/api/share）仍受磁盘上限约束，且 413 文案应说明
         # 是磁盘满了，而不是"文件太大"。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -364,7 +364,7 @@ class Connectivity(unittest.TestCase):
                 r.read()
                 self.assertEqual(r.status, 302)
                 return r.getheader("Set-Cookie").split(";")[0].split("=")[1], c
-            app.meta_set("pw", app.hash_pw("oldpw123"))
+            app.create_user("oldpw123", is_admin=True)
             sess_a, ca = login("oldpw123")
             sess_b, cb = login("oldpw123")
             ca.request("POST", "/api/chpw",
@@ -389,7 +389,7 @@ class Connectivity(unittest.TestCase):
     def test_del_files_rejects_non_ascii_ids(self):
         # str.isdigit() 对 "²" 返回 True 但 int() 会炸：非法 id 应忽略而非 500
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -411,7 +411,7 @@ class Connectivity(unittest.TestCase):
         # 删除分享只删链接不删文件：文件保留在"全部文件"里（标记为"链接已删"），
         # 由用户手动删除。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -555,7 +555,7 @@ class Connectivity(unittest.TestCase):
             c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
                       ("abC123-_", "send", "t", now, 0))
             shares = c.execute("SELECT * FROM shares").fetchall()
-        body = app.dash_page(shares).decode("utf-8")
+        body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
         self.assertIn("<div class='linkbox' id='lk-abC123-_'>/s/abC123-_</div>", body)
         self.assertEqual(app._clean_filename('../../etc/passwd'), 'passwd')
         self.assertEqual(app._clean_filename('正常 文件名.pdf'), '正常 文件名.pdf')
@@ -595,7 +595,7 @@ class Connectivity(unittest.TestCase):
                 self.assertEqual(self.request('127.0.0.1', backend, '/')[0], 200)
 
     def _login_cookie(self, port, pw="pw123456"):
-        app.meta_set("pw", app.hash_pw(pw))
+        app.create_user(pw, is_admin=True)
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         c.request("POST", "/login",
                   body=urllib.parse.urlencode({"pw": pw}).encode(),
@@ -737,7 +737,10 @@ class Connectivity(unittest.TestCase):
         self.assertTrue(app.check_pw("right-pw", h))
         self.assertFalse(app.check_pw("wrong-pw", h))
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", "zz$xx")  # 模拟损坏的哈希
+            # 模拟损坏的哈希：直接往 users 表里写一行坏数据
+            with app.db() as dbc:
+                dbc.execute("INSERT INTO users(pw,is_admin,created) VALUES(?,?,?)",
+                            ("zz$xx", 1, int(time.time())))
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "whatever"}).encode(),
@@ -756,7 +759,7 @@ class Connectivity(unittest.TestCase):
         self.assertEqual(app._disp_param(disp, "filename"), "a;b.txt")
         # 端到端：上传带分号的文件名，入库名字保持完整
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -781,7 +784,7 @@ class Connectivity(unittest.TestCase):
         # 回归测试：/api/del_files 的 deleted 之前是 len(ids)，勾了不存在的
         # id 也会算进去；现在只计真实删掉的行。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -823,7 +826,7 @@ class Connectivity(unittest.TestCase):
                       " VALUES(?,?,?,?,?)",
                       ("exp12345", "old.txt", "x" * 32, 3, now - 100))
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("POST", "/login",
                       body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
@@ -860,7 +863,7 @@ class Connectivity(unittest.TestCase):
                 c.close()
                 return r.status, data
 
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             # 直接入库一个接收分享（省去 multipart 建链接的步骤）
             with app.db() as c:
                 c.execute("INSERT INTO shares(id,type,title,created,expires)"
@@ -881,7 +884,7 @@ class Connectivity(unittest.TestCase):
         # 之前上限只看 MAX_UPLOAD：比如剩余 1GB 时传 2GB 的文件，
         # 会一直传到写满磁盘才 500。
         with self.server("127.0.0.1") as port:
-            app.meta_set("pw", app.hash_pw("pw123456"))
+            app.create_user("pw123456", is_admin=True)
             with app.db() as c:
                 c.execute("INSERT INTO shares(id,type,title,created,expires)"
                           " VALUES(?,?,?,?,?)",
@@ -907,6 +910,258 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertTrue(json.loads(r.read())["ok"])
             c.close()
+
+    # ---------------- 多用户 ----------------
+    def _t_login(self, port, pw):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/login",
+                  body=urllib.parse.urlencode({"pw": pw}).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        body = r.read()
+        ck = r.getheader("Set-Cookie")
+        c.close()
+        return r.status, (ck.split(";")[0] if ck else None), body
+
+    def _t_api(self, port, path, params, cookie):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", path, body=urllib.parse.urlencode(params).encode(),
+                  headers={"Content-Type": "application/x-www-form-urlencoded",
+                           "Cookie": cookie})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, json.loads(data)
+
+    def _t_mk_recv_share(self, port, cookie, title="t"):
+        bnd = "----mu"
+        mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n"
+              f"{title}\r\n--{bnd}--\r\n").encode()
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/api/receive", body=mp,
+                  headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                           "Cookie": cookie})
+        r = c.getresponse()
+        data = json.loads(r.read())
+        c.close()
+        self.assertEqual(r.status, 200)
+        return data["id"]
+
+    def test_multiuser_login_roles(self):
+        # 同一个登录页、只输密码：不同密码 = 不同账号，控制台显示身份
+        with self.server("127.0.0.1") as port:
+            app.create_user("adminpw1", is_admin=True)
+            app.create_user("userpw22")
+            s, acookie, _ = self._t_login(port, "adminpw1")
+            self.assertEqual(s, 302)
+            s, ucookie, _ = self._t_login(port, "userpw22")
+            self.assertEqual(s, 302)
+            # 密码错误
+            s, _, body = self._t_login(port, "wrongpw")
+            self.assertEqual(s, 200)
+            self.assertIn("密码错误".encode(), body)
+            # 管理员控制台：身份徽标 + 用户管理 + 删文件按钮
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/dash", headers={"Cookie": acookie})
+            r = c.getresponse()
+            ahtml = r.read().decode()
+            c.close()
+            self.assertIn("👑 管理员", ahtml)
+            self.assertIn("👥 用户管理", ahtml)
+            self.assertIn("<form id='userAddForm'", ahtml)
+            # 普通用户控制台：无用户管理
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/dash", headers={"Cookie": ucookie})
+            r = c.getresponse()
+            uhtml = r.read().decode()
+            c.close()
+            self.assertIn("👤 普通用户", uhtml)
+            self.assertNotIn("👥 用户管理", uhtml)
+            self.assertNotIn("<form id='userAddForm'", uhtml)
+
+    def test_multiuser_share_permissions(self):
+        # 普通用户只能取消自己的分享；管理员可以取消任何人的
+        with self.server("127.0.0.1") as port:
+            app.create_user("adminpw1", is_admin=True)
+            app.create_user("userpw22")
+            _, acookie, _ = self._t_login(port, "adminpw1")
+            _, ucookie, _ = self._t_login(port, "userpw22")
+            asid = self._t_mk_recv_share(port, acookie, "admin的")
+            usid = self._t_mk_recv_share(port, ucookie, "用户的")
+            # 普通用户删管理员的分享：403
+            s, j = self._t_api(port, "/api/delete", {"id": asid}, ucookie)
+            self.assertEqual(s, 403)
+            # 普通用户改管理员分享的备注/过期：403
+            s, j = self._t_api(port, "/api/title", {"id": asid, "title": "x"}, ucookie)
+            self.assertEqual(s, 403)
+            s, j = self._t_api(port, "/api/expiry", {"id": asid, "expiry": "1"}, ucookie)
+            self.assertEqual(s, 403)
+            # 普通用户删自己的：ok
+            s, j = self._t_api(port, "/api/delete", {"id": usid}, ucookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(j["ok"])
+            # 管理员删任何人的：ok（再建一个给管理员删）
+            usid2 = self._t_mk_recv_share(port, ucookie, "用户的2")
+            s, j = self._t_api(port, "/api/delete", {"id": usid2}, acookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(j["ok"])
+            # 删不存在的：404
+            s, j = self._t_api(port, "/api/delete", {"id": "nope12345"}, acookie)
+            self.assertEqual(s, 404)
+
+    def test_multiuser_file_delete_admin_only(self):
+        # 全部文件所有人可见，但删除只有管理员可以
+        with self.server("127.0.0.1") as port:
+            app.create_user("adminpw1", is_admin=True)
+            app.create_user("userpw22")
+            _, acookie, _ = self._t_login(port, "adminpw1")
+            _, ucookie, _ = self._t_login(port, "userpw22")
+            # 管理员上传一个文件
+            bnd = "----mu"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                  f"filename=\"a.txt\"\r\n\r\nhello\r\n--{bnd}--\r\n").encode()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/api/share", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": acookie})
+            r = c.getresponse()
+            sid = json.loads(r.read())["id"]
+            c.close()
+            with app.db() as dbc:
+                fid = dbc.execute("SELECT id FROM files WHERE share_id=?",
+                                  (sid,)).fetchone()["id"]
+            # 普通用户能看到这个文件，但删不了；控制台里也没有删除按钮
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/dash", headers={"Cookie": ucookie})
+            uhtml = c.getresponse().read().decode()
+            c.close()
+            self.assertIn("a.txt", uhtml)
+            self.assertNotIn('onclick="delOneFile(', uhtml)
+            self.assertNotIn("class='fileck'", uhtml)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/dash", headers={"Cookie": acookie})
+            ahtml = c.getresponse().read().decode()
+            c.close()
+            self.assertIn('onclick="delOneFile(', ahtml)
+            self.assertIn("class='fileck'", ahtml)
+            s, j = self._t_api(port, "/api/del_files", {"ids": str(fid)}, ucookie)
+            self.assertEqual(s, 403)
+            # 管理员可以删
+            s, j = self._t_api(port, "/api/del_files", {"ids": str(fid)}, acookie)
+            self.assertEqual(s, 200)
+            self.assertEqual(j["deleted"], 1)
+
+    def test_multiuser_user_management(self):
+        # 用户管理只有管理员能用；没有注册入口
+        with self.server("127.0.0.1") as port:
+            app.create_user("adminpw1", is_admin=True)
+            app.create_user("userpw22")
+            _, acookie, _ = self._t_login(port, "adminpw1")
+            _, ucookie, _ = self._t_login(port, "userpw22")
+            # 普通用户调管理接口：403
+            s, j = self._t_api(port, "/api/user_add",
+                               {"pw1": "newpw33", "pw2": "newpw33"}, ucookie)
+            self.assertEqual(s, 403)
+            # 管理员添加用户
+            s, j = self._t_api(port, "/api/user_add",
+                               {"pw1": "newpw33", "pw2": "newpw33"}, acookie)
+            self.assertEqual(s, 200)
+            new_id = j["id"]
+            # 密码不能和已有账号重复（否则登录无法区分是谁）
+            s, j = self._t_api(port, "/api/user_add",
+                               {"pw1": "adminpw1", "pw2": "adminpw1"}, acookie)
+            self.assertEqual(s, 400)
+            # 两次输入不一致
+            s, j = self._t_api(port, "/api/user_add",
+                               {"pw1": "newpw44", "pw2": "diff"}, acookie)
+            self.assertEqual(s, 400)
+            # 新用户能登录
+            s, ncookie, _ = self._t_login(port, "newpw33")
+            self.assertEqual(s, 302)
+            # 管理员给新用户重设密码：旧密码失效
+            s, j = self._t_api(port, "/api/user_resetpw",
+                               {"id": new_id, "pw1": "resetpw5", "pw2": "resetpw5"},
+                               acookie)
+            self.assertEqual(s, 200)
+            s, _, _ = self._t_login(port, "newpw33")
+            self.assertEqual(s, 200)  # 旧密码登录失败，回到登录页
+            s, ncookie, _ = self._t_login(port, "resetpw5")
+            self.assertEqual(s, 302)
+            # 普通用户不能给别人重设密码
+            s, j = self._t_api(port, "/api/user_resetpw",
+                               {"id": new_id, "pw1": "x", "pw2": "x"}, ucookie)
+            self.assertEqual(s, 403)
+            # 不能删管理员、不能删自己
+            admin_id = app.find_user_by_pw("adminpw1")["id"]
+            s, j = self._t_api(port, "/api/user_del", {"id": admin_id}, acookie)
+            self.assertEqual(s, 403)
+            # 新用户建个分享，删用户后分享失效、用户登不进
+            usid = self._t_mk_recv_share(port, ncookie, "待删用户的")
+            s, j = self._t_api(port, "/api/user_del", {"id": new_id}, acookie)
+            self.assertEqual(s, 200)
+            s, _, _ = self._t_login(port, "resetpw5")
+            self.assertEqual(s, 200)
+            s, j = self._t_api(port, "/api/delete", {"id": usid}, acookie)
+            self.assertEqual(s, 404)
+
+    def test_multiuser_chpw_kills_only_own_sessions(self):
+        # 改密码只踢掉自己的其他会话，不能影响别的账号
+        with self.server("127.0.0.1") as port:
+            app.create_user("adminpw1", is_admin=True)
+            app.create_user("userpw22")
+            _, acookie, _ = self._t_login(port, "adminpw1")
+            _, ucookie1, _ = self._t_login(port, "userpw22")
+            _, ucookie2, _ = self._t_login(port, "userpw22")
+            s, j = self._t_api(port, "/api/chpw",
+                               {"new1": "usernew66", "new2": "usernew66"}, ucookie1)
+            self.assertEqual(s, 200)
+            self.assertTrue(j["ok"])
+
+            def dash_status(cookie):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", "/dash", headers={"Cookie": cookie})
+                r = c.getresponse()
+                r.read()
+                st = r.status
+                c.close()
+                return st
+            # 自己的另一个会话被踢掉，管理员不受影响
+            self.assertEqual(dash_status(ucookie2), 302)
+            self.assertEqual(dash_status(acookie), 200)
+            self.assertEqual(dash_status(ucookie1), 200)
+            # 新密码能登录
+            s, _, _ = self._t_login(port, "usernew66")
+            self.assertEqual(s, 302)
+
+    def test_multiuser_migration_from_single_pw(self):
+        # 老版本数据库（meta.pw 单密码、无 users 表）升级后：
+        # 旧密码变成管理员账号，老分享归管理员，老会话作废
+        with app.db() as c:
+            c.execute("INSERT INTO meta(k,v) VALUES('pw',?)",
+                      (app.hash_pw("oldadminpw"),))
+        # 手工造出老结构：删掉新表，按老 schema 重建
+        with app.db() as c:
+            c.execute("DROP TABLE sessions")
+            c.execute("DROP TABLE shares")
+            c.execute("DROP TABLE users")
+            c.execute("CREATE TABLE sessions(token TEXT PRIMARY KEY,"
+                      " created INTEGER, expires INTEGER)")
+            c.execute("CREATE TABLE shares(id TEXT PRIMARY KEY, type TEXT,"
+                      " title TEXT, created INTEGER, expires INTEGER)")
+            now = int(time.time())
+            c.execute("INSERT INTO sessions(token,created,expires) VALUES(?,?,?)",
+                      ("oldt-token", now, now + 99999))
+            c.execute("INSERT INTO shares(id,type,title,created,expires)"
+                      " VALUES(?,?,?,?,?)", ("oldshr01", "send", "t", now, 0))
+        app.init_db()  # 触发迁移
+        self.assertTrue(app.has_users())
+        admin = app.find_user_by_pw("oldadminpw")
+        self.assertTrue(admin and admin["is_admin"])
+        with app.db() as c:
+            self.assertIsNone(c.execute("SELECT v FROM meta WHERE k='pw'").fetchone())
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            owner = c.execute("SELECT owner_id FROM shares WHERE id='oldshr01'").fetchone()["owner_id"]
+            self.assertEqual(owner, admin["id"])
 
 class Installer(unittest.TestCase):
     def run_install(self, port, mode='no-manager', ipver='4'):
