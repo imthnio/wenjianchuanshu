@@ -231,6 +231,117 @@ class Installer(unittest.TestCase):
         self.assertIn(marker_text.strip(), content)
         self.assertFalse(content.startswith('# installed version'))
 
+    def run_install_pty(self, choice):
+        """Run install.sh under a pty so [ -t 0 ] is true; answer the repair/reinstall prompt."""
+        import pty
+        import select
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        source = root / 'source'
+        shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns('.git', '__pycache__'))
+        bin_dir = root / 'bin'
+        bin_dir.mkdir()
+        def command(name, body):
+            q = bin_dir / name
+            q.write_text('#!/bin/sh\n' + body + '\n')
+            q.chmod(0o755)
+        command('id', 'echo 0')
+        command('systemctl', 'exit 0')
+        command('journalctl', 'echo TEST_STARTUP_LOG')
+        script = (source / 'install.sh').read_text()
+        marker = root / 'run-systemd'
+        marker.mkdir()
+        units = root / 'units'
+        units.mkdir()
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        app_dir = root / 'app'
+        (app_dir / 'data' / 'files').mkdir(parents=True)
+        (units / 'minishare.service').write_text(
+            'Environment=SHARE_HOST=127.0.0.1\n'
+            'Environment=SHARE_PORT=%d\n'
+            'Environment=SHARE_DATA=%s\n' % (port, app_dir / 'data'))
+        (app_dir / 'fileshare.py').write_text('# installed version\n' + (ROOT / 'fileshare.py').read_text())
+        script = script.replace('/run/systemd/system', str(marker)).replace('/etc/systemd/system', str(units))
+        script = script.replace('elif command -v rc-service >/dev/null 2>&1; then', 'elif false; then')
+        (source / 'install.sh').write_text(script)
+        master, slave = pty.openpty()
+        env = {**os.environ, 'PATH': str(bin_dir) + ':' + os.environ['PATH'],
+               'APP_DIR': str(app_dir), 'PYTHONDONTWRITEBYTECODE': '1'}
+        env.pop('NONINTERACTIVE', None)
+        proc = subprocess.Popen(['sh', str(source / 'install.sh')], cwd=root,
+                                stdin=slave, stdout=slave, stderr=slave,
+                                env=env, close_fds=True)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.terminate())
+        out = b''
+        def drain():
+            data = b''
+            end = time.time() + 5
+            while time.time() < end:
+                r, _, _ = select.select([master], [], [], 1)
+                if not r:
+                    break
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        def read_until(needle, timeout=25):
+            nonlocal out
+            end = time.time() + timeout
+            while time.time() < end:
+                r, _, _ = select.select([master], [], [], 1)
+                if r:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                    if needle in out:
+                        return True
+                if proc.poll() is not None:
+                    break
+            return needle in out
+        self.assertTrue(read_until('请选择'.encode('utf-8')), 'prompt not shown: %r' % out[-500:])
+        os.write(master, (choice + '\n').encode())
+        if choice == '2':
+            self.assertTrue(read_until('1/3'.encode()), 'wizard q1 not reached')
+            os.write(master, b'\n')
+            self.assertTrue(read_until('2/3'.encode()), 'wizard q2 not reached')
+            os.write(master, ('%d\n' % port).encode())
+            self.assertTrue(read_until('3/3'.encode()), 'wizard q3 not reached')
+            os.write(master, b'1\n')
+        try:
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            self.fail('installer did not exit: %r' % out[-2000:])
+        rest = drain()
+        if rest:
+            out += rest
+        os.close(master)
+        return proc.returncode, out.decode('utf-8', 'replace')
+
+    def test_pty_choice_2_goes_to_reinstall(self):
+        rc, text = self.run_install_pty('2')
+        self.assertNotEqual(rc, 0)  # no listener: --check fails after reinstall
+        self.assertIn('安装向导', text)
+        self.assertNotIn('修复完成', text)
+
+    def test_pty_default_choice_repairs(self):
+        rc, text = self.run_install_pty('')
+        self.assertNotEqual(rc, 0)  # no listener: check fails and rolls back
+        self.assertIn('恢复原程序', text)
+        self.assertNotIn('安装向导', text)
+
 class HTTPSConfig(unittest.TestCase):
     def nat_case(self, fail):
         with tempfile.TemporaryDirectory() as folder:
