@@ -126,6 +126,112 @@ class Connectivity(unittest.TestCase):
         finally:
             app.MAX_UPLOAD = old_max
 
+    def test_receive_with_files_rejected_and_cleaned(self):
+        # 回归测试：/api/receive 只创建接收链接。以前顺手带上的文件会落盘
+        # 后被直接丢弃，变成谁也看不见、清不掉的孤儿文件占着磁盘。
+        # 现在应 400，且磁盘上不留文件。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            bnd = "----rx"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nt\r\n"
+                  f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\n\r\n"
+                  + "y" * 1000 + f"\r\n--{bnd}--\r\n").encode()
+            c.request("POST", "/api/receive", body=mp,
+                      headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                               "Cookie": cookie})
+            r = c.getresponse()
+            self.assertEqual(r.status, 400)
+            self.assertIn("不需要上传文件", r.read().decode("utf-8"))
+            self.assertEqual(os.listdir(app.FILES_DIR), [])
+            c.close()
+
+    def test_unread_body_closes_connection(self):
+        # 回归测试：没读请求体就返回（未知 POST 路径、未登录的 API、
+        # 无效的上传链接、带 body 的 GET）必须带 Connection: close，
+        # 否则残留的 body 会被当成同一 keep-alive 连接上的下一个请求解析
+        # （曾实测：下一个请求直接 501）。
+        with self.server("127.0.0.1") as port:
+            def post(path, body, headers=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                h = {"Content-Type": "application/x-www-form-urlencoded"}
+                h.update(headers or {})
+                c.request("POST", path, body=body, headers=h)
+                r = c.getresponse()
+                status, conn, data = r.status, r.getheader("Connection"), r.read()
+                c.close()
+                return status, conn, data
+            # 1) 未知路径
+            s, conn, _ = post("/no-such-path", b"z" * 100)
+            self.assertEqual(s, 404)
+            self.assertEqual(conn, "close")
+            # 2) 未登录调 /api/share（body 没读）
+            s, conn, _ = post("/api/share", b"z" * 100)
+            self.assertEqual(s, 401)
+            self.assertEqual(conn, "close")
+            # 3) 无效的接收上传链接
+            s, conn, _ = post("/r/deadbeef/upload", b"z" * 100)
+            self.assertEqual(s, 404)
+            self.assertEqual(conn, "close")
+            # 4) 带 body 的 GET（本应用 GET 从不读 body）
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/healthz", body=b"z" * 10)
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.getheader("Connection"), "close")
+            r.read()
+            c.close()
+            # 5) 同一连接对象：未知路径（关连接）之后再发正常请求，
+            # 不应被残留 body 污染（旧代码这里会返回 501）
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/no-such-path", body=b"z" * 100,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 404)
+            r.read()
+            c.request("GET", "/healthz")  # 服务端已关连接，客户端自动重连
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"minishare", r.read())
+            c.close()
+
+    def test_db_failure_cleans_orphan_files(self):
+        # 回归测试：文件落盘后入库失败（如主键冲突/磁盘满），
+        # 不能留下孤儿文件占空间。
+        with self.server("127.0.0.1") as port:
+            app.meta_set("pw", app.hash_pw("pw123456"))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/login",
+                      body=urllib.parse.urlencode({"pw": "pw123456"}).encode(),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            r.read()
+            cookie = r.getheader("Set-Cookie").split(";")[0]
+            # 预置同 id 分享，让 INSERT 撞主键失败
+            with app.db() as dbc:
+                dbc.execute("INSERT INTO shares(id,type,title,created,expires)"
+                            " VALUES(?,?,?,?,?)",
+                            ("fixedsid1", "send", "t", int(time.time()), 0))
+            bnd = "----db"
+            mp = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"f\"; "
+                  f"filename=\"a.txt\"\r\n\r\n" + "x" * 100 +
+                  f"\r\n--{bnd}--\r\n").encode()
+            with patch.object(app, "new_share_id", return_value="fixedsid1"):
+                c.request("POST", "/api/share", body=mp,
+                          headers={"Content-Type": f"multipart/form-data; boundary={bnd}",
+                                   "Cookie": cookie})
+                r = c.getresponse()
+                self.assertEqual(r.status, 500)
+                r.read()
+            self.assertEqual(os.listdir(app.FILES_DIR), [])
+            c.close()
+
     def test_chpw_kills_other_sessions(self):
         # 改密码后其他会话立即失效（旧密码可能已泄露），当前会话不断线
         with self.server("127.0.0.1") as port:
@@ -238,7 +344,7 @@ class Connectivity(unittest.TestCase):
                          'evilX-Injected: 1.txt')
 
     def test_dash_shows_disk_usage_in_corner(self):
-        # 控制台左下角固定角标显示已用/总空间；公开分享页不暴露磁盘信息
+        # 控制台左下角固定角标显示剩余/已用空间；公开分享页不暴露磁盘信息
         with self.server("127.0.0.1") as port:
             def req(method, path, body=None, headers=None, cookie=None):
                 c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -262,10 +368,9 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(s, 200)
             html = b.decode("utf-8")
             used, total = app.disk_usage()
+            free = max(total - used, 0)
             self.assertIn("class='diskfoot'", html)
-            self.assertIn("已用", html)
-            self.assertIn(app.hsize(used), html)
-            self.assertIn(app.hsize(total), html)
+            self.assertIn(f"剩余 {app.hsize(free)} / 已用 {app.hsize(used)}", html)
 
             # 未登录访问公开分享页，不应出现磁盘信息
             mp = ("------b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nt\r\n"
