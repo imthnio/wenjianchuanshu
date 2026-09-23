@@ -68,7 +68,17 @@ if [ -z "$SRV_FILE" ]; then
   exit 1
 fi
 PORT="$(grep -o 'SHARE_PORT=[^ ]*' "$SRV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"' || true)"
-if [ -z "$PORT" ]; then PORT="18080"; fi
+case "$PORT" in ''|*[!0-9]*)
+  # 之前这里静默 fallback 到 18080：服务文件损坏/被手工改坏时，
+  # 脚本会拿着错误的端口继续配 Caddy、生成错误的访问地址。
+  # 读不到就直接报错，别猜。
+  echo "读不到 minishare 的端口配置（$SRV_FILE 里没有 SHARE_PORT），请先重装 minishare 再运行。"
+  exit 1 ;;
+esac
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "minishare 的端口配置无效（$PORT），请先重装 minishare 再运行。"
+  exit 1
+fi
 echo "检测到 minishare 端口：${PORT}（HTTPS 会跟随这个端口）"
 echo ""
 
@@ -324,11 +334,36 @@ rollback_https() {
     else
       rc-service minishare restart || true
     fi
+    # 恢复 Caddy 本体的旧状态：Caddyfile 和 caddy 服务单元都是本脚本
+    # 覆盖/新建的。要么恢复旧的，要么把新建的清理掉——否则会留下一个
+    # 开机自启、但 Caddyfile 对不上（甚至没有 Caddyfile）的 caddy，
+    # 下次开机就进 Restart=on-failure 的 5 秒重启死循环。
     if [ -f "$BACKUP_DIR/Caddyfile" ]; then
       cp "$BACKUP_DIR/Caddyfile" /etc/caddy/Caddyfile
-      if [ -d /run/systemd/system ]; then systemctl restart caddy || true; else rc-service caddy restart || true; fi
     else
       rm -f /etc/caddy/Caddyfile
+    fi
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      if [ -f "$BACKUP_DIR/caddy.service" ]; then
+        cp "$BACKUP_DIR/caddy.service" /etc/systemd/system/caddy.service
+      else
+        systemctl disable caddy >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/caddy.service
+      fi
+      systemctl daemon-reload
+      if [ -f "$BACKUP_DIR/Caddyfile" ] || [ -f "$BACKUP_DIR/caddy.service" ]; then
+        systemctl restart caddy || true
+      fi
+    elif command -v rc-service >/dev/null 2>&1; then
+      if [ -f "$BACKUP_DIR/caddy.initd" ]; then
+        cp "$BACKUP_DIR/caddy.initd" /etc/init.d/caddy
+      else
+        rc-update del caddy default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/caddy
+      fi
+      if [ -f "$BACKUP_DIR/Caddyfile" ] || [ -f "$BACKUP_DIR/caddy.initd" ]; then
+        rc-service caddy restart || true
+      fi
     fi
   fi
   rm -rf "$BACKUP_DIR"
@@ -359,10 +394,22 @@ case "$SRV_FILE" in
     rc-service minishare restart
     ;;
 esac
+# sed 没匹配上（比如服务文件被手工改过格式）：minishare 还在旧端口上，
+# Caddy 却去连 BACKEND_PORT，HTTPS 打不开。直接报错，EXIT trap 会回滚，
+# 别留一个"看着成功了、实际不通"的状态。
+if ! grep -q "SHARE_PORT=[\"']*${BACKEND_PORT}[\"']*" "$SRV_FILE" || \
+   ! grep -q 'SHARE_HOST=\(127.0.0.1\|"127.0.0.1"\)' "$SRV_FILE"; then
+  echo "改写 minishare 服务文件失败（没找到 SHARE_HOST/SHARE_PORT 行），已回滚。"
+  exit 1
+fi
 
 # ---- [8] 设置开机自启并启动（启动失败则回滚 minishare，不让站点变砖） ----
 echo "[8] 设置开机自启…"
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  if [ -f /etc/systemd/system/caddy.service ]; then
+    # 别把用户原来自己的 caddy 服务单元搞丢（回滚时要恢复）
+    cp /etc/systemd/system/caddy.service "$BACKUP_DIR/caddy.service"
+  fi
   cat > /etc/systemd/system/caddy.service <<'EOF'
 [Unit]
 Description=Caddy Web Server (minishare HTTPS)
@@ -385,6 +432,10 @@ EOF
   # 这里故意 || true，把"起没起来"的判断和报错统一交给 [5b]。
   systemctl restart caddy || true
 elif command -v rc-update >/dev/null 2>&1; then
+  if [ -f /etc/init.d/caddy ]; then
+    # 同上：备份用户原来的 caddy 启动脚本
+    cp /etc/init.d/caddy "$BACKUP_DIR/caddy.initd"
+  fi
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
 name="caddy"
@@ -593,9 +644,12 @@ case "$SRV_HOST" in
   *) UPSTREAM="$SRV_HOST:$PORT" ;;
 esac
 mkdir -p /etc/caddy
-if [ -f /etc/caddy/Caddyfile ] && [ ! -f /etc/caddy/Caddyfile.bak ]; then
+if [ -f /etc/caddy/Caddyfile ]; then
   # 别直接覆盖：这台机器可能已经有别的 Caddy 配置（比如之前跑过 NAT 模式），
   # 先备份，出问题还能找回来。
+  # 注意：每次运行都要重新备份当前文件，不能只在 .bak 不存在时备。
+  # 否则第二次运行失败时，恢复的是第一次运行前的古老配置，而不是上次
+  # 成功运行的配置——会把正在用的 HTTPS 搞挂（实测确认）。
   cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak
   echo "已备份原有 Caddyfile 到 /etc/caddy/Caddyfile.bak"
 fi
@@ -610,6 +664,11 @@ echo ""
 # ---- [5] 设置开机自启并启动 ----
 echo "[5] 设置开机自启…"
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  if [ -f /etc/systemd/system/caddy.service ]; then
+    # 别把用户原来自己的 caddy 服务单元搞丢（[5b] 失败时要恢复）。
+    # 同 Caddyfile：每次运行都重新备份，否则第二次失败会恢复过时的单元。
+    cp /etc/systemd/system/caddy.service /etc/caddy/caddy.service.bak
+  fi
   cat > /etc/systemd/system/caddy.service <<'EOF'
 [Unit]
 Description=Caddy Web Server (minishare HTTPS)
@@ -632,6 +691,10 @@ EOF
   # 这里故意 || true，把"起没起来"的判断和报错统一交给 [5b]。
   systemctl restart caddy || true
 elif command -v rc-update >/dev/null 2>&1; then
+  if [ -f /etc/init.d/caddy ]; then
+    # 同上：每次运行都重新备份，防第二次失败恢复过时文件
+    cp /etc/init.d/caddy /etc/caddy/caddy.service.bak
+  fi
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
 name="caddy"
@@ -683,6 +746,14 @@ if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
     # 让原来的配置先恢复可用，再排查这次失败的原因。
     echo "正在恢复之前的 Caddy 配置…"
     cp /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile
+    if [ -f /etc/caddy/caddy.service.bak ]; then
+      # [5] 覆盖了 caddy 的服务单元：有备份就恢复回来
+      if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        cp /etc/caddy/caddy.service.bak /etc/systemd/system/caddy.service
+      elif command -v rc-update >/dev/null 2>&1; then
+        cp /etc/caddy/caddy.service.bak /etc/init.d/caddy
+      fi
+    fi
     RESTORED=0
     # 注意：不能写成 `systemctl restart ... && RESTORED=1` 裸放在分支末尾：
     # set -e 下它是分支的最后一条命令，失败会导致整个 if 非零、脚本直接退出。
