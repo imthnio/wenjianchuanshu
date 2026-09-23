@@ -676,6 +676,20 @@ if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
   else
     tail -n 30 /var/log/messages 2>/dev/null || true
   fi
+  if [ -f /etc/caddy/Caddyfile.bak ]; then
+    # [4] 已经把 Caddyfile 覆盖了：如果这台机器之前 Caddy 跑的是别的配置
+    #（比如之前成功跑过的 NAT 模式），现在配置已坏、Caddy 是停的，原来
+    # 的 HTTPS 反而被这次失败的运行搞挂了。把备份恢复回去并尽量重启，
+    # 让原来的配置先恢复可用，再排查这次失败的原因。
+    echo "正在恢复之前的 Caddy 配置…"
+    cp /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl restart caddy >/dev/null 2>&1 || true
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service caddy restart >/dev/null 2>&1 || rc-service caddy start >/dev/null 2>&1 || true
+    fi
+    echo "已恢复之前的 Caddy 配置（/etc/caddy/Caddyfile.bak）。"
+  fi
   exit 1
 fi
 echo ""
