@@ -613,6 +613,31 @@ else
   echo "没检测到 systemd 或 OpenRC，请手动后台运行："
   echo "  nohup /usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/var/log/caddy.log 2>&1 &"
 fi
+
+# ---- [5b] 确认 Caddy 真的在跑（镜像 NAT 模式的 [8b] 检查） ----
+# 之前这里没有检查：systemctl restart caddy 一旦失败，set -e 会让脚本直接
+# 退出，用户只看到一行 systemd 报错，拿不到最后的"成功/失败"总结和排查指引。
+# （minishare 本体没被动过，HTTP 还能用，不会变砖，只是 HTTPS 没开上。）
+CADDY_OK=0
+CADDY_CHECKABLE=1
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  sleep 3
+  systemctl is-active --quiet caddy && CADDY_OK=1
+elif command -v rc-update >/dev/null 2>&1; then
+  sleep 3
+  rc-service caddy status >/dev/null 2>&1 && CADDY_OK=1
+else
+  CADDY_CHECKABLE=0
+fi
+if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
+  echo "Caddy 没能启动起来，HTTPS 未完成。先看日志再重跑："
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    journalctl -u caddy -n 30 --no-pager || true
+  else
+    tail -n 30 /var/log/messages 2>/dev/null || true
+  fi
+  exit 1
+fi
 echo ""
 
 # ---- [6] 放行防火墙 80/443 ----
