@@ -88,9 +88,13 @@ def hash_pw(pw, salt=None):
 def check_pw(pw, stored):
     try:
         salt_hex, _ = stored.split("$", 1)
+        salt = bytes.fromhex(salt_hex)
     except ValueError:
+        # 数据库里的哈希损坏（没有 $ 分隔、或 salt 不是合法 hex）：
+        # 之前 bytes.fromhex 在 try 外面，直接抛 ValueError，
+        # /login 会 500；损坏的哈希只能判为密码不对。
         return False
-    return hmac.compare_digest(hash_pw(pw, bytes.fromhex(salt_hex)), stored)
+    return hmac.compare_digest(hash_pw(pw, salt), stored)
 
 def new_session():
     tok = secrets.token_urlsafe(32)
@@ -132,19 +136,28 @@ def is_expired(share):
     return share["expires"] and share["expires"] < time.time()
 
 def delete_share(sid):
-    # 只删除分享链接：文件保留在"全部文件"里，由用户手动删除。
-    # 过期自动清理也走这里：链接失效，文件同样保留。
     with db() as c:
+        for f in c.execute("SELECT stored FROM files WHERE share_id=?", (sid,)).fetchall():
+            try:
+                os.unlink(os.path.join(FILES_DIR, f["stored"]))
+            except OSError:
+                pass
+        c.execute("DELETE FROM files WHERE share_id=?", (sid,))
         c.execute("DELETE FROM shares WHERE id=?", (sid,))
 
 def all_files():
+    # 已过期的分享（每小时会被清理线程删掉）在删掉之前也不显示，
+    # 否则控制台"全部文件"里会躺着打不开链接的幽灵文件。
+    now = int(time.time())
     with db() as c:
         return c.execute(
             "SELECT f.id,f.filename,f.size,f.created,s.type,s.title"
             " FROM files f LEFT JOIN shares s ON f.share_id=s.id"
-            " ORDER BY f.id DESC").fetchall()
+            " WHERE s.id IS NULL OR s.expires=0 OR s.expires>?"
+            " ORDER BY f.id DESC", (now,)).fetchall()
 
 def delete_files(ids):
+    removed = 0
     with db() as c:
         for fid in ids:
             r = c.execute("SELECT stored FROM files WHERE id=?", (fid,)).fetchone()
@@ -154,6 +167,8 @@ def delete_files(ids):
                 except OSError:
                     pass
                 c.execute("DELETE FROM files WHERE id=?", (fid,))
+                removed += 1
+    return removed
 
 def cleanup_expired():
     now = int(time.time())
@@ -187,10 +202,26 @@ def _fix_header_encoding(v):
     except (UnicodeEncodeError, UnicodeDecodeError):
         return v
 
+def _split_params(disp):
+    """按分号切 Content-Disposition 的参数，但双引号里的分号不算分隔符。
+    直接 disp.split(";") 会把 filename="a;b.txt" 从中间切断，文件名被截成 "\"a"。"""
+    parts, cur, quoted = [], [], False
+    for ch in disp:
+        if ch == '"':
+            quoted = not quoted
+            cur.append(ch)
+        elif ch == ";" and not quoted:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
 def _disp_param(disp, key):
     """从 Content-Disposition 头取参数，支持 filename*=UTF-8''... 形式"""
     kl = key.lower()
-    for part in disp.split(";"):
+    for part in _split_params(disp):
         p = part.strip()
         pl = p.lower()
         if pl.startswith(kl + "*="):
@@ -498,22 +529,17 @@ def dash_page(shares):
 <button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
 <button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
 <button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
-<button class='danger' onclick="delShare('{s['id']}')">删除链接</button>
+<button class='danger' onclick="delShare('{s['id']}')">删除</button>
 </div></div>""")
     frows = []
     for fr in all_files():
         fid, fn, fsz, fct, stype, stitle = fr["id"], fr["filename"], fr["size"], fr["created"], fr["type"], fr["title"]
-        if stype is None:
-            # 归属的分享链接已被删除，文件仍保留在这里等待手动清理
-            ftyp, fcls, fsrc = "链接已删", "recv", "分享链接已删除"
-        else:
-            ftyp = "发送" if stype == "send" else "接收"
-            fcls = "" if stype == "send" else "recv"
-            fsrc = f"{ftyp}「{html.escape(stitle or '(无备注)')}」"
+        ftyp = "发送" if stype == "send" else "接收"
+        fcls = "" if stype == "send" else "recv"
         frows.append(f"""<div class='file'><div>
 <input type='checkbox' class='fileck' value='{fid}'>
 <span class='badge {fcls}'>{ftyp}</span><b>{html.escape(fn)}</b>
-<div class='muted'>{hsize(fsz)} · 来自{fsrc} · {htime(fct)}</div>
+<div class='muted'>{hsize(fsz)} · 来自{ftyp}「{html.escape(stitle or '(无备注)')}」 · {htime(fct)}</div>
 </div>
 <button class='danger' onclick="delOneFile({fid})">删除</button></div>""")
     flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
@@ -575,7 +601,7 @@ function copyLink(id, p){{
   copyText(t, el);
 }}
 function delShare(id){{
-  if(!confirm('确定删除这个分享链接吗？文件会保留，可在「全部文件」里手动删除。')) return;
+  if(!confirm('确定删除这个分享吗？文件也会一起删除。')) return;
   fetch('/api/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
     body:'id='+encodeURIComponent(id)}}).then(r=>r.json()).then(()=>location.reload());
 }}
@@ -900,9 +926,13 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/dash":
                 if not self._authed():
                     return self._redirect("/login")
+                # 已过期的分享不列出来（每小时会被清理线程删掉，
+                # 在删掉之前访问链接已经是 404，这里保持一致）
                 with db() as c:
                     shares = c.execute(
-                        "SELECT * FROM shares ORDER BY created DESC").fetchall()
+                        "SELECT * FROM shares WHERE expires=0 OR expires>?"
+                        " ORDER BY created DESC",
+                        (int(time.time()),)).fetchall()
                 return self._send(200, dash_page(shares))
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})", p)
@@ -1060,8 +1090,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 但 int() 转不了，会抛 ValueError 变成 500。用 ASCII 数字校验。
                 ids = [int(x) for x in (f.get("ids") or "").split(",")
                        if re.fullmatch(r"[0-9]+", x.strip() or "")]
-                delete_files(ids)
-                return self._json({"ok": True, "deleted": len(ids)})
+                removed = delete_files(ids)
+                return self._json({"ok": True, "deleted": removed})
 
             if p == "/api/expiry":
                 # 管理员手动调整已创建分享的过期时间（延长或缩短）
