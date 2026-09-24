@@ -67,6 +67,53 @@ class Connectivity(unittest.TestCase):
     def test_ipv4(self):
         self.exercise('0.0.0.0', '127.0.0.1')
 
+    def test_first_admin_requires_server_setup_code(self):
+        token_path = Path(app.setup_token_path())
+        token = token_path.read_text().strip()
+        self.assertEqual(len(token), 64)
+        self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
+        with self.server('127.0.0.1') as port:
+            def request(method, path, fields=None):
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                body = urllib.parse.urlencode(fields).encode() if fields is not None else None
+                headers = {'Content-Type': 'application/x-www-form-urlencoded'} if body else {}
+                conn.request(method, path, body, headers)
+                response = conn.getresponse()
+                status, data = response.status, response.read()
+                conn.close()
+                return status, data
+
+            status, page = request('GET', '/setup')
+            self.assertEqual(status, 200)
+            self.assertNotIn(token.encode(), page)
+            fields = {'pw1': 'owner-password', 'pw2': 'owner-password'}
+            self.assertEqual(request('POST', '/setup', fields)[0], 403)
+            self.assertEqual(request('POST', '/setup', {**fields, 'setup_code': '0' * 64})[0], 403)
+            self.assertFalse(app.has_users())
+            self.assertEqual(request('POST', '/setup', {**fields, 'setup_code': token})[0], 302)
+            self.assertFalse(token_path.exists())
+            self.assertTrue(app.find_user_by_pw('owner-password')['is_admin'])
+            app.init_db()
+            self.assertFalse(token_path.exists())
+
+    def test_simultaneous_first_admin_only_creates_one_user(self):
+        token = Path(app.setup_token_path()).read_text().strip()
+        results = []
+        def claim():
+            try:
+                results.append(app.create_initial_admin('owner-password', token))
+            except ValueError:
+                results.append(None)
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(result is not None for result in results), 1)
+        with app.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM users').fetchone()[0], 1)
+
     @unittest.skipUnless(socket.has_ipv6, 'IPv6 unavailable')
     def test_ipv6(self):
         self.exercise('::', '::1')
@@ -484,7 +531,8 @@ class Connectivity(unittest.TestCase):
             s, _, _ = req("POST", "/api/title", b"id=x&title=y", form)
             self.assertEqual(s, 401)
 
-            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234"}).encode()
+            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234",
+                                           "setup_code": Path(app.setup_token_path()).read_text().strip()}).encode()
             s, ck, _ = req("POST", "/setup", body, form)
             self.assertEqual(s, 302)
             cookie = ck.split(";")[0]
@@ -537,7 +585,8 @@ class Connectivity(unittest.TestCase):
                 return r.status, ck, data
 
             form = {"Content-Type": "application/x-www-form-urlencoded"}
-            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234"}).encode()
+            body = urllib.parse.urlencode({"pw1": "test1234", "pw2": "test1234",
+                                           "setup_code": Path(app.setup_token_path()).read_text().strip()}).encode()
             s, ck, _ = req("POST", "/setup", body, form)
             self.assertEqual(s, 302)
             cookie = ck.split(";")[0]
@@ -1224,6 +1273,7 @@ class Connectivity(unittest.TestCase):
                       " VALUES(?,?,?,?,?)", ("oldshr01", "send", "t", now, 0))
         app.init_db()  # 触发迁移
         self.assertTrue(app.has_users())
+        self.assertFalse(Path(app.setup_token_path()).exists())
         admin = app.find_user_by_pw("oldadminpw")
         self.assertTrue(admin and admin["is_admin"])
         with app.db() as c:

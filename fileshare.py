@@ -31,6 +31,7 @@ import hashlib
 import secrets
 import sqlite3
 import threading
+import tempfile
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -56,6 +57,9 @@ def db():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     return c
+
+def setup_token_path():
+    return os.path.join(DATA_DIR, "setup-token")
 
 def init_db():
     os.makedirs(FILES_DIR, exist_ok=True)
@@ -92,6 +96,58 @@ def init_db():
             SELECT owner_id FROM shares WHERE shares.id=files.share_id)
             WHERE owner_id IS NULL AND EXISTS (
                 SELECT 1 FROM shares WHERE shares.id=files.share_id)""")
+    if has_users():
+        try:
+            os.unlink(setup_token_path())
+        except FileNotFoundError:
+            pass
+    else:
+        _ensure_setup_token()
+
+def _ensure_setup_token():
+    # Public installs listen on 0.0.0.0 before the owner opens /setup. Only
+    # someone with access to the server should be able to claim the first admin.
+    if os.path.exists(setup_token_path()):
+        return
+    token = secrets.token_hex(32)
+    fd, tmp = tempfile.mkstemp(prefix=".setup-", dir=DATA_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as out:
+            out.write(token + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            os.link(tmp, setup_token_path())
+        except FileExistsError:
+            pass  # Another startup already created the token.
+    finally:
+        os.unlink(tmp)
+
+def create_initial_admin(pw, setup_code):
+    if len(pw) < 4:
+        raise ValueError("密码至少 4 位")
+    try:
+        with open(setup_token_path(), encoding="ascii") as f:
+            expected = f.read().strip()
+    except FileNotFoundError:
+        raise ValueError("初始化码不可用，请检查服务器 data/setup-token 文件")
+    if len(setup_code) != 64 or not hmac.compare_digest(setup_code, expected):
+        raise ValueError("初始化码错误")
+    with db() as c:
+        # The outer /setup check is only for routing. Serialize the actual
+        # first-admin creation so two simultaneous requests cannot both win.
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            return None
+        now = int(time.time())
+        cur = c.execute("INSERT INTO users(pw,pw_plain,is_admin,created) VALUES(?,?,?,?)",
+                        (hash_pw(pw), pw, 1, now))
+        admin = {"id": cur.lastrowid, "is_admin": True}
+    try:
+        os.unlink(setup_token_path())
+    except FileNotFoundError:
+        pass
+    return admin
 
 def _migrate_to_multiuser(c):
     # 老版本只有 meta.pw 一个密码：转成 users 表的第一条管理员记录，
@@ -776,8 +832,9 @@ def too_large_msg():
 def setup_page(err=""):
     e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
     return page("初始设置", f"""<div class='card' style='max-width:420px;margin:40px auto'>
-<h1>🗂️ 文件分享</h1><p class='muted'>首次使用，请设置管理员密码。</p>{e}
+<h1>🗂️ 文件分享</h1><p class='muted'>首次使用，请输入服务器安装时显示的初始化码，并设置管理员密码。初始化码也可在服务器的 data/setup-token 文件中查看。</p>{e}
 <form method='post' action='/setup'>
+<input type='text' name='setup_code' placeholder='初始化码' required autocomplete='off'>
 <input type='password' name='pw1' placeholder='设置密码' required minlength='4'>
 <input type='password' name='pw2' placeholder='再次输入' required minlength='4'>
 <button>完成设置</button></form></div>""")
@@ -1828,8 +1885,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, setup_page("密码至少 4 位"))
                 if pw1 != pw2:
                     return self._send(200, setup_page("两次输入不一致"))
-                # 首个账号即管理员
-                admin = create_user(pw1, is_admin=True)
+                try:
+                    admin = create_initial_admin(pw1, f.get("setup_code", ""))
+                except ValueError as e:
+                    return self._send(403, setup_page(str(e)))
+                if admin is None:
+                    return self._redirect("/login")
                 return self._set_sid(new_session(admin["id"]))
 
             if p == "/login" and has_users():

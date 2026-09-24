@@ -32,6 +32,14 @@ IPVER="${IPVER:-4}"
 BIND="${BIND:-}"
 MINISHARE_REPO="${MINISHARE_REPO:-imthnio/wenjianchuanshu}"
 
+show_setup_token() {
+  if [ -f "$APP_DIR/data/setup-token" ]; then
+    echo "首次设置管理员请填写初始化码：$(cat "$APP_DIR/data/setup-token")"
+    echo "稍后可在服务器运行：cat '$APP_DIR/data/setup-token'"
+    echo "初始化码使用一次后自动删除；不要发送给其他人。"
+  fi
+}
+
 # ---- 0. 准备安装文件（远程安装时自动下载） ----
 SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -f "$SOURCE_DIR/fileshare.py" ] && [ -f "$SOURCE_DIR/minishare.service" ] && [ -f "$SOURCE_DIR/minishare.openrc" ]; then
@@ -208,6 +216,7 @@ PY
   echo "修复完成：程序已更新到最新版，本机 HTTP 检查通过。"
   echo "原监听地址、端口、密码和上传文件都保留。"
   echo "访问地址：http://$DISP:$PORT"
+  show_setup_token
   echo "（NAT 小鸡请用外部映射端口访问；主机防火墙和服务商安全组仍需自行核对。）"
   echo "如果曾开启 HTTPS 且仍打不开，请重新运行新版 enable-https.sh。"
   echo "==================================="
@@ -427,6 +436,7 @@ print("请确认主机防火墙及服务商安全组放行所选 TCP 端口。")
 if ver == "6":
     print("IPv6 地址需要访问端也有 IPv6 网络；网址中的方括号不能去掉。")
 print("尚未开启 HTTPS 时，请完整输入 http://，不要使用 https://。")
-print("第一次打开会让你设置管理员密码。")
+print("第一次打开会让你输入初始化码并设置管理员密码。")
 print("===================================")
 PYADDR
+show_setup_token
