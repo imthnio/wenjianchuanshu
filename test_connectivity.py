@@ -1079,7 +1079,7 @@ class Connectivity(unittest.TestCase):
             self.assertTrue(j["ok"])
 
     def test_multiuser_file_delete_admin_only(self):
-        # 全部文件所有人可见，但删除只有管理员可以
+        # 普通用户看不到别人的文件，删除仍只有管理员可以
         with self.server("127.0.0.1") as port:
             app.create_user("adminpw1", is_admin=True)
             app.create_user("userpw22")
@@ -1099,12 +1099,12 @@ class Connectivity(unittest.TestCase):
             with app.db() as dbc:
                 fid = dbc.execute("SELECT id FROM files WHERE share_id=?",
                                   (sid,)).fetchone()["id"]
-            # 普通用户能看到这个文件，但删不了；控制台里也没有删除按钮
+            # 普通用户看不到这个文件；控制台里也没有删除按钮
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("GET", "/dash", headers={"Cookie": ucookie})
             uhtml = c.getresponse().read().decode()
             c.close()
-            self.assertIn("a.txt", uhtml)
+            self.assertNotIn("a.txt", uhtml)
             self.assertNotIn('onclick="delOneFile(', uhtml)
             self.assertNotIn("class='fileck'", uhtml)
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -1433,6 +1433,20 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(s, 200)
             self.assertTrue(data["ok"])
 
+    def test_admin_add_to_user_share_keeps_user_ownership(self):
+        app.create_user("adminpw1", is_admin=True)
+        owner = app.create_user("userpw22")
+        with self.server("127.0.0.1") as port:
+            _, acookie, _ = self._t_login(port, "adminpw1")
+            sid, _ = self._mkview_share([("a.txt", b"a")], owner=owner["id"])
+            status, data = self._t_multipart(port, f"/s/{sid}/add", acookie,
+                                             [("added.txt", b"hello")])
+            self.assertEqual(status, 200, data)
+            with app.db() as c:
+                row = c.execute("SELECT owner_id FROM files WHERE share_id=?"
+                                " AND filename='added.txt'", (sid,)).fetchone()
+            self.assertEqual(row["owner_id"], owner["id"])
+
     def test_share_page_manage_controls_visibility(self):
         # 管理按钮（删除/添加文件）只出现在本人或管理员打开的分享页上
         sid = "viewtest01"
@@ -1474,19 +1488,69 @@ class Connectivity(unittest.TestCase):
             self.assertIn("/login", h.get("Location", ""))
 
     def test_dash_all_files_has_download_button(self):
-        # "全部文件"每行都有下载按钮：管理员和普通用户都能看到
+        # 管理员看全部文件，普通用户只看自己的文件。
         now = int(time.time())
         with app.db() as c:
             c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
                       " VALUES(?,?,?,?,?,1)", ("dlbtn01", "send", "t", now, 0))
-            cur = c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                            " VALUES(?,?,?,?,?)", ("dlbtn01", "a.txt", "st_a", 5, now))
+            cur = c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                            " VALUES(?,?,?,?,?,?)", ("dlbtn01", "a.txt", "st_a", 5, now, 1))
             fid = cur.lastrowid
             shares = c.execute("SELECT * FROM shares").fetchall()
-        for user in ({"id": 1, "is_admin": True}, {"id": 2, "is_admin": False}):
+        for user in ({"id": 1, "is_admin": True}, {"id": 1, "is_admin": False}):
             body = app.dash_page(shares, user).decode("utf-8")
             self.assertIn(f"/dl/{fid}", body)
             self.assertIn("下载</button>", body)
+        other = app.dash_page([], {"id": 2, "is_admin": False}).decode("utf-8")
+        self.assertNotIn(f"/dl/{fid}", other)
+
+    def test_console_file_owner_is_enforced_after_link_deleted(self):
+        app.create_user("admin-secret", is_admin=True)
+        owner = app.create_user("owner-secret")
+        app.create_user("other-secret")
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,?)",
+                      ("private01", "receive", "private", now, 0, owner["id"]))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                      " VALUES(?,?,?,?,?,?)",
+                      ("private01", "secret.txt", "private-stored", 6, now, owner["id"]))
+            fid = c.execute("SELECT id FROM files WHERE stored='private-stored'").fetchone()[0]
+        Path(app.FILES_DIR, "private-stored").write_bytes(b"secret")
+        with self.server("127.0.0.1") as port:
+            def get_as(pw, path):
+                _, cookie, _ = self._t_login(port, pw)
+                return self._vget(port, path, {"Cookie": cookie})
+            self.assertEqual(get_as("other-secret", f"/dl/{fid}")[0], 404)
+            self.assertNotIn(b"secret.txt", get_as("other-secret", "/dash")[2])
+            self.assertEqual(get_as("owner-secret", f"/dl/{fid}")[2], b"secret")
+            self.assertEqual(get_as("admin-secret", f"/dl/{fid}")[2], b"secret")
+            app.delete_share("private01")
+            self.assertEqual(get_as("other-secret", f"/dl/{fid}")[0], 404)
+            self.assertEqual(get_as("owner-secret", f"/dl/{fid}")[2], b"secret")
+            self.assertEqual(get_as("admin-secret", f"/dl/{fid}")[2], b"secret")
+
+    def test_existing_files_gain_owner_on_migration(self):
+        owner = app.create_user("owner-secret", is_admin=True)
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                      " VALUES(?,?,?,?,?,?)", ("old-share", "send", "", now, 0, owner["id"]))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                      " VALUES(?,?,?,?,?)", ("old-share", "owned.txt", "old-owned", 1, now))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                      " VALUES(?,?,?,?,?)", ("gone-share", "unknown.txt", "old-unknown", 1, now))
+        app.init_db()
+        with app.db() as c:
+            rows = {r["filename"]: r["owner_id"] for r in
+                    c.execute("SELECT filename,owner_id FROM files")}
+        self.assertEqual(rows["owned.txt"], owner["id"])
+        self.assertIsNone(rows["unknown.txt"])
+        self.assertEqual([r["filename"] for r in app.all_files(owner)],
+                         ["unknown.txt", "owned.txt"])
+        self.assertEqual([r["filename"] for r in app.all_files(
+            {"id": owner["id"], "is_admin": False})], ["owned.txt"])
 
     def test_dash_forms_use_postform(self):
         # 回归测试：添加用户/改密码曾用 new URLSearchParams([...fd]) 且没有 .catch，

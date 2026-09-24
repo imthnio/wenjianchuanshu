@@ -73,17 +73,25 @@ def init_db():
             created INTEGER, expires INTEGER, owner_id INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS files(
             id INTEGER PRIMARY KEY AUTOINCREMENT, share_id TEXT,
-            filename TEXT, stored TEXT, size INTEGER, created INTEGER)""")
+            filename TEXT, stored TEXT, size INTEGER, created INTEGER,
+            owner_id INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_id)")
         # 兼容老版本数据库：补上新增的列
         for table, col, typ in (("sessions", "user_id", "INTEGER"),
                                 ("shares", "owner_id", "INTEGER"),
                                 ("users", "remark", "TEXT"),
-                                ("users", "pw_plain", "TEXT")):
+                                ("users", "pw_plain", "TEXT"),
+                                ("files", "owner_id", "INTEGER")):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         _migrate_to_multiuser(c)
+        # Keep file ownership after a share is deleted. Old orphan files have no
+        # reliable owner and remain accessible to administrators only.
+        c.execute("""UPDATE files SET owner_id=(
+            SELECT owner_id FROM shares WHERE shares.id=files.share_id)
+            WHERE owner_id IS NULL AND EXISTS (
+                SELECT 1 FROM shares WHERE shares.id=files.share_id)""")
 
 def _migrate_to_multiuser(c):
     # 老版本只有 meta.pw 一个密码：转成 users 表的第一条管理员记录，
@@ -254,16 +262,18 @@ def delete_share(sid):
     with db() as c:
         c.execute("DELETE FROM shares WHERE id=?", (sid,))
 
-def all_files():
+def all_files(user):
     # 已过期的分享（每小时会被清理线程删掉）在删掉之前也不显示，
     # 否则控制台"全部文件"里会躺着打不开链接的幽灵文件。
     now = int(time.time())
     with db() as c:
+        where = "" if user["is_admin"] else " AND f.owner_id=?"
+        args = (now,) if user["is_admin"] else (now, user["id"])
         return c.execute(
-            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title,s.owner_id"
+            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title,f.owner_id"
             " FROM files f LEFT JOIN shares s ON f.share_id=s.id"
-            " WHERE s.id IS NULL OR s.expires=0 OR s.expires>?"
-            " ORDER BY f.id DESC", (now,)).fetchall()
+            " WHERE (s.id IS NULL OR s.expires=0 OR s.expires>?)" + where +
+            " ORDER BY f.id DESC", args).fetchall()
 
 def delete_files(ids):
     removed = 0
@@ -806,7 +816,7 @@ def dash_page(shares, user):
 <button class='danger' onclick="delShare('{s['id']}')">删除链接</button>
 </div></div>""")
     frows = []
-    for fr in all_files():
+    for fr in all_files(user):
         fid, fn, fsz, fct = fr["id"], fr["filename"], fr["size"], fr["created"]
         stype, stitle, sowner = fr["type"], fr["title"], fr["owner_id"]
         if stype is None:
@@ -834,8 +844,9 @@ def dash_page(shares, user):
     lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
     role = "👑 管理员" if is_admin else "👤 普通用户"
     share_title = "📋 分享链接（全部用户）" if is_admin else "📋 我的分享"
+    file_title = "📁 全部文件" if is_admin else "📁 我的文件"
     filehint = ("发送和接收的所有文件都在这里。删除为彻底删除，不经过回收站。"
-                if is_admin else "所有用户的文件都在这里。你没有删除文件的权限。")
+                if is_admin else "你的文件都在这里。你没有删除文件的权限。")
     fileops = ("""<div class='row' style='margin-top:8px'>
 <button class='ghost' onclick="toggleAllFiles()">全选 / 取消全选</button>
 <button class='danger' onclick="delFiles()">删除选中</button>
@@ -902,7 +913,7 @@ def dash_page(shares, user):
 <option value='30'>30 天后过期</option><option value='0'>永久有效</option></select>
 <button>生成接收链接</button></form><div id='recvRes'></div></div>
 <div class='card'><h2>{share_title}</h2>{lst}</div>
-<div class='card'><h2>📁 全部文件</h2>
+<div class='card'><h2>{file_title}</h2>
 <p class='muted'>{filehint}</p>
 {flist}
 {fileops}<div id='fileRes'></div></div>
@@ -1552,7 +1563,8 @@ class Handler(BaseHTTPRequestHandler):
         # 分片收齐后落盘入库：与普通上传走同样的 files 表结构。
         # 传的过程中分享可能过期/被删：这时文件不能入库，删临时文件。
         want = "send" if e["kind"] == "add" else "receive"
-        if not self._valid_share(e["sid"], want):
+        share = self._valid_share(e["sid"], want)
+        if not share:
             try:
                 os.unlink(e["tmp"])
             except OSError:
@@ -1570,9 +1582,10 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time())
         try:
             with db() as c:
-                c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                          " VALUES(?,?,?,?,?)",
-                          (e["sid"], e["filename"], stored, e["size"], now))
+                c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                          " VALUES(?,?,?,?,?,?)",
+                          (e["sid"], e["filename"], stored, e["size"], now,
+                           share["owner_id"]))
         except Exception:
             try:
                 os.unlink(os.path.join(FILES_DIR, stored))
@@ -1711,16 +1724,18 @@ class Handler(BaseHTTPRequestHandler):
 
             m = re.fullmatch(r"/dl/(\d+)", p)
             if m:
-                # 控制台"全部文件"的下载按钮：登录即可下载，
-                # 分享链接已删的孤儿文件也能下（/s/<sid>/f/<fid> 走不通）
-                if not self._user():
+                # 控制台下载必须与文件列表使用同一归属规则；普通用户不能
+                # 猜测递增的文件 ID 下载其他账号（包括已删链接的文件）。
+                user = self._user()
+                if not user:
                     return self._redirect("/login")
                 with db() as c:
                     f = c.execute("SELECT f.*, s.expires FROM files f"
                                   " LEFT JOIN shares s ON s.id=f.share_id"
                                   " WHERE f.id=?",
                                   (int(m.group(1)),)).fetchone()
-                if not f:
+                if not f or (not user["is_admin"] and
+                             f["owner_id"] != user["id"]):
                     return self._send(404, not_found())
                 if f["expires"] and f["expires"] < time.time():
                     # 所属分享已过期（清理线程每小时才跑一轮）：跟控制台
@@ -1871,9 +1886,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with db() as c:
                         for fo in files:
-                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                                      " VALUES(?,?,?,?,?)",
-                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                                      " VALUES(?,?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now,
+                                       s["owner_id"]))
                 except Exception:
                     for fo in files:
                         try:
@@ -1937,9 +1953,10 @@ class Handler(BaseHTTPRequestHandler):
                                   (sid, "send", title, now, now + days * 86400 if days else 0,
                                    user["id"]))
                         for fo in files:
-                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                                      " VALUES(?,?,?,?,?)",
-                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                                      " VALUES(?,?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now,
+                                       user["id"]))
                 except Exception:
                     # 入库失败（如磁盘满）：删掉已落盘的文件，不能留孤儿占空间
                     for fo in files:
@@ -2211,9 +2228,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with db() as c:
                         for fo in files:
-                            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
-                                      " VALUES(?,?,?,?,?)",
-                                      (sid, fo["filename"], fo["stored"], fo["size"], now))
+                            c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                                      " VALUES(?,?,?,?,?,?)",
+                                      (sid, fo["filename"], fo["stored"], fo["size"], now,
+                                       s["owner_id"]))
                 except Exception:
                     # 入库失败（如磁盘满）：删掉已落盘的文件，不能留孤儿占空间
                     for fo in files:
