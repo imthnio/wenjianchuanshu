@@ -76,7 +76,7 @@ case "$PORT" in ''|*[!0-9]*)
   exit 1 ;;
 esac
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-  echo "minishare 的端口配置无效（$PORT），请先重装 minishare 再运行。"
+  echo "minishare 的端口配置无效（${PORT}），请先重装 minishare 再运行。"
   exit 1
 fi
 echo "检测到 minishare 端口：${PORT}（HTTPS 会跟随这个端口）"

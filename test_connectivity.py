@@ -623,6 +623,89 @@ class Connectivity(unittest.TestCase):
         self.assertEqual(app._clean_filename('../../etc/passwd'), 'passwd')
         self.assertEqual(app._clean_filename('正常 文件名.pdf'), '正常 文件名.pdf')
 
+    def test_share_links_use_detected_https_domain(self):
+        # 域名不写死。配置里或这次访问里是什么域名，分享链接就用什么域名。
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES(?,?,?,?,?,?)",
+                      ("abC123-_", "send", "t", now, 0, 1))
+            shares = c.execute("SELECT * FROM shares").fetchall()
+        body = app.dash_page(shares, {"id": 1, "is_admin": True},
+                             "https://files.example.com").decode()
+        self.assertIn(">https://files.example.com/s/abC123-_</div>", body)
+        self.assertIn('copyLink(\'abC123-_\',\'/s/abC123-_\')', body)
+        other = app.dash_page(shares, {"id": 1, "is_admin": True},
+                              "https://other.example.net:8443").decode()
+        self.assertIn("https://other.example.net:8443/s/abC123-_", other)
+        self.assertNotIn("deu.xx.kg", body + other)
+        self.assertIn("location.origin", body)
+
+    def test_link_base_keeps_original_autodetect(self):
+        env = {"MINISHARE_CADDYFILE": "/nonexistent-minishare-caddy",
+               "SHARE_PUBLIC_BASE": ""}
+        with patch.dict(os.environ, env):
+            self.assertEqual(app.normalize_public_base("http://files.example.com"), "")
+            self.assertEqual(app.normalize_public_base("https://150.129.9.164"), "")
+            self.assertEqual(app.normalize_public_base("https://files.example.com/s/x"), "")
+            # 外网直接访问时，伪造的 https 头不能把链接改到别人的域名
+            self.assertEqual(app.resolve_link_base(
+                "8.8.8.8", "evil.example.com",
+                {"X-Forwarded-Proto": "https", "CF-Visitor": '{"scheme":"https"}'},
+                "8080"), "")
+            # 本机反代声明 https 时，用这次访问自己的域名
+            self.assertEqual(app.resolve_link_base(
+                "127.0.0.1", "ok.example.com",
+                {"X-Forwarded-Proto": "https"}, "8080"), "https://ok.example.com")
+            self.assertEqual(app.resolve_link_base(
+                "104.16.1.2", "cf.example.org",
+                {"CF-Visitor": '{"scheme":"https"}'}, "8080"), "https://cf.example.org")
+            # 看不出 https 域名时保持空，页面继续用 location.origin
+            self.assertEqual(app.resolve_link_base("203.0.113.9", "1.2.3.4", {}, "18080"), "")
+        self.assertEqual(app.client_rate_key("8.8.8.8", "203.0.113.5"), "8.8.8.8")
+        self.assertEqual(app.client_rate_key("104.16.1.2", "203.0.113.5"), "203.0.113.5")
+        self.assertEqual(app.client_rate_key("127.0.0.1", ""), "127.0.0.1")
+        self.assertEqual(app.client_rate_key("127.0.0.1", "203.0.113.8"), "203.0.113.8")
+
+    def test_caddyfile_domain_is_reused_when_visit_has_no_https_name(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "Caddyfile")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("https://share.example.org:19332 {\n"
+                    "\treverse_proxy 127.0.0.1:18080\n}\n")
+        with patch.dict(os.environ, {"MINISHARE_CADDYFILE": path, "SHARE_PUBLIC_BASE": ""}):
+            self.assertEqual(app.caddy_public_base("18080"), "https://share.example.org:19332")
+            self.assertEqual(app.resolve_link_base("203.0.113.9", "1.2.3.4", {}, "18080"),
+                             "https://share.example.org:19332")
+            # 这次访问自己已经是另一个 https 域名时，仍跟这次访问走
+            self.assertEqual(app.resolve_link_base(
+                "127.0.0.1", "live.example.com",
+                {"X-Forwarded-Proto": "https"}, "18080"), "https://live.example.com")
+
+    def test_head_healthz_is_not_501(self):
+        with self.server("127.0.0.1") as port:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                c.request("HEAD", "/healthz")
+                r = c.getresponse()
+                body = r.read()
+                self.assertEqual(r.status, 200, body)
+                self.assertEqual(body, b"")
+                self.assertIn("minishare/", r.getheader("Server") or "")
+            finally:
+                c.close()
+
+    def test_original_autodetect_text_is_kept(self):
+        install = (ROOT / "install.sh").read_text()
+        https = (ROOT / "enable-https.sh").read_text()
+        program = (ROOT / "fileshare.py").read_text()
+        self.assertIn("自动识别", install)
+        self.assertIn("https://api64.ipify.org", install)
+        self.assertIn("NAT_DETECTED", https)
+        self.assertIn("自动检测：本机出口 IP", https)
+        self.assertIn("location.origin", program)
+        self.assertIn('VERSION = "1.1.0"', program)
+
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:
             with patch.object(app, 'DB_PATH', '/nonexistent-minishare-test/share.db'):
@@ -3025,9 +3108,21 @@ class Installer(unittest.TestCase):
             os.write(master, ('%d\n' % port).encode())
             self.assertTrue(read_until('3/3'.encode()), 'wizard q3 not reached')
             os.write(master, b'1\n')
-        try:
-            proc.wait(timeout=120)
-        except subprocess.TimeoutExpired:
+        # macOS 的 pty 会在进程退出时丢掉还没读走的输出。检查要十几秒，
+        # 必须边等边读，否则“恢复原程序”这些字到不了断言里。
+        end = time.time() + 120
+        while time.time() < end and proc.poll() is None:
+            ready, _, _ = select.select([master], [], [], 1)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        if proc.poll() is None:
             proc.terminate()
             self.fail('installer did not exit: %r' % out[-2000:])
         rest = drain()

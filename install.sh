@@ -174,7 +174,7 @@ PY
   APP_DIR=$(cat "$RTMP/APP_DIR")
   BIND=$(cat "$RTMP/SHARE_HOST")
   PORT=$(cat "$RTMP/SHARE_PORT")
-  echo "现有配置：监听 $BIND，端口 $PORT，目录 $APP_DIR"
+  echo "现有配置：监听 ${BIND}，端口 ${PORT}，目录 ${APP_DIR}"
   # 先校验新程序，确认没问题才动现有安装。
   "$PYTHON" - fileshare.py <<'PY'
 import ast, sys
@@ -211,11 +211,20 @@ PY
       fi ;;
   esac
   case "$BIND" in *:*) DISP="[$BIND]" ;; *) DISP="$BIND" ;; esac
+  NEW_VER=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' "$APP_DIR/fileshare.py" | head -n 1)
+  OLD_VER=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' "$BACKUP" | head -n 1)
   echo ""
   echo "==================================="
   echo "修复完成：程序已更新到最新版，本机 HTTP 检查通过。"
+  if [ -n "$NEW_VER" ] && [ -n "$OLD_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+    echo "程序已从 ${OLD_VER} 自动更新到 ${NEW_VER}。"
+  elif [ -n "$NEW_VER" ]; then
+    echo "程序版本：${NEW_VER}。再次运行安装脚本会自动更新到最新版本。"
+  fi
   echo "原监听地址、端口、密码和上传文件都保留。"
   echo "访问地址：http://$DISP:$PORT"
+  echo "分享链接仍按原来的方式自动识别：用 https 域名打开，链接就是这个域名。"
+  echo "已经用 HTTPS 脚本配过域名的，也会沿用那份配置里的域名。每台机器各认各的。"
   show_setup_token
   echo "（NAT 小鸡请用外部映射端口访问；主机防火墙和服务商安全组仍需自行核对。）"
   echo "如果曾开启 HTTPS 且仍打不开，请重新运行新版 enable-https.sh。"
@@ -440,3 +449,7 @@ print("第一次打开会让你输入初始化码并设置管理员密码。")
 print("===================================")
 PYADDR
 show_setup_token
+NEW_VER=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' "$APP_DIR/fileshare.py" | head -n 1)
+if [ -n "$NEW_VER" ]; then
+  echo "程序版本：${NEW_VER}。以后再次运行安装脚本，会自动更新到最新版本。"
+fi

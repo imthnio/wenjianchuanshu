@@ -25,6 +25,7 @@ import json
 import time
 import hmac
 import html
+import ipaddress
 import socket
 import mimetypes
 import hashlib
@@ -37,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
 # ---------------- 配置 ----------------
+VERSION = "1.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -51,6 +53,202 @@ CHUNK = 65536
 # 小包能过，只有大回复回不来）。把 MSS 钳小后服务端只发小包，
 # 这类链路也能正常工作；正常链路几乎无影响。设为 0 则不限制。
 MSS = int(os.environ.get("SHARE_MSS", "1220"))
+
+# Cloudflare 公布的网段（2026-09-24）。只用来判断连上来的是不是 Cloudflare。
+# 是的话，登录限流按访客自己的 IP 算，避免所有人挤在同一个 Cloudflare 地址上。
+# 直接访问本机端口的人不在这些网段里，伪造的转发头会被忽略。
+_CF_CIDRS = (
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+)
+_CF_NETS = None
+_DNS_NAME = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$",
+    re.I)
+_NOISE_TLDS = {
+    "py", "sh", "service", "conf", "yml", "yaml", "log", "txt",
+    "sock", "pid", "local", "internal", "invalid", "localhost",
+}
+
+def cloudflare_networks():
+    global _CF_NETS
+    if _CF_NETS is None:
+        nets = []
+        for item in _CF_CIDRS:
+            try:
+                nets.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        _CF_NETS = tuple(nets)
+    return _CF_NETS
+
+def _is_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+def trusted_proxy(peer):
+    """本机反代或 Cloudflare 的接入地址。其他来源带来的转发头不可信。"""
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    return any(addr in net for net in cloudflare_networks())
+
+def client_rate_key(peer, cf_connecting_ip):
+    """登录限流用的 IP。直连用对端地址；只有可信反代才采用 CF-Connecting-IP。"""
+    if trusted_proxy(peer):
+        raw = (cf_connecting_ip or "").split(",")[0].strip()
+        if _is_ip(raw):
+            return raw
+    return peer
+
+def _is_dns_name(host):
+    host = (host or "").strip().lower().rstrip(".")
+    if not _DNS_NAME.match(host):
+        return False
+    return host.rsplit(".", 1)[-1] not in _NOISE_TLDS
+
+def normalize_public_base(value):
+    """只接受 https://域名 或 https://域名:端口。域名来自现有配置或这次访问，不写死。"""
+    raw = (value or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlparse(raw)
+    except ValueError:
+        return ""
+    if parts.scheme != "https" or parts.username or parts.password:
+        return ""
+    if parts.query or parts.fragment or parts.path not in ("", "/"):
+        return ""
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not _is_dns_name(host):
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    if port in (None, 443):
+        return "https://" + host
+    if not 1 <= port <= 65535:
+        return ""
+    return "https://%s:%d" % (host, port)
+
+def public_link(path, base):
+    if not path.startswith("/"):
+        path = "/" + path
+    base = normalize_public_base(base)
+    if not base:
+        return path
+    return base + path
+
+def _read_caddyfile():
+    # enable-https.sh 会把用户填的域名写进这份文件。没有就不猜。
+    path = os.environ.get("MINISHARE_CADDYFILE", "/etc/caddy/Caddyfile")
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) > 200_000:
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(200_000)
+    except OSError:
+        return ""
+
+def _caddy_sites(text):
+    sites = []
+    current = None
+    depth = 0
+    buf = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if current is None:
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.match(r"^(\S+)\s*\{(.*)$", stripped)
+            if not match:
+                continue
+            current = match.group(1)
+            rest = match.group(2)
+            buf = [rest]
+            depth = 1 + rest.count("{") - rest.count("}")
+            if depth <= 0:
+                sites.append((current, "\n".join(buf)))
+                current = None
+                depth = 0
+            continue
+        buf.append(stripped)
+        depth += stripped.count("{") - stripped.count("}")
+        if depth <= 0:
+            sites.append((current, "\n".join(buf)))
+            current = None
+            depth = 0
+    return sites
+
+def caddy_public_base(listen_port):
+    """沿用 enable-https.sh 已经写好的域名。没有这份配置就返回空。"""
+    text = _read_caddyfile()
+    if not text:
+        return ""
+    sites = _caddy_sites(text)
+    if not sites:
+        return ""
+    port = str(listen_port or "").strip()
+    matched = []
+    for addr, body in sites:
+        if port and re.search(r"(?<!\d)" + re.escape(port) + r"(?!\d)", body):
+            matched.append(addr)
+    if not matched and len(sites) == 1:
+        matched = [sites[0][0]]
+    if len(matched) != 1:
+        return ""
+    return normalize_public_base(matched[0])
+
+def resolve_link_base(peer, host, headers, listen_port):
+    """分享链接的 https 根地址。
+
+    原来的自动识别保留着：这次访问如果已经是 https，就用地址栏里的域名。
+    访问本身看不出域名时，再沿用 Caddyfile 里已经配好的域名。
+    两边都没有就返回空，页面继续用 location.origin。
+    """
+    forced = normalize_public_base(os.environ.get("SHARE_PUBLIC_BASE", ""))
+    if forced:
+        return forced
+    headers = headers or {}
+    if trusted_proxy(peer):
+        visitor = headers.get("CF-Visitor") or ""
+        proto = (headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        https = bool(re.search(r'"scheme"\s*:\s*"https"', visitor, re.I)) or proto == "https"
+        if https:
+            found = normalize_public_base("https://" + (host or "").strip())
+            if found:
+                return found
+    return caddy_public_base(listen_port)
 
 # ---------------- 数据库 ----------------
 def db():
@@ -848,15 +1046,18 @@ def login_page(err=""):
 <button>登录</button></form>
 <p class='muted'>没有用户名：不同的密码对应不同的账号，找管理员要你的密码。</p></div>""")
 
-def dash_page(shares, user):
+def dash_page(shares, user, public_base=""):
     is_admin = user["is_admin"]
+    base = normalize_public_base(public_base)
+    pub_js = json.dumps(base)
     items = []
     for s in shares:
         files = share_files(s["id"])
         total = sum(f["size"] for f in files)
         typ = "发送" if s["type"] == "send" else "接收"
         cls = "" if s["type"] == "send" else "recv"
-        link = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
+        path = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
+        link = public_link(path, base)
         # 管理员看全部分享：标出归属；普通用户只看得到自己的分享
         owner = ""
         if is_admin and s["owner_id"] is not None:
@@ -865,9 +1066,9 @@ def dash_page(shares, user):
         items.append(f"""<div class='file'><div>
 <span class='badge {cls}'>{typ}</span>{owner}<b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
 <div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
-<div class='linkbox' id='lk-{s['id']}'>{link}</div><div id='ti-{s['id']}'></div></div>
+<div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div id='ti-{s['id']}'></div></div>
 <div style='white-space:nowrap'>
-<button class='ghost' onclick="copyLink('{s['id']}','{link}')">复制链接</button>
+<button class='ghost' onclick="copyLink('{s['id']}','{path}')">复制链接</button>
 <button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
 <button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
 <button class='danger' onclick="delShare('{s['id']}')">删除链接</button>
@@ -982,7 +1183,18 @@ def dash_page(shares, user):
 <script>
 """ + CHUNK_JS + f"""
 var _UPW={upw_json};
-function fullLink(p){{return location.origin + p;}}
+var PUBLIC_BASE = {pub_js};
+function fullLink(p){{
+  // 有已识别的 https 根地址就用它；没有就保持原来的自动识别：跟地址栏走。
+  if (/^https?:\\/\\//i.test(p)) return p;
+  var b = PUBLIC_BASE || location.origin;
+  return String(b).replace(/\\/$/, "") + p;
+}}
+function fillShareLinks(){{
+  var boxes = document.querySelectorAll("div.linkbox[id^='lk-']"), i;
+  for (i = 0; i < boxes.length; i++) boxes[i].textContent = fullLink(boxes[i].textContent.trim());
+}}
+fillShareLinks();
 function copyText(t, box){{
   // 剪贴板 API 只在安全上下文（HTTPS / localhost）可用；默认用
   // http://IP:端口 打开时 navigator.clipboard 是 undefined，
@@ -1403,7 +1615,7 @@ def not_found():
 
 # ---------------- HTTP 服务 ----------------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "minishare/1.0"
+    server_version = "minishare/" + VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -1439,6 +1651,8 @@ class Handler(BaseHTTPRequestHandler):
             # 否则它会把残留的请求体当成下一个请求的响应来读。
             self.send_header("Connection", "close")
         self.end_headers()
+        if getattr(self, "_head_only", False):
+            return
         self.wfile.write(body)
 
     def _json(self, obj, code=200):
@@ -1479,8 +1693,26 @@ class Handler(BaseHTTPRequestHandler):
     _LOGIN_FAIL_LIMIT = 20
     _LOGIN_FAIL_WINDOW = 600
 
+    def _rate_key(self):
+        return client_rate_key(self.client_address[0],
+                               self.headers.get("CF-Connecting-IP"))
+
+    def _https_request(self):
+        # 只有可信反代可以声明这次访问是 https。页面直接用 http://IP 打开时不设 Secure。
+        if not trusted_proxy(self.client_address[0]):
+            return False
+        visitor = self.headers.get("CF-Visitor") or ""
+        if re.search(r'"scheme"\s*:\s*"https"', visitor, re.I):
+            return True
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        return proto == "https"
+
+    def _link_base(self):
+        return resolve_link_base(self.client_address[0], self.headers.get("Host"),
+                                 self.headers, PORT)
+
     def _login_allowed(self):
-        ip = self.client_address[0]
+        ip = self._rate_key()
         now = time.time()
         with self.server._login_lock:
             fails = self.server._login_fail
@@ -1494,12 +1726,12 @@ class Handler(BaseHTTPRequestHandler):
             return len(ts) < self._LOGIN_FAIL_LIMIT
 
     def _login_failed(self):
-        ip = self.client_address[0]
+        ip = self._rate_key()
         with self.server._login_lock:
             self.server._login_fail.setdefault(ip, []).append(time.time())
 
     def _login_ok(self):
-        ip = self.client_address[0]
+        ip = self._rate_key()
         with self.server._login_lock:
             self.server._login_fail.pop(ip, None)
 
@@ -1525,7 +1757,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _set_sid(self, tok):
-        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        secure = "; Secure" if self._https_request() else ""
         self.send_response(302)
         self.send_header("Set-Cookie",
                          f"sid={tok}; HttpOnly; Path=/; SameSite=Lax; "
@@ -1662,6 +1894,8 @@ class Handler(BaseHTTPRequestHandler):
         disp = "attachment; filename*=UTF-8''%s" % quote(filename)
         self.send_header("Content-Disposition", disp)
         self.end_headers()
+        if getattr(self, "_head_only", False):
+            return
         with open(path, "rb") as f:
             while True:
                 chunk = f.read(CHUNK)
@@ -1709,6 +1943,8 @@ class Handler(BaseHTTPRequestHandler):
         # 防 MIME 嗅探：浏览器只能按声明的 Content-Type 处理
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
+        if getattr(self, "_head_only", False):
+            return
         with open(path, "rb") as f:
             f.seek(start)
             remaining = length
@@ -1733,6 +1969,14 @@ class Handler(BaseHTTPRequestHandler):
         if want_type and s["type"] != want_type:
             return None
         return s
+
+    def do_HEAD(self):
+        # 原来没有 HEAD，Cloudflare 和浏览器探活会拿到 501。
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     # ---- GET ----
     def do_GET(self):
@@ -1777,7 +2021,7 @@ class Handler(BaseHTTPRequestHandler):
                             " AND (expires=0 OR expires>?)"
                             " ORDER BY created DESC",
                             (user["id"], int(time.time()))).fetchall()
-                return self._send(200, dash_page(shares, user))
+                return self._send(200, dash_page(shares, user, self._link_base()))
 
             m = re.fullmatch(r"/dl/(\d+)", p)
             if m:
@@ -2625,7 +2869,7 @@ def main():
     srv = Server((HOST, PORT), Handler)
     srv.daemon_threads = True
     url_host = f"[{HOST}]" if ":" in HOST else HOST
-    print(f"minishare 启动：http://{url_host}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
+    print(f"minishare v{VERSION} 启动：http://{url_host}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
           flush=True)
     try:
         srv.serve_forever()
