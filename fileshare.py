@@ -1603,9 +1603,10 @@ class Handler(BaseHTTPRequestHandler):
         """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。"""
         size = os.path.getsize(path)
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        if ctype.split("/")[0] not in ("image", "video") and ctype != "application/pdf":
-            # 非图片/视频/PDF：不内联，退回普通下载（防 MIME 混淆）。
-            # PDF 例外：浏览器用自带阅读器渲染，不会执行页面脚本，安全。
+        if _view_kind(filename) is None:
+            # 只内联页面允许查看的扩展名。仅按 MIME 主类型判断会把
+            # image/svg+xml 也放行；直接访问 /v/ URL 时，SVG 脚本会在
+            # 本站域名下执行，即使页面没有给 SVG 显示“查看”按钮。
             return self._send_file(path, filename)
         start, end, status = 0, size - 1, 200
         rh = (self.headers.get("Range") or "").strip()

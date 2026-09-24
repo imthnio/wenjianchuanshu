@@ -2588,6 +2588,34 @@ run();
         self.assertIn("/s/abC123-_/v/1", body)
         self.assertIn("查看", body)
 
+    def test_direct_view_url_does_not_inline_svg(self):
+        # 页面隐藏 SVG 的查看按钮并不足够；直接访问 /v/ 也必须下载。
+        app.create_user("test-admin-password", is_admin=True)
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires)"
+                      " VALUES(?,?,?,?,?)",
+                      ("abC123-_", "send", "t", int(time.time()), 0))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                      " VALUES(?,?,?,?,?)",
+                      ("abC123-_", "attack.svg", "svg-file", 6, int(time.time())))
+            c.execute("INSERT INTO files(share_id,filename,stored,size,created)"
+                      " VALUES(?,?,?,?,?)",
+                      ("abC123-_", "safe.png", "png-file", 6, int(time.time())))
+        Path(app.FILES_DIR, "svg-file").write_bytes(b"<svg/>")
+        Path(app.FILES_DIR, "png-file").write_bytes(b"123456")
+        with self.server("127.0.0.1") as port:
+            for fid, disposition in ((1, "attachment"), (2, "inline")):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                try:
+                    conn.request("GET", f"/s/abC123-_/v/{fid}")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    self.assertTrue(resp.getheader("Content-Disposition").startswith(disposition))
+                    self.assertEqual(resp.getheader("X-Content-Type-Options"), "nosniff")
+                    resp.read()
+                finally:
+                    conn.close()
+
     def test_multipart_enospc_returns_507(self):
         # 回归测试：multipart 上传写盘中途磁盘满（ENOSPC），以前冒泡成
         # 500"服务器错误"，用户不知道是磁盘满了（分片上传路径早就明确
