@@ -699,7 +699,7 @@ class Connectivity(unittest.TestCase):
         self.assertIn("NAT_DETECTED", https)
         self.assertIn("自动检测：本机出口 IP", https)
         self.assertIn("location.origin", program)
-        self.assertIn('VERSION = "1.2.0"', program)
+        self.assertIn('VERSION = "1.2.1"', program)
 
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:
@@ -2679,6 +2679,37 @@ run();
             else:
                 app.MAX_FIELDS_PER_REQUEST = old
 
+    def test_public_receive_rejects_aggregate_fields_and_removes_temp_file(self):
+        # 一个字段不足 64 KiB，但多个字段合计超过 256 KiB。接收链接公开，
+        # 不能让 100 个大字段把低内存机器的服务进程撑死。
+        now = int(time.time())
+        with app.db() as dbc:
+            dbc.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
+                        " VALUES(?,?,?,?,?,?)",
+                        ("fieldcap", "receive", "", now, 0, None))
+        boundary = b"FIELDCAP"
+        parts = [b"--" + boundary + b"\r\nContent-Disposition: form-data; "
+                 b"name=\"file\"; filename=\"keep.txt\"\r\n\r\nfile data\r\n"]
+        for i in range(5):
+            parts.append(b"--" + boundary + b"\r\nContent-Disposition: form-data; "
+                         + (b'name="field%d"\r\n\r\n' % i)
+                         + b"x" * (60 * 1024) + b"\r\n")
+        body = b"".join(parts) + b"--" + boundary + b"--\r\n"
+        with self.server("127.0.0.1") as port:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                conn.request("POST", "/r/fieldcap/upload", body=body,
+                             headers={"Content-Type":
+                                      "multipart/form-data; boundary=FIELDCAP"})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 400)
+                self.assertFalse(json.loads(response.read())["ok"])
+            finally:
+                conn.close()
+        with app.db() as dbc:
+            self.assertEqual(dbc.execute("SELECT COUNT(*) FROM files").fetchone()[0], 0)
+        self.assertEqual(os.listdir(app.FILES_DIR), [])
+
     def test_chunk_init_session_cap_429(self):
         # 分片会话上限：kind=upload 走接收链接、免登录、链接公开，
         # 不限数量会被刷爆内存和 inode。超限必须回 429 JSON。
@@ -3117,6 +3148,11 @@ class Installer(unittest.TestCase):
             if not chunk:
                 break
             out += chunk
+        # PTY 的 EOF 可能比子进程退出状态先到；给 shell 收尾和回收时间。
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
         if proc.poll() is None:
             proc.terminate()
             self.fail('installer did not exit: %r' % out[-2000:])

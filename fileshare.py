@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
 # ---------------- 配置 ----------------
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -634,6 +634,13 @@ MAX_FILES_PER_REQUEST = 200
 # MAX_FILES_PER_REQUEST 兜底，这里之前漏了。正常表单字段从不超过两位数。
 MAX_FIELDS_PER_REQUEST = 100
 
+# 接收链接无需登录。只限制字段数量和单个字段 1MB 时，一个请求仍可
+# 累积约 100MB 的 fields dict，足以让低内存 VPS 的进程被 OOM 杀掉。
+# 实际表单字段只是 title/expiry 等短文本，限制单项和累计大小。
+MAX_FIELD_BYTES = 64 * 1024
+MAX_FIELDS_TOTAL_BYTES = 256 * 1024
+MAX_PART_NAME_BYTES = 256
+
 # ---------------- 分片上传 ----------------
 # 大文件一次 POST 传完，经过 Cloudflare 这类反代时很容易因为
 # “单个请求耗时太长”被中间环节掐掉（用户看到的就是 请求失败(522)）。
@@ -801,6 +808,7 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     fields, files = {}, []
     n_files = 0
     n_fields = 0
+    fields_bytes = 0
     created_paths = []
     budget = max_bytes  # 实际文件字节的剩余额度（信封开销不计入）
     def charge(n):
@@ -948,6 +956,9 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
             headers = read_headers()
             disp = headers.get("content-disposition", "")
             name = _disp_param(disp, "name") or ""
+            name_bytes = len(name.encode("utf-8"))
+            if name_bytes > MAX_PART_NAME_BYTES:
+                raise BadUpload("part name too long")
             filename = _disp_param(disp, "filename")
             if filename:
                 n_files += 1
@@ -967,7 +978,12 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
                     # 已落盘的临时文件由外层 except BaseException 清理；
                     # 这里先计数再读：超限直接拒掉，不必把这个 part 读完
                     raise BadUpload("too many fields")
-                data, ended = read_data_mem(1024 * 1024)
+                if fields_bytes + name_bytes > MAX_FIELDS_TOTAL_BYTES:
+                    raise BadUpload("fields too large")
+                data, ended = read_data_mem(min(
+                    MAX_FIELD_BYTES,
+                    MAX_FIELDS_TOTAL_BYTES - fields_bytes - name_bytes))
+                fields_bytes += name_bytes + len(data)
                 fields[name] = data.decode("utf-8", "replace")
             if ended:
                 break
