@@ -119,30 +119,25 @@ class Connectivity(unittest.TestCase):
         self.exercise('::', '::1')
 
     def test_dash_expiry_buttons_have_valid_onclick(self):
-        # 回归测试：控制台"改过期"的确定/取消按钮由 JS 拼出 onclick，
-        # 引号错位会导致运行时生成 onclick="saveExpiry("+id+"')" 这种坏 HTML，
-        # 点确定没反应。正确应为 onclick="saveExpiry('"+id+"')"。
+        # 动态按钮直接绑定处理函数，避免拼接 onclick 时引号错位。
         now = int(time.time())
         with app.db() as c:
             c.execute("INSERT INTO shares(id,type,title,created,expires) VALUES(?,?,?,?,?)",
                       ("abC123-_", "send", "t", now, 0))
             shares = c.execute("SELECT * FROM shares").fetchall()
         body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
-        self.assertIn('saveExpiry(\'\\"+id+\\"\')', body)
-        self.assertIn('cancelExpiry(\'\\"+id+\\"\')', body)
-        self.assertNotIn('saveExpiry(\\"+id+\\")', body)
+        self.assertIn('ok.onclick=function(){saveExpiry(id);}', body)
+        self.assertIn('no.onclick=function(){cancelExpiry(id);}', body)
 
     def test_dash_resetpw_buttons_have_valid_onclick(self):
-        # 回归测试：用户管理里"重设密码"的确定/取消按钮由 JS 拼出 onclick，
-        # id 必须加引号传参，否则点确定没反应（chunk 上传改造时曾把引号改丢）。
+        # 管理员重设密码的动态按钮也直接绑定处理函数。
         with self.server("127.0.0.1"):
             app.create_user("user0001")
             with app.db() as c:
                 shares = c.execute("SELECT * FROM shares").fetchall()
             body = app.dash_page(shares, {"id": 1, "is_admin": True}).decode("utf-8")
-            self.assertIn('saveResetPw(\'\\"+id+\\"\')', body)
-            self.assertIn('cancelResetPw(\'\\"+id+\\"\')', body)
-            self.assertNotIn('saveResetPw("+id+")', body)
+            self.assertIn('ok.onclick=function(){saveResetPw(id);}', body)
+            self.assertIn('no.onclick=function(){cancelResetPw(id);}', body)
 
     def test_copy_button_has_insecure_context_fallback(self):
         # 回归测试：复制链接按钮之前直接调 navigator.clipboard.writeText，
@@ -704,7 +699,7 @@ class Connectivity(unittest.TestCase):
         self.assertIn("NAT_DETECTED", https)
         self.assertIn("自动检测：本机出口 IP", https)
         self.assertIn("location.origin", program)
-        self.assertIn('VERSION = "1.1.0"', program)
+        self.assertIn('VERSION = "1.2.0"', program)
 
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:
@@ -3438,7 +3433,9 @@ class HTTPSConfig(unittest.TestCase):
             (bindir / 'systemctl').write_text(
                 '#!/bin/sh\necho "$@" >> "$RC_LOG"\nexit 1\n')
             (bindir / 'systemctl').chmod(0o755)
-            block2 = block.replace('/etc/caddy', str(caddy_dir))
+            # 在非 systemd 的测试机上也执行 systemctl 恢复分支。
+            block2 = (block.replace('/etc/caddy', str(caddy_dir))
+                      .replace('[ -d /run/systemd/system ]', 'true'))
             r = subprocess.run(['sh', '-c', 'set -eu\n' + block2],
                                env={**os.environ,
                                     'PATH': str(bindir) + ':/usr/bin:/bin',
