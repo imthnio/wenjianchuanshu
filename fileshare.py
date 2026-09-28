@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
 # ---------------- 配置 ----------------
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -524,7 +524,7 @@ def all_files(user):
         where = "" if user["is_admin"] else " AND f.owner_id=?"
         args = (now,) if user["is_admin"] else (now, user["id"])
         return c.execute(
-            "SELECT f.id,f.filename,f.size,f.created,s.type,s.title,f.owner_id"
+            "SELECT f.id,f.share_id,f.filename,f.size,f.created,s.type,s.title,f.owner_id"
             " FROM files f LEFT JOIN shares s ON f.share_id=s.id"
             " WHERE (s.id IS NULL OR s.expires=0 OR s.expires>?)" + where +
             " ORDER BY f.id DESC", args).fetchall()
@@ -532,6 +532,7 @@ def all_files(user):
 def delete_files(ids):
     removed = 0
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         for fid in ids:
             r = c.execute("SELECT stored FROM files WHERE id=?", (fid,)).fetchone()
             if r:
@@ -542,6 +543,51 @@ def delete_files(ids):
                 c.execute("DELETE FROM files WHERE id=?", (fid,))
                 removed += 1
     return removed
+
+def add_existing_files(sid, ids, user):
+    """把可见的已有文件加入发送分享，原文件及原分享保持独立。"""
+    if not ids or len(ids) > 200 or len(set(ids)) != len(ids):
+        raise ValueError("请选择 1 至 200 个不同的文件")
+    created = []
+    try:
+        with db() as c:
+            # 和删除文件、修改分享串行，避免验证之后原文件就被删掉。
+            c.execute("BEGIN IMMEDIATE")
+            share = c.execute("SELECT * FROM shares WHERE id=?", (sid,)).fetchone()
+            if (not share or share["type"] != "send" or
+                    (share["expires"] and share["expires"] <= time.time())):
+                raise ValueError("发送分享不存在或已过期")
+            if not can_manage_share(user, share):
+                raise PermissionError("只能操作自己的分享")
+            for fid in ids:
+                row = c.execute("SELECT f.*, s.expires FROM files f"
+                                " LEFT JOIN shares s ON s.id=f.share_id"
+                                " WHERE f.id=?", (fid,)).fetchone()
+                if (not row or (not user["is_admin"] and
+                                row["owner_id"] != user["id"]) or
+                        (row["expires"] and row["expires"] <= time.time())):
+                    raise ValueError("所选文件不存在或不可访问")
+                if row["share_id"] == sid:
+                    raise ValueError("所选文件已在这个分享里")
+                source = os.path.join(FILES_DIR, row["stored"])
+                stored = secrets.token_hex(24)
+                dest = os.path.join(FILES_DIR, stored)
+                # 同目录硬链接不重复占用文件数据；两条目录项可分别删除。
+                os.link(source, dest)
+                created.append(dest)
+                c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                          " VALUES(?,?,?,?,?,?)",
+                          (sid, row["filename"], stored, row["size"],
+                           int(time.time()), share["owner_id"]))
+    except Exception:
+        # 数据库回滚后移除刚建的硬链接，不留下磁盘孤儿。
+        for path in created:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    return len(created)
 
 def cleanup_expired():
     now = int(time.time())
@@ -962,6 +1008,8 @@ progress{width:100%;height:10px;margin:6px 0}
 .badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:20px;background:#eef4ff;color:#1677ff;margin-right:6px}
 .badge.recv{background:#f6ffed;color:#389e0d}
 input.fileck{width:auto;margin:0 8px 2px 0;vertical-align:-2px}
+.existing-file{justify-content:flex-start;cursor:pointer}
+.existing-file input[type=checkbox]{width:auto;margin:0 6px 0 0;flex:none}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .diskfoot{position:fixed;left:12px;bottom:12px;background:rgba(30,34,40,.82);color:#fff;font-size:12px;
   padding:7px 12px;border-radius:20px;z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
@@ -1238,11 +1286,21 @@ function delFilesByIds(ids){{
 }}
 function editExpiry(id){{
   var box=document.getElementById('ex-'+id);
-  box.innerHTML="<select id='exs-"+id+"'><option value='1'>1 天后过期</option>"
-    +"<option value='7' selected>7 天后过期</option><option value='30'>30 天后过期</option>"
-    +"<option value='0'>永久有效</option></select> "
-    +"<button class='ghost' onclick=\\\"saveExpiry('\\\"+id+\\\"')\\\">确定</button>"
-    +"<button class='ghost' onclick=\\\"cancelExpiry('\\\"+id+\\\"')\\\">取消</button>";
+  box.innerHTML='';
+  var sel=document.createElement('select'); sel.id='exs-'+id;
+  [['1','1 天后过期'],['7','7 天后过期'],['30','30 天后过期'],
+   ['0','永久有效']].forEach(function(item){{
+    var opt=document.createElement('option'); opt.value=item[0];
+    opt.textContent=item[1]; sel.appendChild(opt);
+  }});
+  sel.value='7';
+  var ok=document.createElement('button'); ok.className='ghost';
+  ok.textContent='确定'; ok.onclick=function(){{saveExpiry(id);}};
+  var no=document.createElement('button'); no.className='ghost';
+  no.textContent='取消'; no.onclick=function(){{cancelExpiry(id);}};
+  box.appendChild(sel); box.appendChild(document.createTextNode(' '));
+  box.appendChild(ok); box.appendChild(document.createTextNode(' '));
+  box.appendChild(no);
 }}
 function cancelExpiry(id){{document.getElementById('ex-'+id).innerHTML="";}}
 function editTitle(id){{
@@ -1412,10 +1470,16 @@ function userDel(id){{
 }}
 function resetPw(id){{
   var box=document.getElementById('urp-'+id);
-  box.innerHTML="<input type='password' id='rp1-"+id+"' placeholder='新密码' minlength='4'> "
-    +"<input type='password' id='rp2-"+id+"' placeholder='再次输入' minlength='4'> "
-    +"<button class='ghost' onclick=\\\"saveResetPw('\\\"+id+\\\"')\\\">确定</button> "
-    +"<button class='ghost' onclick=\\\"cancelResetPw('\\\"+id+\\\"')\\\">取消</button>";
+  box.innerHTML='';
+  var a=document.createElement('input'); a.type='password'; a.id='rp1-'+id;
+  a.placeholder='新密码'; a.minLength=4;
+  var b=document.createElement('input'); b.type='password'; b.id='rp2-'+id;
+  b.placeholder='再次输入'; b.minLength=4;
+  var ok=document.createElement('button'); ok.className='ghost';
+  ok.textContent='确定'; ok.onclick=function(){{saveResetPw(id);}};
+  var no=document.createElement('button'); no.className='ghost';
+  no.textContent='取消'; no.onclick=function(){{cancelResetPw(id);}};
+  [a,b,ok,no].forEach(function(el){{box.appendChild(el); box.appendChild(document.createTextNode(' '));}});
 }}
 function cancelResetPw(id){{document.getElementById('urp-'+id).innerHTML='';}}
 function saveResetPw(id){{
@@ -1519,6 +1583,24 @@ def share_page(sid, share, files, user=None):
 <div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div></div>""")
     add_form = ""
     if manage:
+        candidates = []
+        for f in all_files(user):
+            if f["share_id"] == sid:
+                continue
+            owner = (f" · 用户#{f['owner_id']}" if user["is_admin"] and
+                     f["owner_id"] != user["id"] else "")
+            candidates.append(f"<label class='file existing-file'><input type='checkbox' "
+                              f"value='{f['id']}'> <span>📄 {html.escape(f['filename'])}"
+                              f"<small class='muted'> · {hsize(f['size'])}{owner}</small>"
+                              "</span></label>")
+        existing_picker = ("""<details><summary>从全部文件中添加</summary>
+<p class='muted'>选择已上传的文件，原分享中的文件仍会保留。</p>
+<input id='existingSearch' type='search' placeholder='搜索文件名'>
+<div id='existingList' style='max-height:300px;overflow:auto'>""" +
+                           "".join(candidates) + """</div>
+<button id='existingBtn' class='ghost' type='button'>添加选中文件</button>
+<div id='existingRes'></div></details>""" if candidates else
+                           "<p class='muted'>全部文件中暂无其他可添加的文件</p>")
         add_form = ("""<div class='card' style='max-width:560px;margin:16px auto'>
 <h3>➕ 添加文件</h3>
 <form id='addForm'><input type='file' name='file' multiple required>
@@ -1526,7 +1608,7 @@ def share_page(sid, share, files, user=None):
 <div id='addProgWrap' style='display:none'><progress id='addProg' value='0' max='100'></progress>
  <span id='addPct' class='muted'>0%</span></div>
 <div id='addStat' class='muted'></div></form>
-<div id='addRes'></div></div>
+<div id='addRes'></div>""" + existing_picker + """</div>
 <script>
 function delShareFile(fid, el){
   if(!confirm('确定删除这个文件吗？')) return;
@@ -1542,6 +1624,33 @@ function delShareFile(fid, el){
   .catch(function(){ el.disabled = false; alert('请求失败'); });
 }
 """ + CHUNK_JS + """
+var existingSearch=document.getElementById('existingSearch');
+if(existingSearch){
+  existingSearch.addEventListener('input',function(){
+    var q=this.value.trim().toLocaleLowerCase();
+    document.querySelectorAll('.existing-file').forEach(function(row){
+      row.style.display=row.textContent.toLocaleLowerCase().indexOf(q)>=0?'':'none';
+    });
+  });
+  document.getElementById('existingBtn').addEventListener('click',function(){
+    var btn=this, res=document.getElementById('existingRes');
+    var ids=Array.from(document.querySelectorAll('.existing-file input:checked'))
+      .map(function(el){return el.value;});
+    if(!ids.length){res.textContent='请先选择文件';return;}
+    if(ids.length>200){res.textContent='一次最多添加 200 个文件';return;}
+    btn.disabled=true; res.textContent='正在添加…';
+    fetch('/api/share_file_existing',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'sid='+encodeURIComponent('""" + sid + """')+'&ids='+encodeURIComponent(ids.join(','))})
+    .then(function(r){return r.text().then(function(t){
+      var j=JSON.parse(t); if(!r.ok||!j.ok)throw new Error(j.error||'添加失败');
+      return j;
+    });})
+    .then(function(){location.reload();})
+    .catch(function(e){res.textContent='添加失败：'+(e.message||'网络错误');
+      btn.disabled=false;});
+  });
+}
 document.getElementById('addForm').addEventListener('submit', function(ev){
   ev.preventDefault();
   var res=document.getElementById('addRes'), prog=document.getElementById('addProg'),
@@ -2226,6 +2335,26 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "文件不存在"}, 404)
                 delete_files([int(fid)])
                 return self._json({"ok": True})
+
+            if p == "/api/share_file_existing":
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid = f.get("sid", "")
+                raw_ids = (f.get("ids") or "").split(",")
+                if (not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid) or
+                        any(not re.fullmatch(r"[0-9]+", x) for x in raw_ids)):
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                try:
+                    count = add_existing_files(sid, [int(x) for x in raw_ids], user)
+                except PermissionError as e:
+                    return self._json({"ok": False, "error": str(e)}, 403)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                except OSError:
+                    return self._json({"ok": False, "error": "读取已有文件失败，请检查文件是否仍在服务器上"}, 500)
+                return self._json({"ok": True, "count": count})
 
             if p == "/api/share":
                 user = self._require_auth()
