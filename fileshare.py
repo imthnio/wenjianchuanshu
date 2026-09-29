@@ -283,7 +283,9 @@ def init_db():
                                 ("shares", "owner_id", "INTEGER"),
                                 ("users", "remark", "TEXT"),
                                 ("users", "pw_plain", "TEXT"),
-                                ("files", "owner_id", "INTEGER")):
+                                ("files", "owner_id", "INTEGER"),
+                                ("files", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+                                ("files", "sort_order", "INTEGER")):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -505,7 +507,43 @@ def get_share(sid):
 
 def share_files(sid):
     with db() as c:
-        return c.execute("SELECT * FROM files WHERE share_id=? ORDER BY id", (sid,)).fetchall()
+        return c.execute("SELECT * FROM files WHERE share_id=? ORDER BY "
+                         "pinned DESC, sort_order IS NULL, sort_order, id", (sid,)).fetchall()
+
+def arrange_share_file(sid, fid, action, user):
+    if action not in ("up", "down", "pin", "unpin"):
+        raise ValueError("排序操作无效")
+    with db() as c:
+        # Serialize read/modify/write, including permission and expiry checks.
+        c.execute("BEGIN IMMEDIATE")
+        share = c.execute("SELECT * FROM shares WHERE id=?", (sid,)).fetchone()
+        if not share or share["type"] != "send" or is_expired(share):
+            raise LookupError("分享不存在或已过期")
+        if not can_manage_share(user, share):
+            raise PermissionError("只能修改自己的分享")
+        rows = c.execute("SELECT * FROM files WHERE share_id=? ORDER BY "
+                         "pinned DESC, sort_order IS NULL, sort_order, id", (sid,)).fetchall()
+        target = next((r for r in rows if r["id"] == fid), None)
+        if target is None:
+            raise LookupError("文件不存在")
+        pinned = target["pinned"]
+        group = [r["id"] for r in rows if r["pinned"] == pinned]
+        if action in ("pin", "unpin"):
+            desired = int(action == "pin")
+            if desired == pinned:
+                return
+            pinned = desired
+            group = [r["id"] for r in rows if r["pinned"] == pinned] + [fid]
+            c.execute("UPDATE files SET pinned=? WHERE id=? AND share_id=?",
+                      (pinned, fid, sid))
+        else:
+            pos = group.index(fid)
+            other = pos + (-1 if action == "up" else 1)
+            if not 0 <= other < len(group):
+                return
+            group[pos], group[other] = group[other], group[pos]
+        c.executemany("UPDATE files SET sort_order=? WHERE id=? AND share_id=?",
+                      [(pos, file_id, sid) for pos, file_id in enumerate(group)])
 
 def is_expired(share):
     return share["expires"] and share["expires"] < time.time()
@@ -1011,6 +1049,7 @@ h1{font-size:22px;margin:4px 0 14px}h2{font-size:17px;margin:0 0 10px}h3{font-si
 input,select,textarea{font-size:15px;padding:10px 12px;border-radius:8px;border:1px solid #d9d9d9;width:100%;margin:6px 0;background:#fff}
 button{font-size:15px;padding:10px 12px;border-radius:8px;border:none;background:#1677ff;color:#fff;width:100%;margin:6px 0;cursor:pointer}
 button.ghost{background:#fff;color:#333;border:1px solid #d9d9d9;width:auto;padding:8px 14px;margin:2px 4px 2px 0}
+button.order-btn:disabled{opacity:.45;cursor:default}
 button.danger{background:#fff;color:#e5484d;border:1px solid #f3c2c4;width:auto;padding:8px 14px;margin:2px 4px 2px 0}
 a{color:#1677ff;text-decoration:none}
 .file{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid #f0f0f0}
@@ -1583,7 +1622,8 @@ def share_page(sid, share, files, user=None):
     # user 能管理这个分享（本人或管理员）时，页面上可以追加和删除文件
     manage = user is not None and can_manage_share(user, share)
     rows = []
-    for f in files:
+    pinned_flags = [bool(dict(f).get("pinned", 0)) for f in files]
+    for index, f in enumerate(files):
         name = html.escape(f["filename"])
         kind = _view_kind(f["filename"])
         # 图片和视频都不在页面里直接内联显示：之前 <img> 会让浏览器打开分享页
@@ -1594,9 +1634,19 @@ def share_page(sid, share, files, user=None):
                     "<button class='ghost'>查看</button></a> " if kind else "")
         del_btn = (f"<button class='ghost' onclick='delShareFile({f['id']},this)'>删除</button> "
                    if manage else "")
-        rows.append(f"""<div class='file' style='display:block'>{media}<div>📄 {name}
+        badge = " <span class='badge'>📌 置顶</span>" if pinned_flags[index] else ""
+        order_btns = ""
+        if manage:
+            action, label = ("unpin", "取消置顶") if pinned_flags[index] else ("pin", "置顶")
+            up_disabled = " disabled" if index == 0 or pinned_flags[index-1] != pinned_flags[index] else ""
+            down_disabled = " disabled" if index == len(files)-1 or pinned_flags[index+1] != pinned_flags[index] else ""
+            order_btns = f"""<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px'>
+<button class='ghost order-btn'{up_disabled} onclick='arrangeFile({f['id']},"up")' aria-label='上移 {name}'>↑ 上移</button>
+<button class='ghost order-btn'{down_disabled} onclick='arrangeFile({f['id']},"down")' aria-label='下移 {name}'>↓ 下移</button>
+<button class='ghost order-btn' onclick='arrangeFile({f['id']},"{action}")'>{label}</button></div>"""
+        rows.append(f"""<div class='file' id='file-{f['id']}' style='display:block'>{media}<div>📄 {name}{badge}
 <div class='muted'>{hsize(f['size'])}</div></div>
-<div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div></div>""")
+<div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div>{order_btns}</div>""")
     add_form = ""
     if manage:
         candidates = []
@@ -1626,6 +1676,28 @@ def share_page(sid, share, files, user=None):
 <div id='addStat' class='muted'></div></form>
 <div id='addRes'></div>""" + existing_picker + """</div>
 <script>
+var arrangingFile=false;
+function arrangeFile(fid, action){
+  if(arrangingFile)return;
+  arrangingFile=true;
+  var buttons=Array.from(document.querySelectorAll('.order-btn'));
+  var states=buttons.map(function(b){return b.disabled;});
+  buttons.forEach(function(b){b.disabled=true;});
+  var status=document.getElementById('orderStatus');
+  status.textContent='正在保存…';
+  fetch('/api/share_file_order',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'sid='+encodeURIComponent('""" + sid + """')+'&id='+fid+'&action='+action})
+  .then(function(r){return r.json().then(function(j){
+    if(!r.ok||!j.ok)throw new Error(j.error||'保存失败');
+  });})
+  .then(function(){location.hash='file-'+fid;location.reload();})
+  .catch(function(e){
+    status.textContent='保存失败：'+(e.message||'网络错误')+'，请刷新页面确认后重试';
+    buttons.forEach(function(b,i){b.disabled=states[i];});
+    arrangingFile=false;
+  });
+}
 function delShareFile(fid, el){
   if(!confirm('确定删除这个文件吗？')) return;
   el.disabled = true;
@@ -1693,6 +1765,7 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
     return page("下载文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
 <h1>📥 {html.escape(share['title'] or '文件分享')}</h1>
 <p class='muted'>共 {len(files)} 个文件 · 到期：{htime(share['expires'])}</p>
+{"<p class='muted'>置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。</p><div id='orderStatus' role='status' aria-live='polite'></div>" if manage else ""}
 {''.join(rows) if rows else "<p class='muted'>📭 文件都被删除啦</p>"}
 </div>{add_form}""")
 
@@ -2350,6 +2423,26 @@ class Handler(BaseHTTPRequestHandler):
                 if not row:
                     return self._json({"ok": False, "error": "文件不存在"}, 404)
                 delete_files([int(fid)])
+                return self._json({"ok": True})
+
+            if p == "/api/share_file_order":
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid, fid = f.get("sid", ""), f.get("id", "")
+                if (not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid) or
+                        not re.fullmatch(r"[0-9]{1,19}", fid) or
+                        int(fid) > 9223372036854775807):
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                try:
+                    arrange_share_file(sid, int(fid), f.get("action", ""), user)
+                except PermissionError as e:
+                    return self._json({"ok": False, "error": str(e)}, 403)
+                except LookupError as e:
+                    return self._json({"ok": False, "error": str(e)}, 404)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
                 return self._json({"ok": True})
 
             if p == "/api/share_file_existing":
