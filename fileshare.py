@@ -1040,43 +1040,268 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
         raise
 
 # ---------------- 页面模板 ----------------
+# 设计：浅色为主，系统深色模式时自动切换；所有样式内联在页面里，
+# 不依赖任何 CDN，裸 VPS 断网也能正常显示。
 CSS = """
+:root{--bg:#f4f6fa;--card:#fff;--text:#1f2937;--muted:#667085;--border:#e3e7ee;--line:#eef1f5;
+--hover:#f3f5f9;--accent:#2563eb;--accent-h:#1d4ed8;--accent-soft:#eaf1ff;--accent-text:#1d4ed8;
+--danger:#d92d20;--danger-soft:#fef3f2;--danger-line:#fbcfca;--ok:#067647;--ok-soft:#ecfdf3;--ok-line:#abefc6;
+--warn:#b54708;--warn-soft:#fffaeb;--r:14px;--r-sm:10px;
+--shadow:0 1px 2px rgba(16,24,40,.04),0 2px 12px rgba(16,24,40,.05);color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161a21;--text:#e7e9ee;--muted:#9aa4b2;
+--border:#2a303b;--line:#212631;--hover:#1d222b;--accent:#2f6fed;--accent-h:#4a82f0;--accent-soft:#17233d;
+--accent-text:#8db3ff;--danger:#f97066;--danger-soft:#2a1715;--danger-line:#5c2a25;--ok:#47cd89;
+--ok-soft:#0f2519;--ok-line:#1f4d33;--warn:#fdb022;--warn-soft:#2a2111;--shadow:none;color-scheme:dark}}
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-  max-width:720px;margin:0 auto;padding:16px;background:#f2f4f8;color:#222;-webkit-text-size-adjust:100%}
-.card{background:#fff;border-radius:12px;padding:18px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
-h1{font-size:22px;margin:4px 0 14px}h2{font-size:17px;margin:0 0 10px}h3{font-size:15px;margin:14px 0 8px}
-input,select,textarea{font-size:15px;padding:10px 12px;border-radius:8px;border:1px solid #d9d9d9;width:100%;margin:6px 0;background:#fff}
-button{font-size:15px;padding:10px 12px;border-radius:8px;border:none;background:#1677ff;color:#fff;width:100%;margin:6px 0;cursor:pointer}
-button.ghost{background:#fff;color:#333;border:1px solid #d9d9d9;width:auto;padding:8px 14px;margin:2px 4px 2px 0}
-button.order-btn:disabled{opacity:.45;cursor:default}
-button.danger{background:#fff;color:#e5484d;border:1px solid #f3c2c4;width:auto;padding:8px 14px;margin:2px 4px 2px 0}
-a{color:#1677ff;text-decoration:none}
-.file{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid #f0f0f0}
-.file:last-child{border-bottom:none}
-.muted{color:#8a8f99;font-size:13px}
-.linkbox{background:#f6f8fb;border:1px dashed #b9c6d8;border-radius:8px;padding:10px;word-break:break-all;font-size:14px;margin:8px 0}
-.err{background:#fff1f0;border:1px solid #ffa39e;color:#cf1322;border-radius:8px;padding:10px;margin:8px 0;font-size:14px}
-.ok{background:#f6ffed;border:1px solid #b7eb8f;color:#389e0d;border-radius:8px;padding:10px;margin:8px 0;font-size:14px}
-progress{width:100%;height:10px;margin:6px 0}
-.row{display:flex;gap:8px}.row>*{flex:1}
-.badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:20px;background:#eef4ff;color:#1677ff;margin-right:6px}
-.badge.recv{background:#f6ffed;color:#389e0d}
-input.fileck{width:auto;margin:0 8px 2px 0;vertical-align:-2px}
-.existing-file{justify-content:flex-start;cursor:pointer}
-.existing-file input[type=checkbox]{width:auto;margin:0 6px 0 0;flex:none}
-.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.diskfoot{position:fixed;left:12px;bottom:12px;background:rgba(30,34,40,.82);color:#fff;font-size:12px;
-  padding:7px 12px;border-radius:20px;z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{margin:0 auto;padding:20px 16px 88px}
+.wrap-sm{max-width:440px}.wrap-md{max-width:760px}.wrap-lg{max-width:1080px}
+h1{font-size:22px;line-height:1.35;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+h3{font-size:15px;margin:0 0 10px}
+p{margin:0 0 10px}
+a{color:var(--accent-text);text-decoration:none}a:hover{text-decoration:underline}
+.muted{color:var(--muted);font-size:13px}
+small.muted{font-size:12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card-head p{margin:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;align-items:start}
+.grid2>.card{margin-bottom:0}
+.stack{display:flex;flex-direction:column;gap:16px;margin-bottom:16px}
+.stack>.card{margin-bottom:0}
+label.fld{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+input,select,textarea{font:inherit;font-size:15px;color:var(--text);background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r-sm);padding:10px 12px;width:100%;margin:6px 0;min-height:44px;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+input[type=checkbox]{width:18px;height:18px;min-height:0;margin:0;accent-color:var(--accent);flex:none;cursor:pointer}
+button,.btn{font:inherit;font-size:14px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  min-height:40px;padding:0 16px;border-radius:var(--r-sm);border:1px solid transparent;background:var(--accent);color:#fff;
+  cursor:pointer;text-decoration:none;white-space:nowrap;transition:background .15s,border-color .15s,box-shadow .15s,transform .05s;
+  -webkit-tap-highlight-color:transparent;vertical-align:middle;margin:0}
+button:hover,.btn:hover{background:var(--accent-h);text-decoration:none}
+button:active,.btn:active{transform:translateY(1px)}
+button:focus-visible,.btn:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:2px}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+form>button,button.block,.btn.block{width:100%;min-height:46px;margin-top:10px;font-size:15px}
+button.ghost,.btn.ghost{background:var(--card);color:var(--text);border-color:var(--border)}
+button.ghost:hover,.btn.ghost:hover{background:var(--hover)}
+button.danger,.btn.danger{background:var(--card);color:var(--danger);border-color:var(--danger-line)}
+button.danger:hover,.btn.danger:hover{background:var(--danger-soft)}
+button.sm,.btn.sm{min-height:32px;padding:0 10px;font-size:13px;font-weight:500;border-radius:8px}
+button.icon-only{padding:0;width:40px}
+.btn-view{min-height:44px;padding:0 20px;font-size:15px;box-shadow:0 2px 10px color-mix(in srgb,var(--accent) 35%,transparent)}
+.ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.sm .ic{width:15px;height:15px}
+a.btnlink{display:inline-flex;text-decoration:none}
+a.btnlink>button{pointer-events:none}
+.linkbox{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--accent-soft);color:var(--accent-text);
+  border:1px dashed color-mix(in srgb,var(--accent) 40%,transparent);border-radius:8px;padding:8px 12px;word-break:break-all;margin:8px 0}
+.err,.ok{border-radius:var(--r-sm);padding:10px 12px;margin:8px 0;font-size:14px;border:1px solid}
+.err{background:var(--danger-soft);border-color:var(--danger-line);color:var(--danger)}
+.ok{background:var(--ok-soft);border-color:var(--ok-line);color:var(--ok)}
+span.err,span.ok{display:inline-block}
+progress{-webkit-appearance:none;appearance:none;width:100%;height:8px;border:0;border-radius:99px;background:var(--line);overflow:hidden;vertical-align:middle}
+progress::-webkit-progress-bar{background:var(--line);border-radius:99px}
+progress::-webkit-progress-value{background:var(--accent);border-radius:99px;transition:width .2s}
+progress::-moz-progress-bar{background:var(--accent);border-radius:99px}
+.prog{display:flex;align-items:center;gap:10px;margin:12px 0 4px}.prog .muted{min-width:3em;text-align:right;font-variant-numeric:tabular-nums}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 140px}
+.badge{display:inline-flex;align-items:center;gap:3px;font-size:12px;font-weight:600;line-height:1;padding:4px 8px;border-radius:99px;
+  background:var(--accent-soft);color:var(--accent-text);margin-right:6px;vertical-align:2px;white-space:nowrap}
+.badge.recv{background:var(--ok-soft);color:var(--ok)}
+.badge.pin{background:var(--warn-soft);color:var(--warn)}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:4px 0 18px}
+.brand{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700;margin:0;color:var(--text)}
+.brand .logo{width:36px;height:36px;border-radius:10px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:19px;flex:none}
+.userchip{display:flex;align-items:center;gap:10px;font-size:14px}
+.userchip .who{background:var(--card);border:1px solid var(--border);border-radius:99px;padding:4px 12px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;box-shadow:var(--shadow)}
+.stat b{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}
+.stat span{color:var(--muted);font-size:13px}
+.drop{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;text-align:center;
+  border:2px dashed var(--border);border-radius:var(--r);padding:22px 14px;margin:4px 0 6px;background:var(--hover);color:var(--muted);
+  cursor:pointer;transition:border-color .15s,background .15s;min-height:120px}
+.drop:hover,.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+.drop.has{border-style:solid;border-color:var(--accent)}
+.drop input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;margin:0;min-height:0}
+.drop .ic{width:28px;height:28px;color:var(--accent)}
+.drop b{color:var(--text);font-size:15px}
+.drop-files{font-size:13px;color:var(--accent-text);word-break:break-all}
+.drop-files:empty{display:none}
+.file{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 0;border-top:1px solid var(--line)}
+.file:first-child{border-top:0}
+.file b{word-break:break-word;overflow-wrap:anywhere}
+.file>div:first-child{min-width:0;flex:1}
+.acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex:none;align-items:center}
+.file.stacked{display:block}.file.stacked>.acts{justify-content:flex-start;margin-top:10px}
+.file.stacked .linkbox{max-width:640px}
+.edit-slot:empty{display:none}
+.edit-slot{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}
+.edit-slot input,.edit-slot select{flex:1 1 180px;width:auto!important;margin:0;min-height:36px;padding:6px 10px}
+.edit-slot button{min-height:36px}
+.list-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+.list-tools input[type=search]{flex:1 1 200px;width:auto;margin:0}
+.ftable .fhead,.ftable .frow{display:grid;grid-template-columns:28px minmax(0,1fr) 90px 130px auto;gap:12px;align-items:center}
+.ftable.nock .fhead,.ftable.nock .frow{grid-template-columns:minmax(0,1fr) 90px 130px auto}
+.ftable .fhead{font-size:12px;color:var(--muted);font-weight:600;padding:8px 0;border-bottom:1px solid var(--border)}
+.ftable .frow{padding:12px 0;border-top:1px solid var(--line)}
+.ftable .fhead+.frow{border-top:0}
+.frow .fname b{display:block;word-break:break-word;overflow-wrap:anywhere;font-weight:600}
+.frow .c-size,.frow .c-time{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.m-meta{display:none}
+.empty{text-align:center;padding:28px 12px;color:var(--muted)}
+.empty .big{font-size:40px;line-height:1;margin-bottom:8px;display:block}
+details{border:1px solid var(--border);border-radius:var(--r-sm);padding:0 14px;margin-top:14px}
+details>summary{cursor:pointer;padding:12px 0;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸";color:var(--muted);transition:transform .15s}
+details[open]>summary::before{transform:rotate(90deg)}
+details[open]{padding-bottom:14px}
+.existing-file{justify-content:flex-start;cursor:pointer;padding:10px 4px;gap:10px}
+.existing-file:hover{background:var(--hover)}
+input.fileck{margin:0}
+.auth{margin-top:8vh}
+.auth .brand{justify-content:center;margin-bottom:6px}
+.auth h1{text-align:center;font-size:20px}
+.auth .sub{text-align:center;color:var(--muted);font-size:14px;margin-bottom:16px}
+.hero{display:flex;gap:14px;align-items:flex-start}
+.hero .logo{width:48px;height:48px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:24px;flex:none}
+.hero h1{margin:2px 0 4px;word-break:break-word;overflow-wrap:anywhere}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);background:var(--hover);border:1px solid var(--line);border-radius:99px;padding:3px 10px}
+.chip b{color:var(--text);font-weight:600}
+.note{background:var(--accent-soft);color:var(--accent-text);border-radius:var(--r-sm);padding:10px 12px;font-size:13px;margin-top:14px}
+.sf{display:flex;align-items:center;gap:12px 14px;padding:14px 0;border-top:1px solid var(--line);flex-wrap:wrap;scroll-margin-top:16px}
+.sf:first-child{border-top:0}
+.sf:target{animation:flash 2s ease-out}
+@keyframes flash{0%{background:var(--accent-soft)}100%{background:transparent}}
+.sf-main{display:flex;align-items:center;gap:12px;flex:1 1 260px;min-width:0}
+.sf-info{min-width:0}
+.sf-name{font-weight:600;word-break:break-word;overflow-wrap:anywhere;line-height:1.45}
+.sf-name .badge{margin:0 0 0 6px;vertical-align:1px}
+.sf-meta{margin-top:2px}
+.sf-acts{display:flex;gap:8px;flex:none;align-items:center}
+.sf-manage{flex-basis:100%;display:flex;gap:6px;flex-wrap:wrap;padding-left:56px}
+.ftile{width:44px;height:44px;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;flex:none;
+  background:var(--hover);color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.02em;line-height:1;gap:2px;text-transform:uppercase}
+.ftile .ic{width:20px;height:20px}
+.ftile.k-img{background:#e8f7ee;color:#067647}.ftile.k-vid{background:#f3ebff;color:#6d28d9}
+.ftile.k-aud{background:#fff1e6;color:#c2410c}.ftile.k-pdf{background:#fdecec;color:#c01f1f}
+.ftile.k-txt{background:#eaf1ff;color:#1d4ed8}
+@media (prefers-color-scheme:dark){.ftile.k-img{background:#10261a;color:#6ce0a0}.ftile.k-vid{background:#221a36;color:#c4a6ff}
+.ftile.k-aud{background:#2b1c10;color:#ffb27a}.ftile.k-pdf{background:#2d1515;color:#ff9a9a}.ftile.k-txt{background:#17233d;color:#8db3ff}}
+.diskfoot{position:fixed;left:12px;bottom:12px;background:rgba(17,24,39,.86);color:#fff;font-size:12px;padding:7px 12px;border-radius:99px;
+  z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 .diskbar{width:90px;height:5px;border-radius:3px;background:rgba(255,255,255,.25);overflow:hidden}
 .diskbar i{display:block;height:100%;background:#40c463;border-radius:3px}
+.foot{text-align:center;color:var(--muted);font-size:12px;margin-top:8px}
+html.pv-lock,html.pv-lock body{overflow:hidden}
+.pv{position:fixed;inset:0;z-index:3000;display:flex;flex-direction:column;background:#0b0d12;color:#f2f4f7}
+.pv[hidden]{display:none}
+.pv-bar{display:flex;align-items:center;gap:8px;padding:10px 12px;padding-top:max(10px,env(safe-area-inset-top))}
+.pv-title{flex:1;min-width:0}
+.pv-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pv-meta{font-size:12px;color:#aab2c0}
+.pv-btn,.pv-nav{background:rgba(255,255,255,.12);color:#fff;border:0}
+.pv-btn:hover,.pv-nav:hover{background:rgba(255,255,255,.22)}
+.pv-body{flex:1;min-height:0;position:relative;display:flex}
+.pv-stage{flex:1;min-width:0;display:flex;align-items:center;justify-content:center;padding:0 12px 12px;padding-bottom:max(12px,env(safe-area-inset-bottom));overflow:auto}
+.pv-stage img,.pv-stage video{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px;background:#000;display:block}
+.pv-stage img{cursor:zoom-in;background:transparent}
+.pv-stage.zoom{align-items:flex-start;justify-content:flex-start}
+.pv-stage.zoom img{max-width:none;max-height:none;cursor:zoom-out}
+.pv-stage iframe{width:100%;height:100%;border:0;border-radius:8px;background:#fff}
+.pv-stage pre{align-self:stretch;width:100%;max-width:980px;margin:0 auto;overflow:auto;background:var(--card);color:var(--text);padding:16px;
+  border-radius:10px;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,"PingFang SC","Microsoft YaHei",monospace;white-space:pre-wrap;word-break:break-word}
+.pv-audio{background:rgba(255,255,255,.06);border-radius:16px;padding:28px 22px;text-align:center;width:min(480px,100%)}
+.pv-audio .ic{width:48px;height:48px;color:#ffb27a;margin-bottom:8px}
+.pv-audio audio{width:100%;margin-top:14px}
+.pv-msg{text-align:center;max-width:440px;color:#d0d5dd;line-height:1.7}
+.pv-msg .btn{margin:14px 4px 0}
+.pv-nav{position:absolute;top:50%;margin-top:-24px;width:48px;height:48px;min-height:0;padding:0;border-radius:50%;z-index:2}
+.pv-prev{left:14px}.pv-next{right:14px}
+.pv[data-kind=txt] .pv-nav,.pv[data-kind=pdf] .pv-nav{background:rgba(17,24,39,.72)}
+.pv-count{position:absolute;left:50%;transform:translateX(-50%);bottom:max(14px,env(safe-area-inset-bottom));font-size:12px;color:#aab2c0;
+  background:rgba(0,0,0,.45);padding:2px 10px;border-radius:99px;pointer-events:none}
+.pv-count:empty{display:none}
+.pv-spin{width:38px;height:38px;border:3px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (max-width:700px){
+  .wrap{padding:14px 12px 84px}
+  .card{padding:16px;border-radius:12px}
+  h1{font-size:20px}
+  .stats{gap:8px}.stat{padding:10px 12px}.stat b{font-size:18px}
+  .file{flex-wrap:wrap}.file>.acts{flex:1 1 100%;justify-content:flex-start}
+  .ftable .fhead{display:none}
+  .ftable .frow,.ftable.nock .frow{grid-template-columns:auto minmax(0,1fr);gap:6px 10px}
+  .ftable.nock .frow{grid-template-columns:minmax(0,1fr)}
+  .frow .c-size,.frow .c-time{display:none}
+  .m-meta{display:inline}
+  .frow .acts{grid-column:1/-1;justify-content:flex-start}
+  .ftable:not(.nock) .frow .acts{padding-left:28px}
+}
+@media (max-width:560px){
+  .sf-acts{flex:1 1 100%}
+  .sf-acts .btn-view{flex:1 1 auto;min-height:48px;font-size:16px}
+  .sf-acts .btn{min-height:48px}
+  .sf-acts .btn:only-child{flex:1 1 auto}
+  .sf-manage{padding-left:0}
+  .pv-btn .lbl{display:none}
+  .pv-btn{padding:0;width:42px}
+  .pv-nav{width:40px;height:40px;margin-top:-20px}.pv-prev{left:6px}.pv-next{right:6px}
+}
 """
 
-def page(title, body):
+# 线框图标（Feather 风格），直接内联 SVG，不依赖外部字体/CDN。
+_ICON_PATHS = {
+    "eye": '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    "play": '<polygon points="7 4 20 12 7 20 7 4" fill="currentColor"/>',
+    "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+    "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
+    "x": '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+    "left": '<polyline points="15 18 9 12 15 6"/>',
+    "right": '<polyline points="9 18 15 12 9 6"/>',
+    "external": '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
+    "copy": '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    "trash": '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+    "edit": '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+    "clock": '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>',
+    "file": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
+    "image": '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+    "film": '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M7 3v18M17 3v18M2 12h20M2 7.5h5M2 16.5h5M17 7.5h5M17 16.5h5"/>',
+    "music": '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+    "text": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="14" y2="17"/>',
+    "up": '<polyline points="18 15 12 9 6 15"/>',
+    "down": '<polyline points="6 9 12 15 18 9"/>',
+    "pin": '<path d="M12 17v5"/><path d="M9 3h6l-1 6 4 4v2H6v-2l4-4z"/>',
+    "logout": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+    "open": '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+}
+
+def icon(name):
+    return ('<svg class="ic" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            + _ICON_PATHS[name] + "</svg>")
+
+_FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+            "%3Crect width='64' height='64' rx='16' fill='%232563eb'/%3E"
+            "%3Cpath d='M16 22a4 4 0 0 1 4-4h9l4 5h11a4 4 0 0 1 4 4v15a4 4 0 0 1-4 4H20a4 4 0 0 1-4-4z' fill='white'/%3E%3C/svg%3E")
+
+def page(title, body, size="md"):
+    # size: sm（登录/提示）、md（分享页/接收页）、lg（控制台）
     return ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+            "<meta name='color-scheme' content='light dark'>"
+            "<meta name='theme-color' content='#f4f6fa' media='(prefers-color-scheme: light)'>"
+            "<meta name='theme-color' content='#0e1116' media='(prefers-color-scheme: dark)'>"
+            f"<link rel='icon' href=\"{_FAVICON}\">"
             f"<title>{html.escape(title)}</title><style>{CSS}</style></head>"
-            f"<body>{body}</body></html>").encode("utf-8")
+            f"<body><main class='wrap wrap-{size}'>{body}</main></body></html>").encode("utf-8")
+
+def brand(tag="div"):
+    return f"<{tag} class='brand'><span class='logo' aria-hidden='true'>🗂️</span>文件分享</{tag}>"
 
 def hsize(n):
     n = int(n or 0)
@@ -1130,24 +1355,40 @@ def too_large_msg():
         return "磁盘剩余空间不足（剩余 %s），无法上传" % hsize(free)
     return "文件太大，超出上限"
 
+def _auth_card(inner):
+    return f"<div class='auth'><div class='card'>{inner}</div></div>"
+
 def setup_page(err=""):
     e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
-    return page("初始设置", f"""<div class='card' style='max-width:420px;margin:40px auto'>
-<h1>🗂️ 文件分享</h1><p class='muted'>首次使用，请输入服务器安装时显示的初始化码，并设置管理员密码。初始化码也可在服务器的 data/setup-token 文件中查看。</p>{e}
+    return page("初始设置", _auth_card(f"""{brand()}
+<h1>欢迎使用</h1><p class='sub'>首次使用，请输入服务器安装时显示的初始化码，并设置管理员密码。初始化码也可在服务器的 data/setup-token 文件中查看。</p>{e}
 <form method='post' action='/setup'>
-<input type='text' name='setup_code' placeholder='初始化码' required autocomplete='off'>
-<input type='password' name='pw1' placeholder='设置密码' required minlength='4'>
-<input type='password' name='pw2' placeholder='再次输入' required minlength='4'>
-<button>完成设置</button></form></div>""")
+<label class='fld' for='setup_code'>初始化码</label>
+<input type='text' id='setup_code' name='setup_code' placeholder='64 位初始化码' required autocomplete='off' spellcheck='false'>
+<label class='fld' for='pw1'>管理员密码</label>
+<input type='password' id='pw1' name='pw1' placeholder='设置密码（至少 4 位）' required minlength='4' autocomplete='new-password'>
+<input type='password' name='pw2' placeholder='再次输入' required minlength='4' autocomplete='new-password' aria-label='再次输入密码'>
+<button>完成设置</button></form>"""), "sm")
 
 def login_page(err=""):
-    e = f"<div class='err'>{html.escape(err)}</div>" if err else ""
-    return page("登录", f"""<div class='card' style='max-width:420px;margin:40px auto'>
-<h1>🗂️ 文件分享</h1>{e}
+    e = f"<div class='err' role='alert'>{html.escape(err)}</div>" if err else ""
+    return page("登录", _auth_card(f"""{brand()}
+<p class='sub'>输入密码登录控制台</p>{e}
 <form method='post' action='/login'>
-<input type='password' name='pw' placeholder='密码' required autofocus>
+<input type='password' name='pw' placeholder='密码' required autofocus autocomplete='current-password' aria-label='密码'>
 <button>登录</button></form>
-<p class='muted'>没有用户名：不同的密码对应不同的账号，找管理员要你的密码。</p></div>""")
+<p class='muted' style='margin:14px 0 0;text-align:center'>没有用户名：不同的密码对应不同的账号，找管理员要你的密码。</p>"""), "sm")
+
+_EXPIRY_OPTIONS = ("<option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>"
+                   "<option value='30'>30 天后过期</option><option value='0'>永久有效</option>")
+
+def _drop_zone(input_attrs, hint=""):
+    # 整块区域都是 <input type=file>（透明覆盖），点击或把文件拖进来都能选；
+    # 选中后由 UI_JS 显示文件名和总大小。
+    return (f"<label class='drop'>{icon('upload')}<b>点击选择文件，或拖到这里</b>"
+            f"<span class='muted'>{hint or '支持多选，大文件自动分片上传'}</span>"
+            f"<span class='drop-files' aria-live='polite'></span>"
+            f"<input type='file' {input_attrs} aria-label='选择文件'></label>")
 
 def dash_page(shares, user, public_base=""):
     is_admin = user["is_admin"]
@@ -1156,7 +1397,7 @@ def dash_page(shares, user, public_base=""):
     items = []
     for s in shares:
         files = share_files(s["id"])
-        total = sum(f["size"] for f in files)
+        total = sum(f["size"] or 0 for f in files)
         typ = "发送" if s["type"] == "send" else "接收"
         cls = "" if s["type"] == "send" else "recv"
         path = f"/{'s' if s['type']=='send' else 'r'}/{s['id']}"
@@ -1166,19 +1407,23 @@ def dash_page(shares, user, public_base=""):
         if is_admin and s["owner_id"] is not None:
             owner = ("<span class='badge'>我的</span>" if s["owner_id"] == user["id"]
                      else f"<span class='badge recv'>用户#{s['owner_id']}</span>")
-        items.append(f"""<div class='file'><div>
+        items.append(f"""<div class='file stacked'><div>
 <span class='badge {cls}'>{typ}</span>{owner}<b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
-<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])} <span id='ex-{s['id']}'></span></div>
-<div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div id='ti-{s['id']}'></div></div>
-<div style='white-space:nowrap'>
-<button class='ghost' onclick="copyLink('{s['id']}','{path}')">复制链接</button>
-<button class='ghost' onclick="editTitle('{s['id']}')">改备注</button>
-<button class='ghost' onclick="editExpiry('{s['id']}')">改过期</button>
-<button class='danger' onclick="delShare('{s['id']}')">删除链接</button>
+<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])}</div>
+<div class='edit-slot' id='ex-{s['id']}'></div>
+<div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div class='edit-slot' id='ti-{s['id']}'></div></div>
+<div class='acts'>
+<button class='ghost sm' onclick="copyLink('{s['id']}','{path}')">{icon('copy')}复制链接</button>
+<a class='btn ghost sm' href='{path}' target='_blank' rel='noopener'>{icon('external')}打开</a>
+<button class='ghost sm' onclick="editTitle('{s['id']}')">{icon('edit')}改备注</button>
+<button class='ghost sm' onclick="editExpiry('{s['id']}')">{icon('clock')}改过期</button>
+<button class='danger sm' onclick="delShare('{s['id']}')">{icon('trash')}删除链接</button>
 </div></div>""")
     frows = []
+    total_size = 0
     for fr in all_files(user):
         fid, fn, fsz, fct = fr["id"], fr["filename"], fr["size"], fr["created"]
+        total_size += fsz or 0
         stype, stitle, sowner = fr["type"], fr["title"], fr["owner_id"]
         if stype is None:
             # 归属的分享链接已被删除，文件仍保留在这里等待手动清理
@@ -1192,26 +1437,37 @@ def dash_page(shares, user, public_base=""):
         if is_admin and sowner is not None:
             ownermk = (" <span class='badge'>我的</span>" if sowner == user["id"]
                        else f" <span class='badge recv'>用户#{sowner}</span>")
-        ck = f"<input type='checkbox' class='fileck' value='{fid}'>" if is_admin else ""
-        delbtn = (f"<button class='danger' onclick=\"delOneFile({fid})\">删除</button>"
+        ck = (f"<input type='checkbox' class='fileck' value='{fid}' aria-label='选择 {html.escape(fn)}'>"
+              if is_admin else "")
+        delbtn = (f"<button class='danger sm' onclick=\"delOneFile({fid})\">删除</button>"
                   if is_admin else "")
-        dlbtn = f"<a href='/dl/{fid}'><button class='ghost'>下载</button></a> "
-        frows.append(f"""<div class='file'><div>
-{ck}<span class='badge {fcls}'>{ftyp}</span>{ownermk}<b>{html.escape(fn)}</b>
-<div class='muted'>{hsize(fsz)} · 来自{fsrc} · {htime(fct)}</div>
-</div>
-<div style='white-space:nowrap'>{dlbtn}{delbtn}</div></div>""")
-    flist = "".join(frows) if frows else "<p class='muted'>还没有任何文件</p>"
-    lst = "".join(items) if items else "<p class='muted'>还没有分享，来创建一个吧 👆</p>"
+        dlbtn = f"<a class='btnlink' href='/dl/{fid}'><button class='ghost sm' tabindex='-1'>下载</button></a> "
+        frows.append(f"""<div class='frow'>{"<div>" + ck + "</div>" if is_admin else ""}
+<div class='fname'><b>{html.escape(fn)}</b>
+<div class='muted'><span class='badge {fcls}'>{ftyp}</span>{ownermk}来自{fsrc}<span class='m-meta'> · {hsize(fsz)} · {htime(fct)}</span></div></div>
+<div class='c-size'>{hsize(fsz)}</div><div class='c-time'>{htime(fct)}</div>
+<div class='acts'>{dlbtn}{delbtn}</div></div>""")
+    nock = "" if is_admin else " nock"
+    if frows:
+        flist = (f"<div class='ftable{nock}' id='fileTable'><div class='fhead'>"
+                 + ("<div></div>" if is_admin else "")
+                 + "<div>文件名</div><div>大小</div><div>上传时间</div><div></div></div>"
+                 + "".join(frows) + "</div>"
+                 + "<p class='empty' id='fileNoMatch' hidden>没有匹配的文件</p>")
+    else:
+        flist = "<div class='empty'><span class='big'>📂</span>还没有任何文件</div>"
+    lst = ("".join(items) if items else
+           "<div class='empty'><span class='big'>🔗</span>还没有分享，来创建一个吧 👆</div>")
     role = "👑 管理员" if is_admin else "👤 普通用户"
     share_title = "📋 分享链接（全部用户）" if is_admin else "📋 我的分享"
     file_title = "📁 全部文件" if is_admin else "📁 我的文件"
     filehint = ("发送和接收的所有文件都在这里。删除为彻底删除，不经过回收站。"
                 if is_admin else "你的文件都在这里。你没有删除文件的权限。")
-    fileops = ("""<div class='row' style='margin-top:8px'>
-<button class='ghost' onclick="toggleAllFiles()">全选 / 取消全选</button>
-<button class='danger' onclick="delFiles()">删除选中</button>
-</div>""") if is_admin else ""
+    search = ("<input type='search' id='fileSearch' placeholder='搜索文件名 / 来源' aria-label='搜索文件'>"
+              if frows else "")
+    fileops = ("""<button class='ghost sm' onclick="toggleAllFiles()">全选 / 取消全选</button>
+<button class='danger sm' onclick="delFiles()">删除选中</button>""") if is_admin and frows else ""
+    tools = f"<div class='list-tools'>{search}{fileops}</div>" if (search or fileops) else ""
     users_card = ""
     # 眼睛：普通用户的明文密码直接嵌进本页（仅管理员可见），点眼睛本地即时显示，
     # 不再为每次点击发一次网络请求（之前慢就慢在这一次往返上）。
@@ -1230,61 +1486,68 @@ def dash_page(shares, user, public_base=""):
                    if remark else f"<span class='muted' id='rmk-{u['id']}'></span>")
             if u["is_admin"]:
                 mark, who = "<span class='badge'>管理员</span>", "管理员"
-                ops = ("<span class='muted'>这是你，改密码请用下面的「修改密码」</span>"
+                ops = ("<span class='muted'>这是你，改密码请用「修改密码」</span>"
                        if u["id"] == user["id"] else "")
             else:
                 mark, who = f"<span class='badge recv'>用户#{u['id']}</span>", "普通用户"
-                ops = (f"<button class='ghost' onclick=\"togglePw({u['id']},this)\" title='查看密码'>👁</button> "
-                       f"<button class='ghost' onclick=\"editRemark({u['id']})\">改备注</button> "
-                       f"<button class='ghost' onclick=\"resetPw({u['id']})\">重设密码</button> "
-                       f"<button class='danger' onclick=\"userDel({u['id']})\">删除用户</button>")
-            urows.append(f"""<div class='file'><div>
+                ops = (f"<button class='ghost sm' onclick=\"togglePw({u['id']},this)\" title='查看密码' aria-label='查看密码'>👁</button> "
+                       f"<button class='ghost sm' onclick=\"editRemark({u['id']})\">改备注</button> "
+                       f"<button class='ghost sm' onclick=\"resetPw({u['id']})\">重设密码</button> "
+                       f"<button class='danger sm' onclick=\"userDel({u['id']})\">删除用户</button>")
+            urows.append(f"""<div class='file stacked'><div>
 {mark}<b>{who}</b> {rmk}
-<div class='muted'>创建于 {htime(u['created'])}</div><div id='urp-{u['id']}'></div><div id='urm-{u['id']}'></div><div id='upw-{u['id']}'></div></div>
-<div style='white-space:nowrap'>{ops}</div></div>""")
-        users_card = f"""<div class='card'><h2>👥 用户管理</h2>
-<p class='muted'>没有注册入口，账号只能由你添加。登录没有用户名：不同的密码就是不同的账号。备注名只给你自己看（比如这个账号给了谁），不影响登录。</p>
+<div class='muted'>创建于 {htime(u['created'])}</div><div class='edit-slot' id='urp-{u['id']}'></div><div class='edit-slot' id='urm-{u['id']}'></div><div class='edit-slot' id='upw-{u['id']}'></div></div>
+<div class='acts'>{ops}</div></div>""")
+        users_card = f"""<div class='card'><div class='card-head'><div><h2>👥 用户管理</h2>
+<p class='muted'>没有注册入口，账号只能由你添加。登录没有用户名：不同的密码就是不同的账号。备注名只给你自己看（比如这个账号给了谁），不影响登录。</p></div></div>
 {''.join(urows)}
-<form id='userAddForm'>
-<input type='password' name='pw1' placeholder='新用户密码（至少4位）' required minlength='4'>
-<input type='password' name='pw2' placeholder='再次输入' required minlength='4'>
-<input type='text' name='remark' placeholder='备注名（可选，如：张三）' maxlength='50'>
+<form id='userAddForm' style='margin-top:12px;border-top:1px solid var(--line);padding-top:12px'>
+<h3>添加用户</h3>
+<div class='row'>
+<input type='password' name='pw1' placeholder='新用户密码（至少4位）' required minlength='4' autocomplete='new-password' aria-label='新用户密码'>
+<input type='password' name='pw2' placeholder='再次输入' required minlength='4' autocomplete='new-password' aria-label='再次输入'>
+</div>
+<input type='text' name='remark' placeholder='备注名（可选，如：张三）' maxlength='50' aria-label='备注名'>
 <button class='ghost' style='width:100%'>添加用户</button></form><div id='userRes'></div></div>
 """
-    return page("控制台", f"""<div class='topbar'><h1>🗂️ 文件分享</h1>
-<div><span class='muted'>{role}</span>　<a href='/logout' class='muted'>退出登录</a></div></div>
-<div class='card'><h2>📤 发送文件</h2>
+    stats = (f"<div class='stats'><div class='stat'><b>{len(shares)}</b><span>有效分享</span></div>"
+             f"<div class='stat'><b>{len(frows)}</b><span>文件</span></div>"
+             f"<div class='stat'><b>{hsize(total_size)}</b><span>文件总大小</span></div></div>")
+    return page("控制台", f"""<header class='topbar'>{brand('h1')}
+<div class='userchip'><span class='who'>{role}</span><a href='/logout' class='btn ghost sm'>{icon('logout')}退出登录</a></div></header>
+{stats}
+<div class='grid2' style='margin-bottom:16px'>
+<div class='card'><div class='card-head'><div><h2>📤 发送文件</h2><p class='muted'>上传后生成分享链接，对方打开即可在线查看或下载。</p></div></div>
 <form id='sendForm'>
-<input type='file' name='file' multiple required>
-<input type='text' name='title' placeholder='备注（可选）' maxlength='100'>
-<div class='row'><select name='expiry'>
-<option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>
-<option value='30'>30 天后过期</option><option value='0'>永久有效</option>
-</select></div>
-<button id='sendBtn'>上传并生成分享链接</button>
-<div id='sendProgWrap' style='display:none'><progress id='sendProg' value='0' max='100'></progress>
+{_drop_zone("name='file' multiple required")}
+<input type='text' name='title' placeholder='备注（可选）' maxlength='100' aria-label='备注'>
+<select name='expiry' aria-label='有效期'>{_EXPIRY_OPTIONS}</select>
+<button id='sendBtn'>{icon('upload')}上传并生成分享链接</button>
+<div id='sendProgWrap' class='prog' style='display:none'><progress id='sendProg' value='0' max='100'></progress>
  <span id='sendPct' class='muted'>0%</span></div>
 <div id='sendStat' class='muted'></div>
 </form><div id='sendRes'></div></div>
-<div class='card'><h2>📥 创建接收链接</h2>
-<p class='muted'>把链接发给对方，对方打开网页上传文件，文件会存到你的服务器上。</p>
+<div class='card'><div class='card-head'><div><h2>📥 创建接收链接</h2>
+<p class='muted'>把链接发给对方，对方打开网页上传文件，文件会存到你的服务器上。</p></div></div>
 <form id='recvForm'>
-<input type='text' name='title' placeholder='备注（可选，如：请小王传合同）' maxlength='100'>
-<select name='expiry'><option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>
-<option value='30'>30 天后过期</option><option value='0'>永久有效</option></select>
-<button>生成接收链接</button></form><div id='recvRes'></div></div>
-<div class='card'><h2>{share_title}</h2>{lst}</div>
-<div class='card'><h2>{file_title}</h2>
-<p class='muted'>{filehint}</p>
+<input type='text' name='title' placeholder='备注（可选，如：请小王传合同）' maxlength='100' aria-label='备注'>
+<select name='expiry' aria-label='有效期'>{_EXPIRY_OPTIONS}</select>
+<button>{icon('open')}生成接收链接</button></form><div id='recvRes'></div></div>
+</div>
+<div class='card'><div class='card-head'><h2>{share_title}</h2><span class='muted'>{len(shares)} 个</span></div>{lst}</div>
+<div class='card'><div class='card-head'><div><h2>{file_title}</h2>
+<p class='muted'>{filehint}</p></div></div>
+{tools}
 {flist}
-{fileops}<div id='fileRes'></div></div>
-{users_card}<div class='card'><h2>🔑 修改密码</h2>
+<div id='fileRes'></div></div>
+<div class='grid2'>{users_card}<div class='card'><h2>🔑 修改密码</h2>
+<p class='muted'>修改后，其他设备上的登录会失效。</p>
 <form id='pwForm'>
-<input type='password' name='new1' placeholder='新密码' required minlength='4'>
-<input type='password' name='new2' placeholder='重复新密码' required minlength='4'>
-<button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div>
+<input type='password' name='new1' placeholder='新密码' required minlength='4' autocomplete='new-password' aria-label='新密码'>
+<input type='password' name='new2' placeholder='重复新密码' required minlength='4' autocomplete='new-password' aria-label='重复新密码'>
+<button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div></div>
 <script>
-""" + CHUNK_JS + f"""
+""" + CHUNK_JS + UI_JS + DASH_JS + f"""
 var _UPW={upw_json};
 var PUBLIC_BASE = {pub_js};
 function fullLink(p){{
@@ -1416,7 +1679,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   var files=form.querySelector("input[type=file]").files;
   if(!files.length) return;
   res.innerHTML=''; btn.disabled=true;
-  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  wrap.style.display='flex'; prog.value=0; pct.textContent='0%';
   stat.textContent='创建分享…';
   var title=form.querySelector("input[name=title]").value,
       expiry=form.querySelector("select[name=expiry]").value,
@@ -1434,7 +1697,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   }})
   .then(function(link){{
     prog.value=100; pct.textContent='100%';
-    stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
+    stat.innerHTML="<b style='color:var(--ok)'>上传完成 ✅</b>";
     res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+fullLink(link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
     setTimeout(()=>location.reload(), 1500);
   }})
@@ -1599,54 +1862,265 @@ if(_uaf){{_uaf.addEventListener('submit', function(ev){{
 }});}}
 </script>{disk_foot()}""")
 
+# 上传区域的小交互：显示已选文件名/总大小、拖拽高亮。三个上传入口共用。
+UI_JS = r"""
+function fmtSize(n){var u=['B','KB','MB','GB','TB'],i=0;n=+n||0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return i?n.toFixed(1)+u[i]:n+'B';}
+function bindDrop(input){
+  var zone=input.closest('.drop'); if(!zone) return;
+  var label=zone.querySelector('.drop-files');
+  function show(){
+    var fs=input.files||[], n=fs.length, t=0, names=[], i;
+    for(i=0;i<n;i++){t+=fs[i].size; if(i<3) names.push(fs[i].name);}
+    zone.classList.toggle('has', n>0);
+    label.textContent=n?('已选择 '+n+' 个文件（'+fmtSize(t)+'）：'+names.join('、')+(n>3?' 等':'')):'';
+  }
+  input.addEventListener('change', show);
+  ['dragenter','dragover'].forEach(function(t){zone.addEventListener(t,function(){zone.classList.add('over');});});
+  ['dragleave','drop'].forEach(function(t){zone.addEventListener(t,function(){zone.classList.remove('over');setTimeout(show,0);});});
+  if(input.form) input.form.addEventListener('reset', function(){setTimeout(show,0);});
+}
+Array.prototype.forEach.call(document.querySelectorAll('.drop input[type=file]'), bindDrop);
+"""
+
+# 控制台“全部文件”的本地搜索（只过滤已渲染的行，不发请求）。
+DASH_JS = r"""
+(function(){
+  var q=document.getElementById('fileSearch'); if(!q) return;
+  q.addEventListener('input', function(){
+    var v=q.value.trim().toLocaleLowerCase(), rows=document.querySelectorAll('#fileTable .frow'), shown=0, i;
+    for(i=0;i<rows.length;i++){
+      var hit=!v||rows[i].textContent.toLocaleLowerCase().indexOf(v)>=0;
+      rows[i].style.display=hit?'':'none'; if(hit) shown++;
+    }
+    document.getElementById('fileNoMatch').hidden=shown>0;
+  });
+})();
+"""
+
+# 分享页“查看”：页面上不预先加载任何媒体，点了“查看”才在弹层里创建
+# 图片/视频/音频/PDF/文本预览元素。Esc 或返回键关闭，左右键切换文件。
+PREVIEW_JS = r"""
+(function(){
+  var items=Array.prototype.slice.call(document.querySelectorAll('.btn-view'));
+  var pv=document.getElementById('pv'); if(!pv||!items.length) return;
+  var stage=document.getElementById('pvStage'), nameEl=document.getElementById('pvName'),
+      metaEl=document.getElementById('pvMeta'), openA=document.getElementById('pvOpen'),
+      dlA=document.getElementById('pvDl'), closeB=document.getElementById('pvClose'),
+      prevB=document.getElementById('pvPrev'), nextB=document.getElementById('pvNext'),
+      countEl=document.getElementById('pvCount');
+  var cur=-1, pushed=false, lastFocus=null, token=0, TEXT_LIMIT=1024*1024, tx=null;
+  function el(tag, cls, text){var e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e;}
+  function clear(){
+    token++;
+    var m=stage.querySelectorAll('video,audio'), i;
+    for(i=0;i<m.length;i++){try{m[i].pause();}catch(e){} m[i].removeAttribute('src'); try{m[i].load();}catch(e){}}
+    stage.classList.remove('zoom'); stage.textContent='';
+  }
+  function spinner(){var s=el('div','pv-spin'); s.setAttribute('role','status'); s.setAttribute('aria-label','加载中'); stage.appendChild(s); return s;}
+  function fail(text){
+    stage.textContent='';
+    var box=el('div','pv-msg'); box.appendChild(el('div','',text));
+    var a=el('a','btn','下载文件'); a.href=items[cur].dataset.dl; a.setAttribute('download',''); box.appendChild(a);
+    var o=el('a','btn ghost','新窗口打开'); o.href=items[cur].dataset.src; o.target='_blank'; o.rel='noopener'; box.appendChild(o);
+    stage.appendChild(box);
+  }
+  function decode(buf, truncated){
+    var u8=new Uint8Array(buf);
+    try{return new TextDecoder('utf-8',{fatal:true}).decode(u8,{stream:truncated});}catch(e){}
+    try{return new TextDecoder('gb18030').decode(u8);}catch(e){}
+    return new TextDecoder('utf-8').decode(u8);
+  }
+  function render(i){
+    clear(); cur=i;
+    var b=items[i], kind=b.dataset.kind, src=b.dataset.src, name=b.dataset.name, my=token;
+    nameEl.textContent=name; metaEl.textContent=b.dataset.meta||'';
+    openA.href=src; dlA.href=b.dataset.dl;
+    prevB.hidden=nextB.hidden=items.length<2;
+    countEl.textContent=items.length>1?(i+1)+' / '+items.length:'';
+    pv.setAttribute('data-kind', kind);
+    if(kind==='img'){
+      var sp=spinner(), img=new Image();
+      img.alt=name; img.decoding='async';
+      img.onload=function(){if(my!==token)return; sp.remove(); stage.appendChild(img);};
+      img.onerror=function(){if(my!==token)return; fail('图片加载失败，可以下载后查看。');};
+      img.addEventListener('click', function(){stage.classList.toggle('zoom');});
+      img.src=src;
+    }else if(kind==='vid'){
+      var v=document.createElement('video');
+      v.controls=true; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+      v.preload='metadata';
+      v.onerror=function(){if(my!==token)return; fail('浏览器无法播放这个视频格式（常见于 MKV/AVI/HEVC），可以下载后用播放器打开。');};
+      v.src=src; stage.appendChild(v);
+      var p=v.play(); if(p&&p.catch) p.catch(function(){});
+    }else if(kind==='aud'){
+      var box=el('div','pv-audio');
+      box.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+      box.appendChild(el('div','',name));
+      var a=document.createElement('audio'); a.controls=true; a.preload='metadata';
+      a.onerror=function(){if(my!==token)return; fail('浏览器无法播放这个音频格式，可以下载后播放。');};
+      a.src=src; box.appendChild(a); stage.appendChild(box);
+      var pa=a.play(); if(pa&&pa.catch) pa.catch(function(){});
+    }else if(kind==='pdf'){
+      if(navigator.pdfViewerEnabled===false||(navigator.pdfViewerEnabled===undefined&&/Android|iPhone|iPad|Mobile/i.test(navigator.userAgent))){
+        fail('这个浏览器不能在页面内显示 PDF，请点“新窗口打开”或下载。');
+      }else{
+        var f=document.createElement('iframe'); f.title=name; f.src=src; stage.appendChild(f);
+      }
+    }else if(kind==='txt'){
+      var sp2=spinner();
+      fetch(src,{headers:{'Range':'bytes=0-'+(TEXT_LIMIT-1)}}).then(function(r){
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        var total=0, cr=r.headers.get('Content-Range');
+        if(cr){var m=/\/(\d+)$/.exec(cr); if(m) total=+m[1];}
+        return r.arrayBuffer().then(function(buf){return {buf:buf,total:total};});
+      }).then(function(x){
+        if(my!==token) return;
+        var cut=x.total>x.buf.byteLength;
+        sp2.remove();
+        var pre=el('pre','', decode(x.buf, cut)+(cut?'\n\n…… 文件较大，只显示前 1MB，完整内容请下载。':''));
+        pre.tabIndex=0; stage.appendChild(pre);
+      }).catch(function(){if(my!==token)return; fail('文本加载失败，可以下载后查看。');});
+    }else{
+      fail('这个文件不支持在线查看。');
+    }
+  }
+  function focusables(){return Array.prototype.filter.call(pv.querySelectorAll('a[href],button,video,audio,iframe,pre'),function(e){return !e.hidden&&e.offsetParent!==null;});}
+  function open(i){
+    lastFocus=document.activeElement;
+    pv.hidden=false; document.documentElement.classList.add('pv-lock');
+    render(i);
+    if(!pushed){try{history.pushState({pv:1},''); pushed=true;}catch(e){}}
+    closeB.focus();
+  }
+  function hide(){
+    clear(); cur=-1; pv.hidden=true; document.documentElement.classList.remove('pv-lock');
+    if(lastFocus&&lastFocus.focus) lastFocus.focus();
+  }
+  function close(){ if(pushed){history.back();} else {hide();} }
+  function step(d){ if(items.length>1&&cur>=0) render((cur+d+items.length)%items.length); }
+  window.addEventListener('popstate', function(){ if(pushed){pushed=false; hide();} });
+  items.forEach(function(b,i){ b.addEventListener('click', function(ev){ev.preventDefault(); open(i);}); });
+  closeB.addEventListener('click', close);
+  prevB.addEventListener('click', function(){step(-1);});
+  nextB.addEventListener('click', function(){step(1);});
+  stage.addEventListener('click', function(ev){ if(ev.target===stage) close(); });
+  document.addEventListener('keydown', function(ev){
+    if(pv.hidden) return;
+    if(ev.key==='Escape'){ev.preventDefault(); close(); return;}
+    var t=ev.target&&ev.target.tagName;
+    if(t!=='VIDEO'&&t!=='AUDIO'&&t!=='PRE'){
+      if(ev.key==='ArrowLeft'){ev.preventDefault(); step(-1); return;}
+      if(ev.key==='ArrowRight'){ev.preventDefault(); step(1); return;}
+    }
+    if(ev.key==='Tab'){
+      var f=focusables(); if(!f.length) return;
+      var first=f[0], last=f[f.length-1];
+      if(ev.shiftKey&&document.activeElement===first){ev.preventDefault(); last.focus();}
+      else if(!ev.shiftKey&&document.activeElement===last){ev.preventDefault(); first.focus();}
+    }
+  });
+  stage.addEventListener('touchstart', function(e){ tx=(e.touches.length===1&&pv.getAttribute('data-kind')==='img'&&!stage.classList.contains('zoom'))?e.touches[0].clientX:null; }, {passive:true});
+  stage.addEventListener('touchend', function(e){ if(tx===null) return; var dx=e.changedTouches[0].clientX-tx; tx=null; if(Math.abs(dx)>50) step(dx<0?1:-1); });
+})();
+"""
+
 # 能安全在线查看的文件类型（按扩展名判断）。
 # svg 故意不算图片：内联打开时 SVG 里的脚本会在本站域名下执行，有风险，只给下载。
-# pdf 单独一种：浏览器自带的 PDF 阅读器打开是安全的（不会执行页面脚本），
-# 所以给"查看"按钮；但分享列表里不内联嵌入（整文件嵌进去太重），只给按钮。
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# html 同理只给下载。pdf：浏览器自带的 PDF 阅读器打开是安全的（不会执行页面脚本）。
+# 文本：按 text/plain 返回，由页面脚本读出来放进 <pre> 里显示，不会被当成网页执行。
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"}
 VID_EXTS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv"}
+AUD_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".oga", ".opus"}
 PDF_EXTS = {".pdf"}
+TXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml",
+            ".ini", ".conf", ".cfg", ".toml", ".srt", ".vtt", ".lrc", ".py", ".js", ".ts",
+            ".css", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".java", ".go",
+            ".rs", ".rb", ".php", ".sql", ".diff", ".patch"}
+TEXT_PREVIEW_LIMIT = 1024 * 1024
 
 def _view_kind(filename):
-    """返回 'img' / 'vid' / 'pdf'，不能在线查看的返回 None。"""
+    """返回 'img' / 'vid' / 'aud' / 'pdf' / 'txt'，不能在线查看的返回 None。"""
     ext = os.path.splitext(filename)[1].lower()
     if ext in IMG_EXTS:
         return "img"
     if ext in VID_EXTS:
         return "vid"
+    if ext in AUD_EXTS:
+        return "aud"
     if ext in PDF_EXTS:
         return "pdf"
+    if ext in TXT_EXTS:
+        return "txt"
     return None
+
+_KIND_ICON = {"img": "image", "vid": "film", "aud": "music", "pdf": "file", "txt": "text"}
+
+def _preview_modal():
+    return f"""<div class='pv' id='pv' hidden role='dialog' aria-modal='true' aria-labelledby='pvName'>
+<div class='pv-bar'><div class='pv-title'><div class='pv-name' id='pvName'></div><div class='pv-meta' id='pvMeta'></div></div>
+<a class='btn pv-btn' id='pvOpen' href='#' target='_blank' rel='noopener' title='在新窗口打开'>{icon('external')}<span class='lbl'>新窗口</span></a>
+<a class='btn pv-btn' id='pvDl' href='#' download title='下载'>{icon('download')}<span class='lbl'>下载</span></a>
+<button type='button' class='pv-btn icon-only' id='pvClose' aria-label='关闭预览（Esc）' title='关闭（Esc）'>{icon('x')}</button></div>
+<div class='pv-body'><div class='pv-stage' id='pvStage'></div>
+<button type='button' class='pv-nav pv-prev' id='pvPrev' aria-label='上一个'>{icon('left')}</button>
+<button type='button' class='pv-nav pv-next' id='pvNext' aria-label='下一个'>{icon('right')}</button>
+<div class='pv-count' id='pvCount'></div></div></div>"""
+
+def _looks_utf8(path):
+    """文本预览的编码判断：开头 64KB 是合法 UTF-8 就声明 utf-8，否则不声明，让浏览器自己猜。"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return False
+    try:
+        data.decode("utf-8")
+        return True
+    except UnicodeDecodeError as e:
+        # 只是在 64KB 边界切断了一个多字节字符
+        return len(data) == 65536 and e.start >= len(data) - 3
 
 def share_page(sid, share, files, user=None):
     # user 能管理这个分享（本人或管理员）时，页面上可以追加和删除文件
     manage = user is not None and can_manage_share(user, share)
     rows = []
     pinned_flags = [bool(dict(f).get("pinned", 0)) for f in files]
+    total = 0
     for index, f in enumerate(files):
+        fd = dict(f)
+        total += fd.get("size") or 0
         name = html.escape(f["filename"])
         kind = _view_kind(f["filename"])
-        # 图片和视频都不在页面里直接内联显示：之前 <img> 会让浏览器打开分享页
-        # 就自动下载显示所有图片；<video> 即使 preload='none' 也会渲染出播放器。
-        # 没点"查看"就不加载任何媒体内容，只留"查看"按钮，点了才看。
-        media = ""
-        view_btn = (f"<a href='/s/{sid}/v/{f['id']}' target='_blank'>"
-                    "<button class='ghost'>查看</button></a> " if kind else "")
-        del_btn = (f"<button class='ghost' onclick='delShareFile({f['id']},this)'>删除</button> "
-                   if manage else "")
-        badge = " <span class='badge'>📌 置顶</span>" if pinned_flags[index] else ""
-        order_btns = ""
+        ext = os.path.splitext(f["filename"])[1][1:5]
+        meta = hsize(fd.get("size")) + (f" · {htime(fd['created'])}" if fd.get("created") else "")
+        dl = f"/s/{sid}/f/{f['id']}"
+        # 图片和视频都不在页面里直接内联显示：没点"查看"就不加载任何媒体内容。
+        # 点"查看"由 PREVIEW_JS 在弹层里创建预览元素。
+        view_btn = ""
+        if kind:
+            view_btn = (f"<button type='button' class='btn-view' data-kind='{kind}' "
+                        f"data-src='/s/{sid}/v/{f['id']}' data-dl='{dl}' data-name='{name}' "
+                        f"data-meta='{html.escape(meta)}' aria-label='查看 {name}'>"
+                        f"{icon('play' if kind in ('vid', 'aud') else 'eye')}查看</button>")
+        dl_cls = "btn ghost" if kind else "btn"
+        dl_btn = (f"<a class='{dl_cls}' href='{dl}' download aria-label='下载 {name}'>"
+                  f"{icon('download')}下载</a>")
+        badge = " <span class='badge pin'>📌 置顶</span>" if pinned_flags[index] else ""
+        tile = (f"<div class='ftile k-{kind or 'other'}' aria-hidden='true'>"
+                f"{icon(_KIND_ICON.get(kind, 'file'))}<span>{html.escape(ext)}</span></div>")
+        manage_row = ""
         if manage:
             action, label = ("unpin", "取消置顶") if pinned_flags[index] else ("pin", "置顶")
             up_disabled = " disabled" if index == 0 or pinned_flags[index-1] != pinned_flags[index] else ""
             down_disabled = " disabled" if index == len(files)-1 or pinned_flags[index+1] != pinned_flags[index] else ""
-            order_btns = f"""<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px'>
-<button class='ghost order-btn'{up_disabled} onclick='arrangeFile({f['id']},"up")' aria-label='上移 {name}'>↑ 上移</button>
-<button class='ghost order-btn'{down_disabled} onclick='arrangeFile({f['id']},"down")' aria-label='下移 {name}'>↓ 下移</button>
-<button class='ghost order-btn' onclick='arrangeFile({f['id']},"{action}")'>{label}</button></div>"""
-        rows.append(f"""<div class='file' id='file-{f['id']}' style='display:block'>{media}<div>📄 {name}{badge}
-<div class='muted'>{hsize(f['size'])}</div></div>
-<div style='margin-top:6px'>{view_btn}{del_btn}<a href='/s/{sid}/f/{f['id']}'><button class='ghost'>下载</button></a></div>{order_btns}</div>""")
+            manage_row = f"""<div class='sf-manage'>
+<button class='ghost sm order-btn'{up_disabled} onclick='arrangeFile({f['id']},"up")' aria-label='上移 {name}'>{icon('up')}上移</button>
+<button class='ghost sm order-btn'{down_disabled} onclick='arrangeFile({f['id']},"down")' aria-label='下移 {name}'>{icon('down')}下移</button>
+<button class='ghost sm order-btn' onclick='arrangeFile({f['id']},"{action}")'>{icon('pin')}{label}</button>
+<button class='danger sm' onclick='delShareFile({f['id']},this)'>{icon('trash')}删除</button></div>"""
+        rows.append(f"""<div class='sf' id='file-{f['id']}'><div class='sf-main'>{tile}
+<div class='sf-info'><div class='sf-name'>{name}{badge}</div><div class='muted sf-meta'>{meta}</div></div></div>
+<div class='sf-acts'>{view_btn}{dl_btn}</div>{manage_row}</div>""")
     add_form = ""
     if manage:
         candidates = []
@@ -1661,17 +2135,17 @@ def share_page(sid, share, files, user=None):
                               "</span></label>")
         existing_picker = ("""<details><summary>从全部文件中添加</summary>
 <p class='muted'>选择已上传的文件，原分享中的文件仍会保留。</p>
-<input id='existingSearch' type='search' placeholder='搜索文件名'>
+<input id='existingSearch' type='search' placeholder='搜索文件名' aria-label='搜索文件名'>
 <div id='existingList' style='max-height:300px;overflow:auto'>""" +
                            "".join(candidates) + """</div>
-<button id='existingBtn' class='ghost' type='button'>添加选中文件</button>
-<div id='existingRes'></div></details>""" if candidates else
-                           "<p class='muted'>全部文件中暂无其他可添加的文件</p>")
-        add_form = ("""<div class='card' style='max-width:560px;margin:16px auto'>
-<h3>➕ 添加文件</h3>
-<form id='addForm'><input type='file' name='file' multiple required>
-<button id='addBtn'>上传</button>
-<div id='addProgWrap' style='display:none'><progress id='addProg' value='0' max='100'></progress>
+<button id='existingBtn' class='ghost block' type='button'>添加选中文件</button>
+<div id='existingRes' class='muted'></div></details>""" if candidates else
+                           "<p class='muted' style='margin-top:12px'>全部文件中暂无其他可添加的文件</p>")
+        add_form = ("""<div class='card'>
+<h2>➕ 添加文件</h2><p class='muted'>只有你（分享者或管理员）能看到这一块。</p>
+<form id='addForm'>""" + _drop_zone("name='file' multiple required") + """
+<button id='addBtn'>""" + icon('upload') + """上传</button>
+<div id='addProgWrap' class='prog' style='display:none'><progress id='addProg' value='0' max='100'></progress>
  <span id='addPct' class='muted'>0%</span></div>
 <div id='addStat' class='muted'></div></form>
 <div id='addRes'></div>""" + existing_picker + """</div>
@@ -1711,7 +2185,7 @@ function delShareFile(fid, el){
   })
   .catch(function(){ el.disabled = false; alert('请求失败'); });
 }
-""" + CHUNK_JS + """
+""" + CHUNK_JS + UI_JS + """
 var existingSearch=document.getElementById('existingSearch');
 if(existingSearch){
   existingSearch.addEventListener('input',function(){
@@ -1747,14 +2221,14 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
   var files=ev.target.querySelector("input[type=file]").files;
   if(!files.length) return;
   res.innerHTML=''; btn.disabled=true;
-  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  wrap.style.display='flex'; prog.value=0; pct.textContent='0%';
   stat.textContent='准备上传…';
   // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
   // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
   chunkUpload({sid:'""" + sid + """', kind:'add'}, files,
     {prog:prog, pct:pct, stat:stat}).then(function(){
       prog.value=100; pct.textContent='100%';
-      stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
+      stat.innerHTML="<b style='color:var(--ok)'>上传完成 ✅</b>";
       setTimeout(function(){location.reload();}, 900);
     }).catch(function(err){
       btn.disabled=false; stat.textContent='';
@@ -1762,54 +2236,70 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
     });
 });
 </script>""")
-    return page("下载文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
-<h1>📥 {html.escape(share['title'] or '文件分享')}</h1>
-<p class='muted'>共 {len(files)} 个文件 · 到期：{htime(share['expires'])}</p>
-{"<p class='muted'>置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。</p><div id='orderStatus' role='status' aria-live='polite'></div>" if manage else ""}
-{''.join(rows) if rows else "<p class='muted'>📭 文件都被删除啦</p>"}
-</div>{add_form}""")
+    title = html.escape(share['title'] or '文件分享')
+    manage_note = ("<div class='note'>你是这个分享的管理者：可以调整顺序、置顶、删除或添加文件。"
+                   "置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。</div>"
+                   "<div id='orderStatus' class='muted' role='status' aria-live='polite' style='margin-top:6px'></div>"
+                   if manage else "")
+    listing = ("".join(rows) if rows else
+               "<div class='empty'><span class='big'>📭</span>文件都被删除啦</div>")
+    preview = (_preview_modal() + "<script>" + PREVIEW_JS + "</script>") if rows else ""
+    return page("下载文件", f"""<div class='card'><div class='hero'><div class='logo' aria-hidden='true'>📦</div>
+<div style='min-width:0'><h1>{title}</h1>
+<div class='chips'><span class='chip'>共 <b>{len(files)}</b> 个文件</span><span class='chip'>{hsize(total)}</span>
+<span class='chip'>到期：<b>{htime(share['expires'])}</b></span></div></div></div>{manage_note}</div>
+<div class='card' style='padding-top:6px;padding-bottom:6px'>{listing}</div>
+{add_form}{preview}
+<p class='foot'>图片、视频、音频、PDF 和文本可点「查看」在线预览，其他文件请下载。</p>""")
 
 def receive_page(sid, share):
     limit, _ = upload_limit()
     up_script = ("""<script>
-""" + CHUNK_JS + """
+""" + CHUNK_JS + UI_JS + """
 document.getElementById('upForm').addEventListener('submit', function(ev){
   ev.preventDefault();
-  var res=document.getElementById('res'), prog=document.getElementById('prog'),
+  var form=ev.target, res=document.getElementById('res'), prog=document.getElementById('prog'),
       pct=document.getElementById('upPct'), stat=document.getElementById('upStat'),
       btn=document.getElementById('upBtn'), wrap=document.getElementById('upProgWrap');
-  var files=ev.target.querySelector("input[type=file]").files;
+  var files=form.querySelector("input[type=file]").files;
   if(!files.length) return;
   res.innerHTML=''; btn.disabled=true;
-  wrap.style.display='block'; prog.value=0; pct.textContent='0%';
+  wrap.style.display='flex'; prog.value=0; pct.textContent='0%';
   stat.textContent='准备上传…';
   // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
   // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
   chunkUpload({sid:'""" + sid + """', kind:'upload'}, files,
     {prog:prog, pct:pct, stat:stat}).then(function(){
       prog.value=100; pct.textContent='100%';
-      stat.innerHTML="<b style='color:#389e0d'>上传完成 ✅</b>";
-      res.innerHTML="<div class='ok'>上传成功，对方已可收到 ✅</div>";
+      stat.innerHTML="<b style='color:var(--ok)'>上传完成 ✅</b>";
+      res.innerHTML="<div class='ok'>上传成功，对方已可收到 ✅ 还可以继续选择文件上传。</div>";
+      btn.disabled=false; form.reset();
     }).catch(function(err){
       btn.disabled=false; stat.textContent='';
       res.innerHTML="<div class='err'>"+escapeHtml(err.message||'上传失败')+"</div>";
     });
 });
 </script>""")
-    return page("上传文件", f"""<div class='card' style='max-width:560px;margin:30px auto'>
-<h1>📤 {html.escape(share['title'] or '文件接收')}</h1>
-<p class='muted'>选择文件上传，上传完成后对方即可收到。到期：{htime(share['expires'])}</p>
-<p class='muted'>📦最大可上传 <b>{hsize(limit)}</b>文件</p>
-<form id='upForm'><input type='file' name='file' multiple required>
-<button id='upBtn'>开始上传</button>
-<div id='upProgWrap' style='display:none'><progress id='prog' value='0' max='100'></progress>
+    return page("上传文件", f"""<div class='card'><div class='hero'><div class='logo' aria-hidden='true'>📤</div>
+<div style='min-width:0'><h1>{html.escape(share['title'] or '文件接收')}</h1>
+<p class='muted' style='margin:0 0 8px'>选择文件上传，上传完成后对方即可收到。</p>
+<div class='chips'><span class='chip'>📦最大可上传 <b>{hsize(limit)}</b>文件</span>
+<span class='chip'>到期：<b>{htime(share['expires'])}</b></span></div></div></div>
+<form id='upForm' style='margin-top:16px'>{_drop_zone("name='file' multiple required")}
+<button id='upBtn'>{icon('upload')}开始上传</button>
+<div id='upProgWrap' class='prog' style='display:none'><progress id='prog' value='0' max='100'></progress>
  <span id='upPct' class='muted'>0%</span></div>
 <div id='upStat' class='muted'></div></form>
 <div id='res'></div></div>
 """ + up_script)
 
 def not_found():
-    return page("不存在", "<div class='card' style='max-width:420px;margin:40px auto'><h1>😅 链接不存在或已过期</h1><p class='muted'>请检查链接是否正确，或联系分享者。</p></div>")
+    return page("不存在", "<div class='auth'><div class='card empty'><span class='big'>😅</span>"
+                "<h1>链接不存在或已过期</h1><p class='muted'>请检查链接是否正确，或联系分享者。</p></div></div>", "sm")
+
+def error_page():
+    return page("出错", "<div class='auth'><div class='card empty'><span class='big'>😵</span>"
+                "<h1>出错了</h1><p class='muted'>服务器处理请求时出错，请稍后重试。</p></div></div>", "sm")
 
 # ---------------- HTTP 服务 ----------------
 class Handler(BaseHTTPRequestHandler):
@@ -2105,8 +2595,13 @@ class Handler(BaseHTTPRequestHandler):
         """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。"""
         size = os.path.getsize(path)
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        if ctype.split("/")[0] not in ("image", "video") and ctype != "application/pdf":
-            # 非图片/视频/PDF：不内联，退回普通下载（防 MIME 混淆）。
+        text_view = _view_kind(filename) == "txt"
+        if text_view:
+            # 文本预览一律按 text/plain 返回（加 CSP sandbox），浏览器只会当纯文本显示。
+            ctype = "text/plain; charset=utf-8" if _looks_utf8(path) else "text/plain"
+        elif (ctype.split("/")[0] not in ("image", "video", "audio")
+              and ctype != "application/pdf"):
+            # 非图片/视频/音频/PDF/文本：不内联，退回普通下载（防 MIME 混淆）。
             # PDF 例外：浏览器用自带阅读器渲染，不会执行页面脚本，安全。
             return self._send_file(path, filename)
         start, end, status = 0, size - 1, 200
@@ -2140,6 +2635,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", "inline")
         # 防 MIME 嗅探：浏览器只能按声明的 Content-Type 处理
         self.send_header("X-Content-Type-Options", "nosniff")
+        if text_view:
+            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
         self.end_headers()
         if getattr(self, "_head_only", False):
             return
@@ -2312,7 +2809,7 @@ class Handler(BaseHTTPRequestHandler):
             # 出错时请求体不一定读完了，关连接防污染同一连接的下一个请求
             self.close_connection = True
             try:
-                self._send(500, page("出错", "<div class='card'><h1>😵 出错了</h1></div>"))
+                self._send(500, error_page())
             except Exception:
                 pass
 

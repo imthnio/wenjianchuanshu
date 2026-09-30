@@ -1394,7 +1394,11 @@ class Connectivity(unittest.TestCase):
         self.assertIsNone(app._view_kind("x.svg"))
         self.assertEqual(app._view_kind("x.PNG"), "img")
         self.assertEqual(app._view_kind("x.Mp4"), "vid")
-        self.assertIsNone(app._view_kind("x.txt"))
+        # 文本可以预览（按 text/plain 返回）；网页文件仍然只能下载
+        self.assertEqual(app._view_kind("x.txt"), "txt")
+        self.assertEqual(app._view_kind("x.MP3"), "aud")
+        self.assertIsNone(app._view_kind("x.html"))
+        self.assertIsNone(app._view_kind("x.htm"))
 
     def test_inline_view_image_200_and_headers(self):
         app.create_user("pw123456", is_admin=True)
@@ -1440,10 +1444,10 @@ class Connectivity(unittest.TestCase):
 
     def test_inline_view_nonmedia_falls_back_to_download(self):
         app.create_user("pw123456", is_admin=True)
-        # /v/ 指向非图片/视频：退回 attachment 下载，防 MIME 混淆
+        # /v/ 指向不能预览的类型（网页）：退回 attachment 下载，防 MIME 混淆
         data = b"hello"
         with self.server("127.0.0.1") as port:
-            sid, (fid,) = self._mkview_share([("c.txt", data)])
+            sid, (fid,) = self._mkview_share([("c.html", data)])
             s, h, body = self._vget(port, f"/s/{sid}/v/{fid}")
             self.assertEqual(s, 200)
             self.assertTrue(h.get("Content-Disposition", "").startswith("attachment"))
@@ -1471,7 +1475,7 @@ class Connectivity(unittest.TestCase):
         share = {"title": "t", "expires": 0}
         files = [{"id": 1, "filename": "a.png", "size": 10},
                  {"id": 2, "filename": "b.mp4", "size": 20},
-                 {"id": 3, "filename": "c.txt", "size": 5}]
+                 {"id": 3, "filename": "c.zip", "size": 5}]
         body = app.share_page(sid, share, files).decode("utf-8")
         # 图片和视频都不在页面里直接内联显示：没点"查看"就不加载，
         # 只留查看按钮
@@ -1480,7 +1484,7 @@ class Connectivity(unittest.TestCase):
         self.assertIn(f"/s/{sid}/v/1", body)
         self.assertIn(f"/s/{sid}/v/2", body)
         self.assertIn("查看", body)
-        # txt 没有查看入口，但下载链接还在
+        # zip 没有查看入口，但下载链接还在
         self.assertNotIn(f"/s/{sid}/v/3", body)
         self.assertIn(f"/s/{sid}/f/3", body)
 
@@ -1932,11 +1936,11 @@ run();
             self.assertEqual(r.status, 206)
             self.assertEqual(data, pdf[:100])
 
-    def test_txt_view_still_forces_download(self):
-        # 非图片/视频/PDF（比如 txt）走查看接口仍强制下载：防 MIME 混淆，原有行为不变
+    def test_html_view_still_forces_download(self):
+        # 不能预览的类型（比如 html）走查看接口仍强制下载：防 MIME 混淆，原有行为不变
         with self.server("127.0.0.1") as port:
             cookie = self._login_cookie(port, "pdf3_admin")
-            sid = self._upload_share(port, cookie, "note.txt", b"hello", "text/plain")
+            sid = self._upload_share(port, cookie, "note.html", b"<script>x</script>", "text/html")
             with app.db() as c:
                 fid = c.execute("SELECT id FROM files WHERE share_id=?", (sid,)).fetchone()["id"]
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -1946,12 +1950,49 @@ run();
             c.close()
             self.assertEqual(r.status, 200)
             self.assertIn("attachment", r.getheader("Content-Disposition"))
-            # 分享页上 txt 没有查看按钮
+            # 分享页上 html 没有查看按钮
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("GET", f"/s/{sid}")
             page = c.getresponse().read().decode("utf-8")
             c.close()
             self.assertNotIn("查看</button>", page)
+
+    def test_text_and_audio_preview_inline(self):
+        # 文本预览：按 text/plain 内联返回（带 sandbox CSP，不会当网页执行），支持 Range；
+        # 音频：audio/* 内联返回。分享页两者都有“查看”按钮。
+        with self.server("127.0.0.1") as port:
+            cookie = self._login_cookie(port, "txt_admin")
+            text = "第一行 hello\n第二行".encode("utf-8")
+            sid = self._upload_share(port, cookie, "说明.txt", text, "text/plain")
+            with app.db() as c:
+                fid = c.execute("SELECT id FROM files WHERE share_id=?", (sid,)).fetchone()["id"]
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}")
+            self.assertEqual(s, 200)
+            self.assertEqual(h.get("Content-Type"), "text/plain; charset=utf-8")
+            self.assertTrue(h.get("Content-Disposition", "").startswith("inline"))
+            self.assertIn("sandbox", h.get("Content-Security-Policy", ""))
+            self.assertEqual(h.get("X-Content-Type-Options"), "nosniff")
+            self.assertEqual(body, text)
+            s, h, body = self._vget(port, f"/s/{sid}/v/{fid}", {"Range": "bytes=0-5"})
+            self.assertEqual(s, 206)
+            self.assertEqual(body, text[:6])
+            s, _, page = self._vget(port, f"/s/{sid}")
+            self.assertIn("data-kind='txt'", page.decode("utf-8"))
+            self.assertIn("查看</button>", page.decode("utf-8"))
+            gbk = "中文".encode("gbk")
+            sid2 = self._upload_share(port, cookie, "gbk.log", gbk, "text/plain")
+            with app.db() as c:
+                fid2 = c.execute("SELECT id FROM files WHERE share_id=?", (sid2,)).fetchone()["id"]
+            s, h, body = self._vget(port, f"/s/{sid2}/v/{fid2}")
+            self.assertEqual(h.get("Content-Type"), "text/plain")
+            self.assertEqual(body, gbk)
+            sid3 = self._upload_share(port, cookie, "a.mp3", b"ID3" + b"x" * 100, "audio/mpeg")
+            with app.db() as c:
+                fid3 = c.execute("SELECT id FROM files WHERE share_id=?", (sid3,)).fetchone()["id"]
+            s, h, _ = self._vget(port, f"/s/{sid3}/v/{fid3}")
+            self.assertEqual(s, 200)
+            self.assertEqual(h.get("Content-Type"), "audio/mpeg")
+            self.assertTrue(h.get("Content-Disposition", "").startswith("inline"))
 
     # ---- 备注名 ----
     def test_user_remark_add_set_and_list(self):
