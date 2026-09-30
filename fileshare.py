@@ -860,8 +860,15 @@ def _clean_filename(fn):
     # 去掉双向文本控制符（RLO 等）：接收链接是匿名上传，"发票\u202egnp.exe"
     # 在页面上会显示成"发票exe.png"，把可执行文件伪装成图片骗人下载。
     fn = re.sub("[\u202a-\u202e\u2066-\u2069]", "", fn)
-    fn = os.path.basename(fn.replace("\\", "/")).strip() or "unnamed"
-    return fn[:200]
+    fn = os.path.basename(fn.replace("\\", "/")).strip()
+    if fn in ("", ".", ".."):
+        fn = "unnamed"
+    if len(fn) > 200:
+        # 超长文件名截断时保留扩展名：之前直接截前 200 个字，扩展名被切掉，
+        # 下载下来打不开、也不能在线预览。
+        root, ext = os.path.splitext(fn)
+        fn = root[:200 - len(ext)] + ext if 0 < len(ext) <= 20 else fn[:200]
+    return fn
 
 def parse_multipart(rfile, content_length, boundary, max_bytes):
     """流式解析 multipart/form-data。
@@ -3633,6 +3640,11 @@ def _expiry_days(v):
 
 # ---------------- 主程序 ----------------
 class Server(ThreadingHTTPServer):
+    # listen 队列：socketserver 默认只有 5，并发连接一多（多人同时上传、
+    # 反代突发建连）内核直接丢弃/重置新连接，实测 40 个并发上传有 11 个
+    # 被 reset。线程是 accept 后才开的，这里只是让内核多排一会儿队。
+    request_queue_size = 128
+
     def __init__(self, server_address, handler, bind_and_activate=True):
         self.address_family = (socket.AF_INET6 if ":" in server_address[0]
                                else socket.AF_INET)
