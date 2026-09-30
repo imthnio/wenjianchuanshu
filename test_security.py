@@ -189,6 +189,16 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(set(os.listdir(app.FILES_DIR)), before)
 
+    def test_bidi_controls_stripped_from_filenames(self):
+        # 匿名上传的"发票\u202egnp.exe"不能在页面上显示成"发票exe.png"
+        self.assertEqual(app._clean_filename("发票\u202egnp.exe"), "发票gnp.exe")
+        self.assertEqual(app._clean_filename("a\u2066b\u2069\u202a.txt"), "ab.txt")
+        self.assertEqual(app._clean_filename("中文 😀 名字.txt"), "中文 😀 名字.txt")
+
+    def test_server_header_hides_python_version(self):
+        st, h, _ = self.req('GET', '/healthz')
+        self.assertEqual(h.get('server'), 'minishare/' + app.VERSION)
+
     def test_db_and_files_not_world_readable(self):
         # 数据库里有明文密码（管理员可查看），同机其他账号不能读
         os.chmod(app.DB_PATH, 0o644)
