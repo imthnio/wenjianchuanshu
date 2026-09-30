@@ -119,12 +119,31 @@ def trusted_proxy(peer):
         return True
     return any(addr in net for net in cloudflare_networks())
 
-def client_rate_key(peer, cf_connecting_ip):
-    """登录限流用的 IP。直连用对端地址；只有可信反代才采用 CF-Connecting-IP。"""
-    if trusted_proxy(peer):
-        raw = (cf_connecting_ip or "").split(",")[0].strip()
-        if _is_ip(raw):
-            return raw
+def _in_cloudflare(value):
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(addr in net for net in cloudflare_networks())
+
+def client_rate_key(peer, cf_connecting_ip, forwarded_for=None):
+    """登录限流用的 IP。直连用对端地址；可信反代转来的请求用访客自己的 IP。
+
+    本机的 Caddy 会把访客自己带的 CF-Connecting-IP 原样转过来：之前只要对端
+    是本机就采信这个头，访客每次换一个值就能绕过登录限流。现在先看反代写的
+    X-Forwarded-For 最后一跳（反代自己看到的对端，访客伪造不了）：只有那一跳
+    是 Cloudflare 时才采信 CF-Connecting-IP。没有 X-Forwarded-For 的本机反代
+    （例如 cloudflared）保持原来的行为。"""
+    if not trusted_proxy(peer):
+        return peer
+    cf = (cf_connecting_ip or "").split(",")[0].strip()
+    hop = (forwarded_for or "").split(",")[-1].strip()
+    if _is_ip(hop):
+        if _in_cloudflare(hop) and _is_ip(cf):
+            return cf
+        return hop
+    if _is_ip(cf):
+        return cf
     return peer
 
 def _is_dns_name(host):
@@ -259,6 +278,16 @@ def db():
 def setup_token_path():
     return os.path.join(DATA_DIR, "setup-token")
 
+def _restrict_data_perms():
+    # 数据库里有管理员能查看的明文密码：数据库和文件目录只给运行服务的账号读写。
+    # 之前是 644/755，同机其他账号能直接读走所有密码和文件。数据目录本身不动
+    # （SHARE_DATA 可能指向用户自己的目录）。
+    for path, mode in ((FILES_DIR, 0o700), (DB_PATH, 0o600)):
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
 def init_db():
     os.makedirs(FILES_DIR, exist_ok=True)
     with db() as c:
@@ -296,6 +325,7 @@ def init_db():
             SELECT owner_id FROM shares WHERE shares.id=files.share_id)
             WHERE owner_id IS NULL AND EXISTS (
                 SELECT 1 FROM shares WHERE shares.id=files.share_id)""")
+    _restrict_data_perms()
     if has_users():
         try:
             os.unlink(setup_token_path())
@@ -412,6 +442,9 @@ def create_user(pw, is_admin=False, remark=""):
         raise ValueError("密码至少 4 位")
     remark = (remark or "").strip()[:50]
     with db() as c:
+        # 查重和写入放在同一个写事务里：两个并发请求用同一个密码建号时，
+        # 之前都能通过查重，结果两个账号同密码，登录只能进其中一个。
+        c.execute("BEGIN IMMEDIATE")
         for r in c.execute("SELECT pw FROM users"):
             if check_pw(pw, r["pw"]):
                 raise ValueError("这个密码已经被别的账号用了，换一个")
@@ -448,6 +481,7 @@ def set_user_pw(uid, pw):
     if len(pw) < 4:
         raise ValueError("密码至少 4 位")
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         for r in c.execute("SELECT id, pw FROM users WHERE id!=?", (uid,)):
             if check_pw(pw, r["pw"]):
                 raise ValueError("这个密码已经被别的账号用了，换一个")
@@ -2408,7 +2442,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _rate_key(self):
         return client_rate_key(self.client_address[0],
-                               self.headers.get("CF-Connecting-IP"))
+                               self.headers.get("CF-Connecting-IP"),
+                               self.headers.get("X-Forwarded-For"))
 
     def _https_request(self):
         # 只有可信反代可以声明这次访问是 https。页面直接用 http://IP 打开时不设 Secure。
@@ -2560,6 +2595,13 @@ class Handler(BaseHTTPRequestHandler):
                     os.unlink(e["tmp"])
                 except OSError:
                     pass
+
+    def _discard_uploads(self, files):
+        for fo in files:
+            try:
+                os.unlink(os.path.join(FILES_DIR, fo["stored"]))
+            except OSError:
+                pass
 
     def _chunk_finalize(self, e):
         # 分片收齐后落盘入库：与普通上传走同样的 files 表结构。
@@ -2948,6 +2990,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
+                # 传的过程中分享可能被取消或过期（大文件要传很久）：和分片上传
+                # 一样，入库前再查一次，否则文件会挂到已失效的分享上。
+                if not self._valid_share(sid, "send"):
+                    self._discard_uploads(files)
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
                 now = int(time.time())
                 try:
                     with db() as c:
@@ -3326,6 +3373,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
+                # 传的过程中分享可能被取消或过期（大文件要传很久）：和分片上传
+                # 一样，入库前再查一次，否则文件会挂到已失效的分享上。
+                if not self._valid_share(sid, "receive"):
+                    self._discard_uploads(files)
+                    return self._json({"ok": False, "error": "链接不存在或已过期"}, 404)
                 now = int(time.time())
                 try:
                     with db() as c:
