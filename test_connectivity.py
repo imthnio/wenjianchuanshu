@@ -3041,6 +3041,56 @@ class Installer(unittest.TestCase):
         self.assertIn('TEST_STARTUP_LOG', r.stdout)
         self.assertNotIn('安装完成', r.stdout)
 
+    def test_fresh_install_success_exits_zero(self):
+        # 回归：全新安装成功后脚本退出码是 1（EXIT trap 里 [ -n "$RTMP" ] && ...
+        # 在 set -e 下返回失败），外层 && 串联会误判为安装失败。
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'source'
+            shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns('.git', '__pycache__'))
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            for name, body in (('id', 'echo 0'), ('systemctl', 'exit 0'),
+                               ('journalctl', 'echo TEST_STARTUP_LOG'), ('curl', 'exit 1'),
+                               ('ufw', 'exit 1'), ('firewall-cmd', 'exit 1'),
+                               ('iptables', 'exit 0')):
+                (bin_dir / name).write_text('#!/bin/sh\n' + body + '\n')
+                (bin_dir / name).chmod(0o755)
+            marker = root / 'run-systemd'
+            marker.mkdir()
+            units = root / 'units'
+            units.mkdir()
+            script = (source / 'install.sh').read_text()
+            script = script.replace('/run/systemd/system', str(marker)).replace('/etc/systemd/system', str(units))
+            (source / 'install.sh').write_text(script)
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
+            app_dir = root / 'app'
+            server = subprocess.Popen(
+                [sys.executable, str(ROOT / 'fileshare.py')],
+                env={**os.environ, 'SHARE_HOST': '127.0.0.1', 'SHARE_PORT': str(port),
+                     'SHARE_DATA': str(app_dir / 'data'), 'PYTHONDONTWRITEBYTECODE': '1'},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    if subprocess.run([sys.executable, str(ROOT / 'fileshare.py'), '--check',
+                                       '127.0.0.1', str(port)], capture_output=True,
+                                      timeout=10).returncode == 0:
+                        break
+                    time.sleep(0.5)
+                r = subprocess.run(['sh', str(source / 'install.sh')], cwd=root,
+                    env={**os.environ, 'PATH': str(bin_dir) + ':' + os.environ['PATH'],
+                         'PORT': str(port), 'BIND': '127.0.0.1', 'APP_DIR': str(app_dir),
+                         'NONINTERACTIVE': '1', 'PYTHONDONTWRITEBYTECODE': '1'},
+                    capture_output=True, text=True, timeout=60)
+            finally:
+                server.terminate()
+                server.wait(timeout=10)
+            self.assertIn('安装完成', r.stdout)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue((units / 'minishare.service').is_file())
+
     def run_install_repair(self, with_listener=False):
         """Sandbox with a fake pre-installed minishare service on disk."""
         folder = tempfile.TemporaryDirectory()
