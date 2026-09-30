@@ -195,6 +195,34 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(app._clean_filename("a\u2066b\u2069\u202a.txt"), "ab.txt")
         self.assertEqual(app._clean_filename("中文 😀 名字.txt"), "中文 😀 名字.txt")
 
+    def test_filename_edge_cases(self):
+        self.assertEqual(app._clean_filename(".."), "unnamed")
+        self.assertEqual(app._clean_filename("a/."), "unnamed")
+        long = "名" * 300 + ".mp4"
+        out = app._clean_filename(long)
+        self.assertEqual(len(out), 200)
+        self.assertTrue(out.endswith(".mp4"))
+        self.assertEqual(app._view_kind(out), "vid")
+        self.assertEqual(len(app._clean_filename("x" * 300)), 200)
+
+    def test_listen_backlog_not_tiny(self):
+        # socketserver 默认 listen(5)：并发上传一多，新连接直接被内核 reset
+        self.assertGreaterEqual(app.Server.request_queue_size, 128)
+        results = []
+
+        def hit():
+            try:
+                st, _, _ = self.req('GET', '/healthz')
+                results.append(st)
+            except OSError as e:
+                results.append(repr(e))
+        ts = [threading.Thread(target=hit) for _ in range(60)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(results, [200] * 60)
+
     def test_server_header_hides_python_version(self):
         st, h, _ = self.req('GET', '/healthz')
         self.assertEqual(h.get('server'), 'minishare/' + app.VERSION)

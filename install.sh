@@ -21,7 +21,9 @@ fi
 
 TMPD=""
 RTMP=""
-cleanup() { [ -n "$TMPD" ] && rm -rf "$TMPD"; [ -n "$RTMP" ] && rm -rf "$RTMP"; }
+# 注意写成 [ -z ] || rm：set -e 下 EXIT trap 里最后一个 [ -n "" ] && ... 返回 1，
+# 会把成功的全新安装的退出码变成 1（外层脚本 && 串联时误判安装失败）。
+cleanup() { [ -z "$TMPD" ] || rm -rf "$TMPD"; [ -z "$RTMP" ] || rm -rf "$RTMP"; }
 trap cleanup EXIT
 
 APP_DIR="${APP_DIR:-/opt/minishare}"
