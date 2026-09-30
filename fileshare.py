@@ -1969,6 +1969,7 @@ PREVIEW_JS = r"""
     }else if(kind==='txt'){
       var sp2=spinner();
       fetch(src,{headers:{'Range':'bytes=0-'+(TEXT_LIMIT-1)}}).then(function(r){
+        if(r.status===416) return {buf:new ArrayBuffer(0),total:0};  // 空文件
         if(!r.ok) throw new Error('HTTP '+r.status);
         var total=0, cr=r.headers.get('Content-Range');
         if(cr){var m=/\/(\d+)$/.exec(cr); if(m) total=+m[1];}
@@ -2293,6 +2294,22 @@ document.getElementById('upForm').addEventListener('submit', function(ev){
 <div id='res'></div></div>
 """ + up_script)
 
+# 所有文件响应（下载和除 PDF 外的在线查看）都带这个 CSP：即使文件内容是网页
+# 或脚本，被浏览器打开时也只能在无来源的沙箱里，不能读写本站数据。
+FILE_CSP = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'"
+
+# HTML 页面的安全头：禁止被别的网站用 iframe 嵌入（防点击劫持），禁止插件，
+# 表单只能提交回本站。页面内联脚本较多，脚本来源不做限制。
+PAGE_CSP = "frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"
+
+def content_disposition(kind, filename):
+    """带中文文件名的 Content-Disposition。filename* 给现代浏览器；
+    filename= 给老客户端一个 ASCII 兜底（非 ASCII 和引号换成 _）。"""
+    fallback = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\;' else "_"
+                       for ch in filename) or "download"
+    return "%s; filename=\"%s\"; filename*=UTF-8''%s" % (
+        kind, fallback, quote(filename, safe=""))
+
 def not_found():
     return page("不存在", "<div class='auth'><div class='card empty'><span class='big'>😅</span>"
                 "<h1>链接不存在或已过期</h1><p class='muted'>请检查链接是否正确，或联系分享者。</p></div></div>", "sm")
@@ -2334,6 +2351,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # 页面和接口都是动态内容；控制台页面里还有管理员能看的用户密码，
+        # 不让浏览器或中间代理缓存。
+        self.send_header("Cache-Control", "no-store")
+        if ctype.startswith("text/html"):
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", PAGE_CSP)
+            self.send_header("Referrer-Policy", "same-origin")
         if self.close_connection:
             # 出错路径（请求体没读完）会关连接：明确告诉客户端不要复用，
             # 否则它会把残留的请求体当成下一个请求的响应来读。
@@ -2571,72 +2596,56 @@ class Handler(BaseHTTPRequestHandler):
             raise
         return self._json({"ok": True})
 
-    def _send_file(self, path, filename):
-        size = os.path.getsize(path)
-        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(size))
-        self.send_header("Accept-Ranges", "none")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        disp = "attachment; filename*=UTF-8''%s" % quote(filename)
-        self.send_header("Content-Disposition", disp)
-        self.end_headers()
-        if getattr(self, "_head_only", False):
-            return
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-
-    def _send_file_inline(self, path, filename):
-        """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。"""
-        size = os.path.getsize(path)
-        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        text_view = _view_kind(filename) == "txt"
-        if text_view:
-            # 文本预览一律按 text/plain 返回（加 CSP sandbox），浏览器只会当纯文本显示。
-            ctype = "text/plain; charset=utf-8" if _looks_utf8(path) else "text/plain"
-        elif (ctype.split("/")[0] not in ("image", "video", "audio")
-              and ctype != "application/pdf"):
-            # 非图片/视频/音频/PDF/文本：不内联，退回普通下载（防 MIME 混淆）。
-            # PDF 例外：浏览器用自带阅读器渲染，不会执行页面脚本，安全。
-            return self._send_file(path, filename)
-        start, end, status = 0, size - 1, 200
+    def _parse_range(self, size):
+        """解析 Range 头。返回 (start, end, status)：
+        status 200 表示忽略 Range 返回整个文件（没有 Range、格式不对、多段 Range
+        都按 RFC 9110 允许的方式忽略），206 表示分段，416 表示范围超出文件。"""
         rh = (self.headers.get("Range") or "").strip()
-        if rh:
-            m = re.fullmatch(r"bytes=(\d*)-(\d*)", rh)
-            if not m or (not m.group(1) and not m.group(2)):
-                return self._send(416, "Range 不合法", "text/plain; charset=utf-8")
-            if m.group(1):
-                start = int(m.group(1))
-                end = int(m.group(2)) if m.group(2) else size - 1
-            else:
-                # bytes=-N：文件最后 N 字节
-                start = max(size - int(m.group(2)), 0)
-            end = min(end, size - 1)
-            if start >= size or end < start:
-                self.send_response(416)
-                self.send_header("Content-Range", "bytes */%d" % size)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            status = 206
-        length = end - start + 1
+        if not rh:
+            return 0, size - 1, 200
+        # 数字位数限制：超长数字 int() 会抛 ValueError（Python 的位数上限），
+        # 之前直接 500。18 位足够表示任何真实文件大小。
+        m = re.fullmatch(r"bytes=(\d{0,18})-(\d{0,18})", rh)
+        if not m or (not m.group(1) and not m.group(2)):
+            return 0, size - 1, 200
+        if m.group(1):
+            start = int(m.group(1))
+            if m.group(2) and int(m.group(2)) < start:
+                return 0, size - 1, 200  # 语法无效（尾在头前面）：忽略
+            end = int(m.group(2)) if m.group(2) else size - 1
+        else:
+            # bytes=-N：文件最后 N 字节
+            start = max(size - int(m.group(2)), 0)
+            end = size - 1
+            if int(m.group(2)) == 0:
+                start = size
+        end = min(end, size - 1)
+        if start >= size:
+            return start, end, 416
+        return start, end, 206
+
+    def _stream_file(self, path, filename, ctype, disposition, extra_headers=()):
+        size = os.path.getsize(path)
+        start, end, status = self._parse_range(size)
+        if status == 416:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        length = end - start + 1 if size else 0
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
+        # 下载也支持 Range：大文件下载中断后浏览器/下载工具可以续传
         self.send_header("Accept-Ranges", "bytes")
         if status == 206:
-            self.send_header("Content-Range",
-                             "bytes %d-%d/%d" % (start, end, size))
-        self.send_header("Content-Disposition", "inline")
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Disposition", content_disposition(disposition, filename))
         # 防 MIME 嗅探：浏览器只能按声明的 Content-Type 处理
         self.send_header("X-Content-Type-Options", "nosniff")
-        if text_view:
-            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+        for k, v in extra_headers:
+            self.send_header(k, v)
         self.end_headers()
         if getattr(self, "_head_only", False):
             return
@@ -2653,6 +2662,38 @@ class Handler(BaseHTTPRequestHandler):
                     # 客户端提前关了（比如只预读了视频开头）
                     break
                 remaining -= len(chunk)
+
+    def _send_file(self, path, filename):
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        # 下载的文件即使被人直接在地址栏打开（或浏览器无视 attachment），
+        # sandbox 也让里面的脚本不能以本站身份运行。
+        return self._stream_file(path, filename, ctype, "attachment",
+                                 (("Content-Security-Policy", FILE_CSP),))
+
+    def _send_file_inline(self, path, filename):
+        """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。
+        能否内联只看扩展名白名单（_view_kind），不看猜出来的 MIME 前缀：
+        之前 image/svg+xml 以 image/ 开头也被内联，SVG 里的脚本能在本站域名下执行。"""
+        kind = _view_kind(filename)
+        if not kind:
+            # 不在白名单：不内联，退回普通下载（防 MIME 混淆）
+            return self._send_file(path, filename)
+        extra = (("Content-Security-Policy", FILE_CSP),)
+        if kind == "pdf":
+            # Chrome 的 PDF 阅读器在 sandbox 里会被拦截，PDF 不加 sandbox；
+            # PDF 里的脚本只在阅读器自己的沙箱里运行，碰不到本站页面。
+            ctype, extra = "application/pdf", ()
+        elif kind == "txt":
+            # 文本预览一律按 text/plain 返回，浏览器只会当纯文本显示。
+            ctype = "text/plain; charset=utf-8" if _looks_utf8(path) else "text/plain"
+        else:
+            ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            if ctype.split("/")[0] not in ("image", "video", "audio"):
+                return self._send_file(path, filename)
+            # 白名单里的位图/音视频本身不能执行脚本，不加 sandbox：sandbox 会让
+            # 浏览器的媒体页变成无来源，"新窗口打开"的视频就加载不出来了。
+            extra = ()
+        return self._stream_file(path, filename, ctype, "inline", extra)
 
     def _valid_share(self, sid, want_type=None):
         s = get_share(sid)
@@ -2718,7 +2759,7 @@ class Handler(BaseHTTPRequestHandler):
                             (user["id"], int(time.time()))).fetchall()
                 return self._send(200, dash_page(shares, user, self._link_base()))
 
-            m = re.fullmatch(r"/dl/(\d+)", p)
+            m = re.fullmatch(r"/dl/(\d{1,18})", p)
             if m:
                 # 控制台下载必须与文件列表使用同一归属规则；普通用户不能
                 # 猜测递增的文件 ID 下载其他账号（包括已删链接的文件）。
@@ -2756,7 +2797,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, share_page(sid, s, share_files(sid),
                                                   self._user()))
 
-            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/f/(\d+)", p)
+            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/f/(\d{1,18})", p)
             if m:
                 sid, fid = m.group(1), int(m.group(2))
                 s = self._valid_share(sid, "send")
@@ -2773,7 +2814,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, not_found())
                 return self._send_file(path, f["filename"])
 
-            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/v/(\d+)", p)
+            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/v/(\d{1,18})", p)
             if m:
                 # 在线查看：图片直接显示，视频用 <video> 播放
                 sid, fid = m.group(1), int(m.group(2))
@@ -2813,10 +2854,35 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _cross_site_post(self):
+        """浏览器发来的跨站 POST（CSRF）。SameSite=Lax 挡不住同站的其他子域名，
+        也挡不住不支持 SameSite 的老浏览器，这里再按浏览器自带的来源头判断一次。
+        没有这些头的请求（curl、脚本）不是浏览器 CSRF，照常处理。"""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site:
+            return site not in ("same-origin", "none")
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return False
+        if origin == "null":
+            return True
+        try:
+            netloc = urlparse(origin).netloc.lower()
+        except ValueError:
+            return True
+        hosts = {(self.headers.get("Host") or "").strip().lower()}
+        if trusted_proxy(self.client_address[0]):
+            # 反代改写了 Host 时，以反代转来的原始域名为准
+            hosts.add((self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower())
+        return netloc not in hosts
+
     # ---- POST ----
     def do_POST(self):
         try:
             p = urlparse(self.path).path
+            if self._cross_site_post():
+                self._close_if_body_pending()
+                return self._json({"ok": False, "error": "拒绝跨站请求，请在本站页面操作"}, 403)
             if p == "/setup" and not has_users():
                 f = self._form()
                 pw1, pw2 = f.get("pw1", ""), f.get("pw2", "")
@@ -2907,7 +2973,7 @@ class Handler(BaseHTTPRequestHandler):
                 f = self._form()
                 sid = f.get("sid", "")
                 fid = f.get("id", "")
-                if not re.fullmatch(r"[0-9]+", fid or ""):
+                if not re.fullmatch(r"[0-9]{1,18}", fid or ""):
                     return self._json({"ok": False, "error": "参数错误"}, 400)
                 s = self._valid_share(sid)
                 if not s:
@@ -2950,7 +3016,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = f.get("sid", "")
                 raw_ids = (f.get("ids") or "").split(",")
                 if (not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid) or
-                        any(not re.fullmatch(r"[0-9]+", x) for x in raw_ids)):
+                        any(not re.fullmatch(r"[0-9]{1,18}", x) for x in raw_ids)):
                     return self._json({"ok": False, "error": "参数错误"}, 400)
                 try:
                     count = add_existing_files(sid, [int(x) for x in raw_ids], user)
@@ -3083,7 +3149,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 注意：str.isdigit() 对 "²" 这类 Unicode 数字也返回 True，
                 # 但 int() 转不了，会抛 ValueError 变成 500。用 ASCII 数字校验。
                 ids = [int(x) for x in (f.get("ids") or "").split(",")
-                       if re.fullmatch(r"[0-9]+", x.strip() or "")]
+                       if re.fullmatch(r"[0-9]{1,18}", x.strip() or "")]
                 removed = delete_files(ids)
                 return self._json({"ok": True, "deleted": removed})
 
@@ -3174,9 +3240,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 f = self._form()
-                try:
-                    uid = int(f.get("id", ""))
-                except (TypeError, ValueError):
+                uid = _small_int(f.get("id", ""))
+                if uid is None:
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 if not get_user(uid):
                     return self._json({"ok": False, "error": "用户不存在"}, 404)
@@ -3191,9 +3256,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 f = self._form()
-                try:
-                    uid = int(f.get("id", ""))
-                except (TypeError, ValueError):
+                uid = _small_int(f.get("id", ""))
+                if uid is None:
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 target = get_user(uid)
                 if not target:
@@ -3206,9 +3270,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 f = self._form()
-                try:
-                    uid = int(f.get("id", ""))
-                except (TypeError, ValueError):
+                uid = _small_int(f.get("id", ""))
+                if uid is None:
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 target = get_user(uid)
                 if not target:
@@ -3223,9 +3286,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 f = self._form()
-                try:
-                    uid = int(f.get("id", ""))
-                except (TypeError, ValueError):
+                uid = _small_int(f.get("id", ""))
+                if uid is None:
                     return self._json({"ok": False, "error": "bad id"}, 400)
                 target = get_user(uid)
                 if not target:
@@ -3495,6 +3557,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+
+def _small_int(v):
+    """表单里的数据库 id：只收 1~18 位 ASCII 数字，超出 SQLite 整数范围的
+    （之前会抛 OverflowError 变成 500）和其他垃圾值都返回 None。"""
+    v = (v or "").strip()
+    return int(v) if re.fullmatch(r"[0-9]{1,18}", v) else None
 
 def _expiry_days(v):
     try:

@@ -1408,7 +1408,7 @@ class Connectivity(unittest.TestCase):
             s, h, body = self._vget(port, f"/s/{sid}/v/{fid}")
             self.assertEqual(s, 200)
             self.assertEqual(h.get("Content-Type"), "image/png")
-            self.assertEqual(h.get("Content-Disposition"), "inline")
+            self.assertTrue(h.get("Content-Disposition", "").startswith("inline"))
             self.assertEqual(h.get("Accept-Ranges"), "bytes")
             self.assertEqual(h.get("X-Content-Type-Options"), "nosniff")
             self.assertEqual(body, png)
