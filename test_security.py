@@ -155,6 +155,48 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(h["cache-control"], "no-store")
         self.assertEqual(h["x-content-type-options"], "nosniff")
 
+    def test_share_cancelled_during_plain_upload_not_attached(self):
+        # 回归：普通（非分片）上传只在开始时查分享；传到一半分享被取消/过期，
+        # 文件仍会挂到失效分享上。现在入库前再查一次，并删掉已落盘的文件。
+        from unittest.mock import patch
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares VALUES('recv','receive','t',?,0,1)", (now,))
+        orig = app.Handler._multipart
+
+        def cancel_midway(handler, *a, **kw):
+            res = orig(handler, *a, **kw)
+            app.delete_share(self._cancel)
+            return res
+        boundary = "BOUNDARYx"
+        body = ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n"
+                "Content-Type: text/plain\r\n\r\nhello\r\n--%s--\r\n" % (boundary, boundary)).encode()
+        before = set(os.listdir(app.FILES_DIR))
+        with patch.object(app.Handler, "_multipart", cancel_midway):
+            for self._cancel, path, cookie in (("recv", "/r/recv/upload", None),
+                                               ("share", "/s/share/add", "sid=tok1")):
+                conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+                h = {"Content-Type": "multipart/form-data; boundary=" + boundary}
+                if cookie:
+                    h["Cookie"] = cookie
+                conn.request("POST", path, body, h)
+                r = conn.getresponse()
+                r.read()
+                conn.close()
+                self.assertEqual(r.status, 404, path)
+        with app.db() as c:
+            n = c.execute("SELECT COUNT(*) FROM files WHERE filename='a.txt'").fetchone()[0]
+        self.assertEqual(n, 0)
+        self.assertEqual(set(os.listdir(app.FILES_DIR)), before)
+
+    def test_db_and_files_not_world_readable(self):
+        # 数据库里有明文密码（管理员可查看），同机其他账号不能读
+        os.chmod(app.DB_PATH, 0o644)
+        os.chmod(app.FILES_DIR, 0o755)
+        app.init_db()  # 升级旧安装时也收紧
+        self.assertEqual(os.stat(app.DB_PATH).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(app.FILES_DIR).st_mode & 0o777, 0o700)
+
     def test_oversized_ids_are_not_500(self):
         big = "9" * 25
         for path in ("/s/share/f/" + big, "/s/share/v/" + big, "/dl/" + big):

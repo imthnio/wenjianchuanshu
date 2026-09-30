@@ -244,7 +244,7 @@ class Connectivity(unittest.TestCase):
             self.assertEqual(os.listdir(app.FILES_DIR), [])
             c.close()
 
-    def test_unread_body_closes_connection(self):
+    def test_unread_body_closes_connection_public_paths(self):
         # 回归测试：没读请求体就返回（未知 POST 路径、未登录的 API、
         # 无效的上传链接、带 body 的 GET）必须带 Connection: close，
         # 否则残留的 body 会被当成同一 keep-alive 连接上的下一个请求解析
@@ -660,6 +660,13 @@ class Connectivity(unittest.TestCase):
         self.assertEqual(app.client_rate_key("104.16.1.2", "203.0.113.5"), "203.0.113.5")
         self.assertEqual(app.client_rate_key("127.0.0.1", ""), "127.0.0.1")
         self.assertEqual(app.client_rate_key("127.0.0.1", "203.0.113.8"), "203.0.113.8")
+        # 本机 Caddy 转来的请求：以 Caddy 写的 X-Forwarded-For 最后一跳为准，
+        # 访客自己伪造的 CF-Connecting-IP 不算（之前换个值就能绕过登录限流）
+        self.assertEqual(app.client_rate_key("127.0.0.1", "10.9.8.7", "198.51.100.4"), "198.51.100.4")
+        self.assertEqual(app.client_rate_key("127.0.0.1", "10.9.8.7", "1.1.1.1, 198.51.100.4"), "198.51.100.4")
+        # Caddy 前面还有 Cloudflare：最后一跳是 Cloudflare，才采信 CF-Connecting-IP
+        self.assertEqual(app.client_rate_key("127.0.0.1", "203.0.113.5", "104.16.1.2"), "203.0.113.5")
+        self.assertEqual(app.client_rate_key("104.16.1.2", "203.0.113.5", "203.0.113.5"), "203.0.113.5")
 
     def test_caddyfile_domain_is_reused_when_visit_has_no_https_name(self):
         folder = tempfile.mkdtemp()
@@ -2235,6 +2242,31 @@ run();
             st, _ = login("right-pw-123")
             self.assertEqual(st, 429)
 
+    def test_login_rate_limit_not_bypassed_by_spoofed_cf_header_behind_caddy(self):
+        # 回归：enable-https.sh 的 Caddy 在本机反代，会把访客自带的
+        # CF-Connecting-IP 原样转发；之前本机对端一律采信它，访客每次换个值
+        # 就能无限试密码。现在以 Caddy 写的 X-Forwarded-For 为准。
+        with self.server("127.0.0.1") as port:
+            app.create_user("right-pw-123", is_admin=True)
+
+            def login(i):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    c.request("POST", "/login",
+                              body=urllib.parse.urlencode({"pw": "wrong"}).encode(),
+                              headers={"Content-Type": "application/x-www-form-urlencoded",
+                                       "X-Forwarded-For": "198.51.100.77",
+                                       "CF-Connecting-IP": "10.0.%d.%d" % (i // 250, i % 250)})
+                    r = c.getresponse()
+                    r.read()
+                    return r.status
+                finally:
+                    c.close()
+
+            codes = [login(i) for i in range(21)]
+            self.assertEqual(codes[:20], [200] * 20)
+            self.assertEqual(codes[20], 429)
+
     def test_upload_too_many_files_rejected(self):
         # 回归：以前单次上传的文件 part 数量不限，每个 part 都在磁盘建临时
         # 文件——几千万个空 part 能把 inode 和 SQLite 拖死。现在超过 200 个
@@ -3591,7 +3623,6 @@ class HTTPSConfig(unittest.TestCase):
 
     def nat_case_unit(self, fail, caddy_unit=None, service_text=None):
         # 带 caddy 服务单元场景的 NAT 流程：fail=1 走回滚
-        import re as _re
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / 'etc/systemd/system').mkdir(parents=True)
