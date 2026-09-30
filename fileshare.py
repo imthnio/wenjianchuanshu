@@ -857,6 +857,9 @@ def _disp_param(disp, key):
 def _clean_filename(fn):
     # 去掉控制字符：恶意文件名里的 CR/LF 会污染下载响应头（响应拆分攻击）
     fn = re.sub(r"[\x00-\x1f\x7f]", "", fn)
+    # 去掉双向文本控制符（RLO 等）：接收链接是匿名上传，"发票\u202egnp.exe"
+    # 在页面上会显示成"发票exe.png"，把可执行文件伪装成图片骗人下载。
+    fn = re.sub("[\u202a-\u202e\u2066-\u2069]", "", fn)
     fn = os.path.basename(fn.replace("\\", "/")).strip() or "unnamed"
     return fn[:200]
 
@@ -2355,6 +2358,10 @@ def error_page():
 # ---------------- HTTP 服务 ----------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "minishare/" + VERSION
+
+    def version_string(self):
+        # 响应头 Server 只报程序版本，不再附带 Python 版本号（不必要的信息泄露）
+        return self.server_version
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
