@@ -61,6 +61,16 @@ class SharePreviewPageTest(unittest.TestCase):
         self.assertIn("文件都被删除啦", body)
         self.assertNotIn("id='pv'", body)
 
+    def test_video_preview_has_loading_and_fallback_states(self):
+        js = app.PREVIEW_JS
+        # 加载中提示、超时/卡住提示（重试/新窗口/下载）、出错兜底、不支持格式的检测
+        for needle in ("pv-vload", "pv-vnote", "pv-retry", "canPlayType", "retryVideo",
+                       "'waiting'", "playsinline", "继续等待"):
+            self.assertIn(needle, js)
+        # 切换文件时旧的看门狗定时器要停掉，旧视频要停止并释放连接
+        self.assertIn("clearInterval(watch)", js)
+        self.assertIn("removeAttribute('src')", js)
+
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_page_scripts_are_valid_javascript(self):
         for name, js in (("preview", app.PREVIEW_JS), ("ui", app.UI_JS), ("dash", app.DASH_JS)):
