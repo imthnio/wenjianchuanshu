@@ -71,6 +71,19 @@ class SharePreviewPageTest(unittest.TestCase):
         self.assertIn("clearInterval(watch)", js)
         self.assertIn("removeAttribute('src')", js)
 
+    def test_backdrop_tap_does_not_close_preview(self):
+        js = app.PREVIEW_JS
+        # 之前点舞台空白处（视频上下的黑边）就关闭，手机上很容易误触
+        self.assertNotIn("ev.target===stage", js)
+        self.assertNotRegex(js, r"stage\.addEventListener\('click'")
+        # 仍然可以用 ✕、Esc 和返回键关闭
+        self.assertIn("closeB.addEventListener('click', close)", js)
+        self.assertIn("ev.key==='Escape'", js)
+        self.assertIn("popstate", js)
+        # 滑动切换不拦截视频/音频本身的手势（拖进度条），也不 preventDefault
+        self.assertIn("closest('video,audio,iframe,pre,a,button,input')", js)
+        self.assertNotIn("preventDefault", js.split("touchstart")[1])
+
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_page_scripts_are_valid_javascript(self):
         for name, js in (("preview", app.PREVIEW_JS), ("ui", app.UI_JS), ("dash", app.DASH_JS)):
