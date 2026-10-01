@@ -77,21 +77,46 @@ class SharePreviewPageTest(unittest.TestCase):
         self.assertIn("retryVideo(0)", aud)
         self.assertIn("pv-amsg", aud)
         self.assertIn("setInterval", aud)
+        # 未按下播放、也没进入 loading 时，15 秒后仍要提示。
+        # 之前要求 paused&&networkState!==2 才跳过，iOS 不支持的格式正好踩中，提示永不出现。
+        self.assertNotIn("a.paused&&a.networkState", aud)
+
+    def _run_js(self, harness):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+        try:
+            return subprocess.run(["node", f.name], capture_output=True, timeout=30)
+        finally:
+            os.unlink(f.name)
 
     def test_chunk_upload_retries_with_backoff(self):
         js = app.CHUNK_JS
         self.assertIn("setTimeout(send", js)
+        self.assertIn("XMLHttpRequest", js)
+        self.assertIn("onprogress", js)
+        self.assertIn(".abort()", js)
+        self.assertIn("var CHUNK_SIZE=%d;" % app.CHUNK_SIZE, js)
         # node 可用时实际跑一遍：前两次网络错误，第三次成功，整个上传应成功
         if not shutil.which("node"):
             return
         harness = js + r"""
 var calls=0, waits=[];
 global.setTimeout=function(fn,ms){waits.push(ms); fn();};
-global.fetch=function(url){
-  if(url.indexOf('/api/chunk_init')===0) return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true,up:'u'});}});
-  if(url.indexOf('/api/chunk_done')===0) return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true});}});
-  calls++; if(calls<3) return Promise.reject(new Error('net'));
-  return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true});}});
+global.XMLHttpRequest=function(){this.upload={};this.status=200;this.responseText='';};
+XMLHttpRequest.prototype.open=function(_m,url){this._url=url;};
+XMLHttpRequest.prototype.setRequestHeader=function(){};
+XMLHttpRequest.prototype.abort=function(){};
+XMLHttpRequest.prototype.send=function(){
+  var xhr=this;
+  if(xhr._url.indexOf('/api/chunk_init')>=0){
+    xhr.responseText='{"ok":true,"up":"u"}'; xhr.onload(); return;
+  }
+  if(xhr._url.indexOf('/api/chunk_done')>=0){
+    xhr.responseText='{"ok":true}'; xhr.onload(); return;
+  }
+  calls++;
+  if(calls<3){ xhr.onerror(); return; }
+  xhr.responseText='{"ok":true}'; xhr.onload();
 };
 var f={name:'a',size:10,slice:function(){return {size:10};}};
 chunkUpload({sid:'s',kind:'upload'},[f],{prog:{},pct:null,stat:null}).then(function(){
@@ -99,13 +124,42 @@ chunkUpload({sid:'s',kind:'upload'},[f],{prog:{},pct:null,stat:null}).then(funct
   console.log('ok');
 },function(e){console.log('rejected',e.message); process.exit(1);});
 """
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
-            f.write(harness)
-        try:
-            r = subprocess.run(["node", f.name], capture_output=True, timeout=30)
-            self.assertEqual(r.returncode, 0, r.stdout.decode() + r.stderr.decode())
-        finally:
-            os.unlink(f.name)
+        r = self._run_js(harness)
+        self.assertEqual(r.returncode, 0, r.stdout.decode() + r.stderr.decode())
+
+    def test_chunk_upload_does_not_retry_fatal_error(self):
+        # 分片作废、磁盘满这类错误重试也不会好。不能在这里空转把进度卡住。
+        if not shutil.which("node"):
+            return
+        harness = app.CHUNK_JS + r"""
+var calls=0, waits=[];
+global.setTimeout=function(fn,ms){waits.push(ms); fn();};
+global.XMLHttpRequest=function(){this.upload={};this.status=200;this.responseText='';};
+XMLHttpRequest.prototype.open=function(_m,url){this._url=url;};
+XMLHttpRequest.prototype.setRequestHeader=function(){};
+XMLHttpRequest.prototype.abort=function(){};
+XMLHttpRequest.prototype.send=function(){
+  var xhr=this;
+  if(xhr._url.indexOf('/api/chunk_init')>=0){
+    xhr.responseText='{"ok":true,"up":"u"}'; xhr.onload(); return;
+  }
+  calls++;
+  xhr.status=400;
+  xhr.responseText='{"ok":false,"error":"分片已失效，请重新上传"}';
+  xhr.onload();
+};
+var f={name:'a',size:10,slice:function(){return {size:10};}};
+chunkUpload({sid:'s',kind:'upload'},[f],{prog:{},pct:null,stat:null}).then(function(){
+  console.log('should reject'); process.exit(1);
+},function(e){
+  if(calls!==1||waits.length!==0||e.message.indexOf('分片已失效')<0){
+    console.log('bad',calls,waits,e.message); process.exit(1);
+  }
+  console.log('ok');
+});
+"""
+        r = self._run_js(harness)
+        self.assertEqual(r.returncode, 0, r.stdout.decode() + r.stderr.decode())
 
     def test_backdrop_tap_does_not_close_preview(self):
         js = app.PREVIEW_JS
@@ -122,7 +176,8 @@ chunkUpload({sid:'s',kind:'upload'},[f],{prog:{},pct:null,stat:null}).then(funct
 
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_page_scripts_are_valid_javascript(self):
-        for name, js in (("preview", app.PREVIEW_JS), ("ui", app.UI_JS), ("dash", app.DASH_JS)):
+        for name, js in (("preview", app.PREVIEW_JS), ("ui", app.UI_JS),
+                          ("dash", app.DASH_JS), ("chunk", app.CHUNK_JS)):
             with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
                 f.write(js)
             try:
