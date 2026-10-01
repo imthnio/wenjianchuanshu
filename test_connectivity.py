@@ -706,7 +706,7 @@ class Connectivity(unittest.TestCase):
         self.assertIn("NAT_DETECTED", https)
         self.assertIn("自动检测：本机出口 IP", https)
         self.assertIn("location.origin", program)
-        self.assertIn('VERSION = "1.2.1"', program)
+        self.assertIn('VERSION = "1.2.2"', program)
 
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:

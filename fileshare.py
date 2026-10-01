@@ -36,9 +36,10 @@ import tempfile
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
+from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -1272,6 +1273,16 @@ html.pv-lock,html.pv-lock body{overflow:hidden}
   background:rgba(0,0,0,.45);padding:2px 10px;border-radius:99px;pointer-events:none}
 .pv-count:empty{display:none}
 .pv-spin{width:38px;height:38px;border:3px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .9s linear infinite}
+.pv-spin.sm{width:16px;height:16px;border-width:2px;flex:none}
+.pv-vwrap{position:relative;width:100%;height:100%;min-height:0;display:flex;align-items:center;justify-content:center}
+.pv-vload{position:absolute;top:10px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.6);
+  color:#fff;font-size:13px;padding:6px 12px;border-radius:99px;pointer-events:none;white-space:nowrap;z-index:1}
+.pv-vload[hidden],.pv-vnote[hidden],.pv-vhint[hidden]{display:none}
+.pv-vnote{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(440px,calc(100% - 24px));background:rgba(17,24,39,.94);
+  color:#e4e7ec;border-radius:14px;padding:16px;text-align:center;line-height:1.6;font-size:14px;z-index:3;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+.pv-vnote .btn{margin:10px 4px 0}
+.pv-vhint{position:absolute;top:52px;left:50%;transform:translateX(-50%);width:min(520px,calc(100% - 24px));background:rgba(0,0,0,.7);color:#fde68a;
+  font-size:13px;line-height:1.5;padding:8px 12px;border-radius:10px;text-align:center;pointer-events:none;z-index:1}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (max-width:700px){
   .wrap{padding:14px 12px 84px}
@@ -1952,21 +1963,86 @@ PREVIEW_JS = r"""
       dlA=document.getElementById('pvDl'), closeB=document.getElementById('pvClose'),
       prevB=document.getElementById('pvPrev'), nextB=document.getElementById('pvNext'),
       countEl=document.getElementById('pvCount');
-  var cur=-1, pushed=false, lastFocus=null, token=0, TEXT_LIMIT=1024*1024, tx=null;
+  var cur=-1, pushed=false, lastFocus=null, token=0, TEXT_LIMIT=1024*1024, tx=null, ty=0, watch=null, resumeAt=0, retries=0;
+  var VTYPES={mp4:'video/mp4',m4v:'video/mp4',mov:'video/quicktime',webm:'video/webm',ogv:'video/ogg',ogg:'video/ogg',mkv:'video/x-matroska'};
   function el(tag, cls, text){var e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e;}
   function clear(){
-    token++;
+    token++; clearInterval(watch); watch=null;
     var m=stage.querySelectorAll('video,audio'), i;
     for(i=0;i<m.length;i++){try{m[i].pause();}catch(e){} m[i].removeAttribute('src'); try{m[i].load();}catch(e){}}
     stage.classList.remove('zoom'); stage.textContent='';
   }
   function spinner(){var s=el('div','pv-spin'); s.setAttribute('role','status'); s.setAttribute('aria-label','加载中'); stage.appendChild(s); return s;}
-  function fail(text){
-    stage.textContent='';
-    var box=el('div','pv-msg'); box.appendChild(el('div','',text));
+  function actions(box, retry){
+    if(retry){var r=el('button','btn pv-retry','重试'); r.type='button'; r.addEventListener('click', retry); box.appendChild(r);}
     var a=el('a','btn','下载文件'); a.href=items[cur].dataset.dl; a.setAttribute('download',''); box.appendChild(a);
     var o=el('a','btn ghost','新窗口打开'); o.href=items[cur].dataset.src; o.target='_blank'; o.rel='noopener'; box.appendChild(o);
+  }
+  function fail(text, retry){
+    stage.textContent='';
+    var box=el('div','pv-msg'); box.appendChild(el('div','',text));
+    actions(box, retry);
     stage.appendChild(box);
+  }
+  function retryVideo(at){ resumeAt=at||0; retries++; render(cur); }
+  // 视频：页面自己显示加载状态；出错或长时间没进展时给出重试/新窗口/下载，
+  // 不再让用户对着播放器的转圈干等（iOS 遇到不支持的格式/编码常常不报错，
+  // 只是一直转圈、时长显示 --:--）。
+  function renderVideo(b, my){
+    var src=b.dataset.src, name=b.dataset.name, ext=(name.split('.').pop()||'').toLowerCase();
+    var wrap=el('div','pv-vwrap'), v=document.createElement('video');
+    v.controls=true; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    v.preload='metadata';
+    var busy=el('div','pv-vload'); busy.setAttribute('role','status');
+    busy.appendChild(el('span','pv-spin sm')); busy.appendChild(el('span','','正在加载视频…'));
+    var note=el('div','pv-vnote'); note.hidden=true;
+    var hint=el('div','pv-vhint'); hint.hidden=true;
+    wrap.appendChild(v); wrap.appendChild(busy); wrap.appendChild(note); wrap.appendChild(hint);
+    stage.appendChild(wrap);
+    var type=VTYPES[ext]||'', support=(type&&v.canPlayType)?v.canPlayType(type):'maybe';
+    var t0=Date.now(), last=t0, lastT=-1, dismissed=false, at=resumeAt; resumeAt=0;
+    function alive(){return my===token;}
+    function setBusy(on){busy.hidden=!on;}
+    function showNote(text){
+      if(dismissed||!note.hidden) return;
+      note.textContent=''; note.appendChild(el('div','',text));
+      actions(note, function(){retryVideo(v.currentTime);});
+      var w=el('button','btn ghost','继续等待'); w.type='button';
+      w.addEventListener('click', function(){dismissed=true; note.hidden=true;}); note.appendChild(w);
+      note.hidden=false; setBusy(false);
+    }
+    function moved(){last=Date.now(); note.hidden=true;}
+    v.addEventListener('loadedmetadata', function(){
+      if(!alive()) return;
+      if(at>0){try{v.currentTime=at;}catch(e){}}
+      if(!v.videoWidth&&!v.videoHeight&&ext!=='ogg'){
+        hint.textContent='只有声音没有画面？这个浏览器可能不支持该视频的编码（如 HEVC/H.265），可以下载后用播放器观看。';
+        hint.hidden=false;
+      }
+    });
+    ['loadeddata','canplay','playing'].forEach(function(n){v.addEventListener(n, function(){if(alive()){setBusy(false); moved();}});});
+    v.addEventListener('pause', function(){if(alive()) setBusy(false);});
+    v.addEventListener('waiting', function(){if(alive()&&!v.paused) setBusy(true);});
+    v.addEventListener('play', function(){if(alive()){last=Date.now(); if(v.readyState<3) setBusy(true);}});
+    v.addEventListener('timeupdate', function(){if(alive()&&v.currentTime!==lastT){lastT=v.currentTime; if(!v.paused) moved();}});
+    v.onerror=function(){if(!alive())return; clearInterval(watch);
+      fail('视频加载失败：浏览器无法播放这个格式或编码（常见于 MKV/AVI/HEVC），或网络中断。可以重试、在新窗口打开，或下载后用播放器观看。',
+           function(){retryVideo(v.currentTime);});};
+    watch=setInterval(function(){
+      if(!alive()){return;}
+      var now=Date.now();
+      if(v.readyState<1){
+        // 还没拿到时长：不支持的格式 8 秒、其他 15 秒后提示（加载仍在后台继续）
+        var lim=support===''?8000:15000;
+        if((!v.paused||v.networkState===2)&&now-t0>lim)
+          showNote(support===''?'这个浏览器很可能不支持该视频格式（.'+ext+'），一直无法加载。可以在新窗口打开、下载后用播放器观看，或重试。'
+                              :'视频加载很慢或无法播放。可以重试、在新窗口打开，或直接下载。');
+      }else if(!v.paused&&!v.ended&&v.readyState<3&&now-last>20000){
+        showNote('视频缓冲卡住了（网络较慢或连接中断）。可以重试（从当前位置继续）、在新窗口打开，或下载后观看。');
+      }
+    },1000);
+    v.src=retries?src+'?r='+retries:src;
+    var p=v.play(); if(p&&p.catch) p.catch(function(){if(alive()&&v.paused) setBusy(false);});
   }
   function decode(buf, truncated){
     var u8=new Uint8Array(buf);
@@ -1990,12 +2066,7 @@ PREVIEW_JS = r"""
       img.addEventListener('click', function(){stage.classList.toggle('zoom');});
       img.src=src;
     }else if(kind==='vid'){
-      var v=document.createElement('video');
-      v.controls=true; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
-      v.preload='metadata';
-      v.onerror=function(){if(my!==token)return; fail('浏览器无法播放这个视频格式（常见于 MKV/AVI/HEVC），可以下载后用播放器打开。');};
-      v.src=src; stage.appendChild(v);
-      var p=v.play(); if(p&&p.catch) p.catch(function(){});
+      renderVideo(b, my);
     }else if(kind==='aud'){
       var box=el('div','pv-audio');
       box.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
@@ -2031,7 +2102,7 @@ PREVIEW_JS = r"""
   }
   function focusables(){return Array.prototype.filter.call(pv.querySelectorAll('a[href],button,video,audio,iframe,pre'),function(e){return !e.hidden&&e.offsetParent!==null;});}
   function open(i){
-    lastFocus=document.activeElement;
+    lastFocus=document.activeElement; retries=0;
     pv.hidden=false; document.documentElement.classList.add('pv-lock');
     render(i);
     if(!pushed){try{history.pushState({pv:1},''); pushed=true;}catch(e){}}
@@ -2042,7 +2113,7 @@ PREVIEW_JS = r"""
     if(lastFocus&&lastFocus.focus) lastFocus.focus();
   }
   function close(){ if(pushed){history.back();} else {hide();} }
-  function step(d){ if(items.length>1&&cur>=0) render((cur+d+items.length)%items.length); }
+  function step(d){ if(items.length>1&&cur>=0){ retries=0; resumeAt=0; render((cur+d+items.length)%items.length); } }
   window.addEventListener('popstate', function(){ if(pushed){pushed=false; hide();} });
   items.forEach(function(b,i){ b.addEventListener('click', function(ev){ev.preventDefault(); open(i);}); });
   closeB.addEventListener('click', close);
@@ -2082,6 +2153,26 @@ TXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv", ".tsv", ".json", ".yaml"
             ".css", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".java", ".go",
             ".rs", ".rb", ".php", ".sql", ".diff", ".patch"}
 TEXT_PREVIEW_LIMIT = 1024 * 1024
+
+# 白名单类型的 Content-Type 固定写死，不依赖 mimetypes：mimetypes 先读系统的
+# /etc/mime.types，没有这个文件时（Alpine/精简 Debian 镜像常见）才用 Python
+# 内置表，老版本 Python 内置表里没有 .webm/.mkv/.m4v/.flac/.opus/.avif 等，
+# 结果是 application/octet-stream——在线查看会退回成附件下载，<video> 一直转圈。
+_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".avif": "image/avif",
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+    ".webm": "video/webm", ".ogv": "video/ogg", ".ogg": "video/ogg",
+    ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".wav": "audio/wav",
+    ".flac": "audio/flac", ".oga": "audio/ogg", ".opus": "audio/ogg",
+    ".pdf": "application/pdf",
+}
+
+def guess_type(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return (_MEDIA_TYPES.get(ext) or mimetypes.guess_type(filename)[0]
+            or "application/octet-stream")
 
 def _view_kind(filename):
     """返回 'img' / 'vid' / 'aud' / 'pdf' / 'txt'，不能在线查看的返回 None。"""
@@ -2370,6 +2461,18 @@ class Handler(BaseHTTPRequestHandler):
         # 响应头 Server 只报程序版本，不再附带 Python 版本号（不必要的信息泄露）
         return self.server_version
     protocol_version = "HTTP/1.1"
+
+    def send_response(self, code, message=None):
+        # 记录"这次请求的响应头已经开始发了"：之后再出错就不能再发一份
+        # 错误响应（会被客户端当成上一个响应的正文），只能断开连接。
+        self._resp_started = True
+        super().send_response(code, message)
+
+    def _error_after_headers(self):
+        if getattr(self, "_resp_started", False):
+            self.close_connection = True
+            return True
+        return False
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
@@ -2680,13 +2783,53 @@ class Handler(BaseHTTPRequestHandler):
             return start, end, 416
         return start, end, 206
 
+    def _if_range_ok(self, etag, mtime):
+        """If-Range（RFC 9110 13.1.5）：客户端拿着旧的 ETag/Last-Modified 续传时，
+        文件没变才按 Range 回 206，否则回 200 整个文件，防止把新旧两份拼在一起。"""
+        v = (self.headers.get("If-Range") or "").strip()
+        if not v:
+            return True
+        if v.startswith('"') or v.startswith("W/"):
+            return v == etag  # 只认强校验器
+        try:
+            return int(parsedate_to_datetime(v).timestamp()) == int(mtime)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+
+    def _not_modified(self, etag):
+        inm = self.headers.get("If-None-Match")
+        if not inm:
+            return False
+        tags = [t.strip() for t in inm.split(",")]
+        return "*" in tags or etag in tags or ("W/" + etag) in tags
+
     def _stream_file(self, path, filename, ctype, disposition, extra_headers=()):
-        size = os.path.getsize(path)
+        st = os.stat(path)
+        size = st.st_size
+        # 校验器：存储文件名是随机的、内容写入后不再改，大小+mtime 足够唯一。
+        # Safari/iOS 的媒体加载器会用它们做 If-Range 续传和缓存复用。
+        etag = '"%x-%x"' % (size, st.st_mtime_ns)
+        last_mod = formatdate(st.st_mtime, usegmt=True)
+        common = [("ETag", etag), ("Last-Modified", last_mod),
+                  # 可以存但每次用前都要回源确认：分享删除/过期后不会继续从缓存里看到
+                  ("Cache-Control", "private, no-cache"),
+                  ("Accept-Ranges", "bytes"),
+                  ("X-Content-Type-Options", "nosniff")]
+        if self._not_modified(etag) and not self.headers.get("Range"):
+            self.send_response(304)
+            for k, v in common:
+                self.send_header(k, v)
+            self.end_headers()
+            return
         start, end, status = self._parse_range(size)
+        if status != 200 and not self._if_range_ok(etag, st.st_mtime):
+            start, end, status = 0, size - 1, 200
         if status == 416:
             self.send_response(416)
             self.send_header("Content-Range", "bytes */%d" % size)
             self.send_header("Content-Length", "0")
+            for k, v in common:
+                self.send_header(k, v)
             self.end_headers()
             return
         length = end - start + 1 if size else 0
@@ -2694,12 +2837,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         # 下载也支持 Range：大文件下载中断后浏览器/下载工具可以续传
-        self.send_header("Accept-Ranges", "bytes")
         if status == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.send_header("Content-Disposition", content_disposition(disposition, filename))
-        # 防 MIME 嗅探：浏览器只能按声明的 Content-Type 处理
-        self.send_header("X-Content-Type-Options", "nosniff")
+        # X-Content-Type-Options: nosniff 在 common 里：浏览器只能按声明的类型处理
+        for k, v in common:
+            self.send_header(k, v)
         for k, v in extra_headers:
             self.send_header(k, v)
         self.end_headers()
@@ -2711,16 +2854,25 @@ class Handler(BaseHTTPRequestHandler):
             while remaining > 0:
                 chunk = f.read(min(CHUNK, remaining))
                 if not chunk:
+                    # 文件中途变短（被删/被截断）：已声明的 Content-Length 发不满，
+                    # 只能断开连接，让客户端知道这次响应不完整。
+                    self.close_connection = True
                     break
                 try:
                     self.wfile.write(chunk)
-                except (ConnectionResetError, BrokenPipeError):
-                    # 客户端提前关了（比如只预读了视频开头）
+                except OSError:
+                    # 客户端提前关了（比如只预读了视频开头），或者长时间不读
+                    # （iOS 暂停播放时会停着连接不读，120 秒后发送超时）。
+                    # 响应头和部分正文已经发出：这时绝不能再回 500 页面——之前
+                    # 超时异常落到 do_GET 的通用 except，把 "HTTP/1.1 500" 和
+                    # 错误页 HTML 接着写进了视频数据流里。直接关连接，
+                    # 播放器会用新的 Range 请求从断点接着取。
+                    self.close_connection = True
                     break
                 remaining -= len(chunk)
 
     def _send_file(self, path, filename):
-        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        ctype = guess_type(filename)
         # 下载的文件即使被人直接在地址栏打开（或浏览器无视 attachment），
         # sandbox 也让里面的脚本不能以本站身份运行。
         return self._stream_file(path, filename, ctype, "attachment",
@@ -2743,7 +2895,7 @@ class Handler(BaseHTTPRequestHandler):
             # 文本预览一律按 text/plain 返回，浏览器只会当纯文本显示。
             ctype = "text/plain; charset=utf-8" if _looks_utf8(path) else "text/plain"
         else:
-            ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            ctype = guess_type(filename)
             if ctype.split("/")[0] not in ("image", "video", "audio"):
                 return self._send_file(path, filename)
             # 白名单里的位图/音视频本身不能执行脚本，不加 sandbox：sandbox 会让
@@ -2772,6 +2924,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- GET ----
     def do_GET(self):
+        self._resp_started = False
         try:
             # 本应用的 GET 接口都不读请求体：带 body 的 GET 直接标记关连接，
             # 否则残留 body 会污染同一 keep-alive 连接上的下一个请求。
@@ -2905,6 +3058,8 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("GET %s error: %s", self.path, e)
             # 出错时请求体不一定读完了，关连接防污染同一连接的下一个请求
             self.close_connection = True
+            if self._error_after_headers():
+                return
             try:
                 self._send(500, error_page())
             except Exception:
@@ -2934,6 +3089,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST ----
     def do_POST(self):
+        self._resp_started = False
         try:
             p = urlparse(self.path).path
             if self._cross_site_post():
@@ -3618,6 +3774,8 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("POST %s error: %s", self.path, e)
             # 出错时请求体不一定读完了，关连接是最稳妥的
             self.close_connection = True
+            if self._error_after_headers():
+                return
             try:
                 self._json({"ok": False, "error": "服务器错误"}, 500)
             except Exception:
@@ -3644,6 +3802,8 @@ class Server(ThreadingHTTPServer):
     # 反代突发建连）内核直接丢弃/重置新连接，实测 40 个并发上传有 11 个
     # 被 reset。线程是 accept 后才开的，这里只是让内核多排一会儿队。
     request_queue_size = 128
+    # 每个连接"连续无数据"的超时秒数（见 get_request）
+    conn_timeout = 120
 
     def __init__(self, server_address, handler, bind_and_activate=True):
         self.address_family = (socket.AF_INET6 if ":" in server_address[0]
@@ -3665,7 +3825,7 @@ class Server(ThreadingHTTPServer):
         # 不设超时一个慢连接就能永久占住一个线程直到耗尽内存。
         # 超时按"连续无数据"计算，正常传大文件不受影响。
         conn, addr = super().get_request()
-        conn.settimeout(120)
+        conn.settimeout(self.conn_timeout)
         return conn, addr
 
     def server_bind(self):
