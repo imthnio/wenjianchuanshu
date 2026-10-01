@@ -71,6 +71,42 @@ class SharePreviewPageTest(unittest.TestCase):
         self.assertIn("clearInterval(watch)", js)
         self.assertIn("removeAttribute('src')", js)
 
+    def test_audio_preview_has_error_and_timeout_fallback(self):
+        js = app.PREVIEW_JS
+        aud = js[js.index("kind==='aud'"):js.index("kind==='pdf'")]
+        self.assertIn("retryVideo(0)", aud)
+        self.assertIn("pv-amsg", aud)
+        self.assertIn("setInterval", aud)
+
+    def test_chunk_upload_retries_with_backoff(self):
+        js = app.CHUNK_JS
+        self.assertIn("setTimeout(send", js)
+        # node 可用时实际跑一遍：前两次网络错误，第三次成功，整个上传应成功
+        if not shutil.which("node"):
+            return
+        harness = js + r"""
+var calls=0, waits=[];
+global.setTimeout=function(fn,ms){waits.push(ms); fn();};
+global.fetch=function(url){
+  if(url.indexOf('/api/chunk_init')===0) return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true,up:'u'});}});
+  if(url.indexOf('/api/chunk_done')===0) return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true});}});
+  calls++; if(calls<3) return Promise.reject(new Error('net'));
+  return Promise.resolve({status:200,json:function(){return Promise.resolve({ok:true});}});
+};
+var f={name:'a',size:10,slice:function(){return {size:10};}};
+chunkUpload({sid:'s',kind:'upload'},[f],{prog:{},pct:null,stat:null}).then(function(){
+  if(calls!==3||waits.length!==2||!(waits[1]>waits[0])) {console.log('bad',calls,waits); process.exit(1);}
+  console.log('ok');
+},function(e){console.log('rejected',e.message); process.exit(1);});
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stdout.decode() + r.stderr.decode())
+        finally:
+            os.unlink(f.name)
+
     def test_backdrop_tap_does_not_close_preview(self):
         js = app.PREVIEW_JS
         # 之前点舞台空白处（视频上下的黑边）就关闭，手机上很容易误触
