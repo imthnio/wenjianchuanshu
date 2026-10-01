@@ -42,6 +42,30 @@ EOF
   fi
 }
 
+# 把公网端口的 TCP MSS 钳到和 minishare 一样（默认 1220）。
+# Python 只钳自己 listen 的套接字。换成 Caddy 之后，访客连的是 Caddy，
+# 大包被 PMTU 黑洞丢掉时，上传会一直停在某个百分比。规则已存在就跳过。
+clamp_public_mss() {
+  _mss="${SHARE_MSS:-1220}"
+  if [ "$_mss" = "0" ]; then
+    return 0
+  fi
+  for _fw in iptables ip6tables; do
+    if ! command -v "$_fw" >/dev/null 2>&1; then
+      continue
+    fi
+    for _p in "$@"; do
+      "$_fw" -t mangle -C OUTPUT -p tcp --sport "$_p" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$_mss" 2>/dev/null \
+        || "$_fw" -t mangle -A OUTPUT -p tcp --sport "$_p" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$_mss" 2>/dev/null \
+        || true
+      "$_fw" -t mangle -C INPUT -p tcp --dport "$_p" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$_mss" 2>/dev/null \
+        || "$_fw" -t mangle -A INPUT -p tcp --dport "$_p" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$_mss" 2>/dev/null \
+        || true
+    done
+  done
+  return 0
+}
+
 # ---- 问 1：域名 ----
 echo "提示：建议用子域名，例如 file.example.com；"
 echo "主域名（如 example.com）留着以后做别的用，子域名可以建很多个、每个服务一个。"
@@ -504,6 +528,7 @@ elif command -v iptables >/dev/null 2>&1; then
 else
   echo "没检测到防火墙工具：如果外网打不开，去云服务商安全组放行 TCP ${PORT}。"
 fi
+clamp_public_mss "$PORT" || true
 echo ""
 
 # ---- certbot 自动续期 ----
@@ -800,6 +825,7 @@ else
     echo "请检查主机防火墙和服务商安全组，放行 TCP 80/443。"
   fi
 fi
+clamp_public_mss 80 443 || true
 echo ""
 
 # ---- 收尾：等证书并验证 ----

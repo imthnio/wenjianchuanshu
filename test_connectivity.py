@@ -706,7 +706,13 @@ class Connectivity(unittest.TestCase):
         self.assertIn("NAT_DETECTED", https)
         self.assertIn("自动检测：本机出口 IP", https)
         self.assertIn("location.origin", program)
-        self.assertIn('VERSION = "1.2.2"', program)
+        self.assertIn('VERSION = "1.2.3"', program)
+
+    def test_public_mss_clamp_skipped_for_normal_user(self):
+        # 普通用户启动不能改防火墙。root 上才会按 Caddy 的公网端口钳 MSS。
+        if os.geteuid() == 0:
+            self.skipTest("root would touch iptables")
+        self.assertEqual(app.clamp_public_mss(), [])
 
     def test_health_fails_when_database_unavailable(self):
         with self.server('127.0.0.1') as port:
@@ -2473,7 +2479,7 @@ run();
             app.create_user("pw123456", is_admin=True)
             cookie = self._chunk_login(port, "pw123456")
             sid = self._chunk_make_share(port, cookie)
-            payload = os.urandom(9 * 1024 * 1024 + 123)  # 3 片：4M+4M+1M+123B
+            payload = os.urandom(2 * app.CHUNK_SIZE + 123)  # 整整两片，再加一小片
             nchunks = 3
             s, b = self._chunk_post(
                 port, "/api/chunk_init",
@@ -2484,7 +2490,7 @@ run();
             up = json.loads(b.decode("utf-8"))["up"]
             sent = 0
             for i in range(nchunks):
-                part = payload[i * 4 * 1024 * 1024:(i + 1) * 4 * 1024 * 1024]
+                part = payload[i * app.CHUNK_SIZE:(i + 1) * app.CHUNK_SIZE]
                 s, b = self._chunk_post(
                     port, "/api/chunk?up=%s&i=%d" % (up, i), raw=part,
                     cookie=cookie)
@@ -2611,11 +2617,14 @@ run();
                 {"sid": sid, "kind": "add", "name": "lie.bin",
                  "size": "100", "chunks": "5"}, cookie=cookie)
             self.assertEqual(s, 400)
-            # 超上限 -> 413（片数必须与大小自洽：238418580）
+            # 超上限 -> 413（片数必须与大小自洽，否则会先 400）
+            huge = 10 ** 15
             s, _ = self._chunk_post(
                 port, "/api/chunk_init",
                 {"sid": sid, "kind": "add", "name": "big.bin",
-                 "size": str(10 ** 15), "chunks": "238418580"}, cookie=cookie)
+                 "size": str(huge),
+                 "chunks": str((huge + app.CHUNK_SIZE - 1) // app.CHUNK_SIZE)},
+                cookie=cookie)
             self.assertEqual(s, 413)
 
     def test_chunk_duplicate_retry_is_idempotent(self):
@@ -2625,7 +2634,7 @@ run();
             app.create_user("pw123456", is_admin=True)
             cookie = self._chunk_login(port, "pw123456")
             sid = self._chunk_make_share(port, cookie)
-            p0 = os.urandom(4 * 1024 * 1024)
+            p0 = os.urandom(app.CHUNK_SIZE)
             p1 = os.urandom(100)
             s, b = self._chunk_post(
                 port, "/api/chunk_init",
@@ -2652,6 +2661,33 @@ run();
                     "SELECT stored FROM files WHERE share_id=?", (sid,)).fetchone()[0]
             disk = open(os.path.join(app.FILES_DIR, stored), "rb").read()
             self.assertEqual(disk, p0 + p1)
+
+    def test_chunk_done_replay_is_success(self):
+        # 完成请求的响应在路上丢了，客户端会再叫一次 chunk_done。
+        # 文件已经入库，第二次必须仍是成功，而且不能再插一行。
+        with self.server("127.0.0.1") as port:
+            app.create_user("pw123456", is_admin=True)
+            cookie = self._chunk_login(port, "pw123456")
+            sid = self._chunk_make_share(port, cookie)
+            s, b = self._chunk_post(
+                port, "/api/chunk_init",
+                {"sid": sid, "kind": "add", "name": "once.bin",
+                 "size": "4", "chunks": "1"}, cookie=cookie)
+            up = json.loads(b.decode("utf-8"))["up"]
+            s, _ = self._chunk_post(port, "/api/chunk?up=%s&i=0" % up,
+                                    raw=b"data", cookie=cookie)
+            self.assertEqual(s, 200)
+            s, _ = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                    cookie=cookie)
+            self.assertEqual(s, 200)
+            s, body = self._chunk_post(port, "/api/chunk_done", {"up": up},
+                                       cookie=cookie)
+            self.assertEqual(s, 200)
+            self.assertTrue(json.loads(body.decode("utf-8"))["ok"])
+            with app.db() as dbc:
+                n = dbc.execute("SELECT COUNT(*) FROM files WHERE share_id=?",
+                                (sid,)).fetchone()[0]
+            self.assertEqual(n, 1)
 
     def test_chunk_done_rechecks_permission(self):
         # 完成阶段重新鉴权：初始化分片时有权限，传完时用户已被删、

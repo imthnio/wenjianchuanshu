@@ -30,7 +30,9 @@ import socket
 import mimetypes
 import hashlib
 import secrets
+import shutil
 import sqlite3
+import subprocess
 import threading
 import tempfile
 from http.client import HTTPConnection, HTTPException
@@ -39,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -715,11 +717,12 @@ MAX_FIELDS_TOTAL_BYTES = 256 * 1024
 MAX_PART_NAME_BYTES = 256
 
 # ---------------- 分片上传 ----------------
-# 大文件一次 POST 传完，经过 Cloudflare 这类反代时很容易因为
-# “单个请求耗时太长”被中间环节掐掉（用户看到的就是 请求失败(522)）。
-# 切成小片逐个传：每个请求都很快完成，既避开超时，又能显示真实的
-# 上传百分比；某片失败也只重传该片，不用整个文件重来。
-CHUNK_SIZE = 4 * 1024 * 1024  # 每片 4MB
+# 大文件一次 POST 传完，经过 Cloudflare / Caddy 时很容易因为
+# “单个请求耗时太长”被中间环节掐掉。浏览器这边如果用 fetch 传，
+# 既看不到片内进度，请求挂死也不会超时，进度条就一直停着。
+# 切成 1MB：慢速网络也能在常见的 100 秒代理超时前传完一片；
+# 某一片卡住只中断并重传这一片。
+CHUNK_SIZE = 1 * 1024 * 1024  # 每片 1MB
 CHUNK_TTL = 2 * 3600  # 分片会话 2 小时没传完就清理临时文件
 
 # 服务端同时存在的分片上传会话上限：每个会话占一个内存条目 + 磁盘上一个
@@ -729,78 +732,154 @@ CHUNK_TTL = 2 * 3600  # 分片会话 2 小时没传完就清理临时文件
 MAX_CHUNK_SESSIONS = 1000
 
 # 分片上传的前端通用函数：分享页“添加文件”、接收页“上传”、控制台
-# “发送文件”三个上传入口共用。大文件切成 4MB 一片逐个 POST，每片请求
-# 都很快完成，经过 Cloudflare 这类反代不会因“单个请求耗时太长”被掐
-# （之前整文件一次 POST 大文件容易 请求失败(522)）；同时能显示真实的
-# 上传百分比和“正在上传第几个/上传完成”，某片失败只重传该片。
-CHUNK_JS = """
+# “发送文件”三个上传入口共用。用 XHR 而不是 fetch：fetch 没有上传进度，
+# 连接挂死时 Promise 也不会结束，进度条就停在那里。某一片 30 秒没有
+# 新字节就中断这条连接并退避重试；服务端认同一片的重传，不会把文件写坏。
+CHUNK_JS = r"""
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-var CHUNK_SIZE=4*1024*1024;
+var CHUNK_SIZE=@@CHUNK@@;
 // params: {sid, kind:'add'|'upload'}；ui: {prog, pct, stat}
 // 成功 resolve()，失败 reject(Error)，错误信息可直接展示给用户。
 function chunkUpload(params, files, ui){
   return new Promise(function(resolve, reject){
-    var total=0, i;
+    var STALL_MS=30000, HARD_MS=600000, MAX_TRIES=4;
+    var total=0, i, doneBytes=0, shown=0, stopped=false;
     for(i=0;i<files.length;i++) total+=files[i].size;
-    var sent=0;
-    function paint(){
-      var p=total>0?Math.floor(sent/total*100):100;
-      ui.prog.value=p;
+    function fmt(n){
+      if(typeof fmtSize==='function') return fmtSize(n);
+      if(n<1024) return n+' B';
+      if(n<1048576) return (n/1024).toFixed(1)+' KB';
+      return (n/1048576).toFixed(1)+' MB';
+    }
+    function paint(extra){
+      var n=doneBytes+(extra||0);
+      if(n<0) n=0;
+      if(total>0 && n>total) n=total;
+      if(n>shown) shown=n;
+      var p=total>0?Math.floor(shown*100/total):0;
+      if(p>99) p=99;
+      if(ui.prog) ui.prog.value=p;
       if(ui.pct) ui.pct.textContent=p+'%';
     }
-    function jpost(url, body){
-      return fetch(url,{method:'POST',
-        headers:{'Content-Type':'application/x-www-form-urlencoded'},
-        body:body}).then(function(r){
-          return r.json().catch(function(){return null;}).then(function(j){
-            return {status:r.status, json:j};
-          });
-        });
+    function stop(err){
+      if(stopped) return;
+      stopped=true;
+      reject(err instanceof Error?err:new Error(String(err||'上传失败')));
+    }
+    function retryable(status, j){
+      // 网络中断、代理超时、服务端明确说可以重试的才重传。
+      // 权限、文件过大、磁盘满、分片作废重传也没用。
+      if(status===0||status===408||status===429) return true;
+      if(status===502||status===503||status===504||status>=520) return true;
+      var msg=(j&&j.error)||'';
+      return msg.indexOf('请重试')>=0;
+    }
+    // allow500：建会话和传片失败可以整片重来。完成入库的 500 不重试，
+    // 避免服务端已经收齐后再被重放。
+    function post(url, body, asForm, onBytes, allow500){
+      return new Promise(function(res, rej){
+        var tries=0;
+        function send(){
+          if(stopped) return;
+          tries++;
+          var xhr=new XMLHttpRequest();
+          var settled=false, last=Date.now(), started=last;
+          var timer=setInterval(function(){
+            if(settled||stopped) return;
+            var now=Date.now();
+            if(now-last>=STALL_MS) failTry(new Error('网络卡住，正在重试'));
+            else if(now-started>=HARD_MS) failTry(new Error('这一片耗时太长，正在重试'));
+          },1000);
+          function cleanup(){
+            clearInterval(timer);
+            try{xhr.onabort=null; xhr.abort();}catch(e){}
+          }
+          function failTry(err){
+            if(settled||stopped) return;
+            settled=true;
+            cleanup();
+            if(tries<MAX_TRIES){
+              if(ui.stat) ui.stat.textContent=(err.message||'正在重试')+'（'+tries+'/'+MAX_TRIES+'）…';
+              setTimeout(send, 800*tries*tries);
+            }else{
+              rej(new Error((err.message||'上传失败')+'（已重试多次仍失败）'));
+            }
+          }
+          function succeed(j){
+            if(settled||stopped) return;
+            settled=true;
+            clearInterval(timer);
+            res(j);
+          }
+          xhr.open('POST', url);
+          if(asForm) xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+          xhr.upload.onprogress=function(e){
+            last=Date.now();
+            if(onBytes&&e.lengthComputable) onBytes(e.loaded);
+          };
+          xhr.upload.onload=function(){last=Date.now();};
+          xhr.onprogress=function(){last=Date.now();};
+          xhr.onload=function(){
+            if(settled||stopped) return;
+            last=Date.now();
+            var j=null;
+            try{j=JSON.parse(xhr.responseText);}catch(e){}
+            if(j&&j.ok){succeed(j); return;}
+            var msg=(j&&j.error)||('请求失败('+(xhr.status||0)+')');
+            if(retryable(xhr.status, j)||(allow500&&xhr.status===500)) failTry(new Error(msg));
+            else{settled=true; clearInterval(timer); rej(new Error(msg));}
+          };
+          xhr.onerror=function(){failTry(new Error('网络错误'));};
+          xhr.ontimeout=function(){failTry(new Error('上传超时'));};
+          try{xhr.send(body==null?'':body);}
+          catch(e){failTry(new Error('网络错误'));}
+        }
+        send();
+      });
     }
     function upFile(fi){
-      if(fi>=files.length){ paint(); resolve(); return; }
-      var f=files[fi], nchunks=Math.max(1, Math.ceil(f.size/CHUNK_SIZE));
+      if(stopped) return;
+      if(fi>=files.length){paint(0); resolve(); return;}
+      var f=files[fi];
+      var nchunks=Math.max(1, Math.ceil(f.size/CHUNK_SIZE));
       if(ui.stat) ui.stat.innerHTML='正在上传 <b>'+escapeHtml(f.name)+'</b>（'+(fi+1)+'/'+files.length+'）…';
-      jpost('/api/chunk_init',
+      post('/api/chunk_init',
         'sid='+encodeURIComponent(params.sid)+'&kind='+params.kind+
-        '&name='+encodeURIComponent(f.name)+'&size='+f.size+'&chunks='+nchunks
-      ).then(function(r){
-        if(!r.json||!r.json.ok) throw new Error((r.json&&r.json.error)||('请求失败('+r.status+')'));
-        var up=r.json.up;
+        '&name='+encodeURIComponent(f.name)+'&size='+f.size+'&chunks='+nchunks,
+        true, null, true).then(function(j){
+        if(stopped) return;
+        var up=j.up;
         function upChunk(c){
+          if(stopped) return;
           if(c>=nchunks){
-            jpost('/api/chunk_done','up='+encodeURIComponent(up)).then(function(r2){
-              if(!r2.json||!r2.json.ok) throw new Error((r2.json&&r2.json.error)||('请求失败('+r2.status+')'));
+            post('/api/chunk_done','up='+encodeURIComponent(up), true, null, false).then(function(){
+              if(stopped) return;
               upFile(fi+1);
-            }).catch(reject);
+            }).catch(stop);
             return;
           }
-          var blob=f.slice(c*CHUNK_SIZE,(c+1)*CHUNK_SIZE), tries=0;
-          function retryOrFail(err){
-            // 退避重试：手机网络抖动时立刻连发 3 次往往全部失败
-            if(tries<4){ setTimeout(send, 800*tries*tries); }
-            else{ reject(new Error(err.message+'（第'+(c+1)+'片，已重试多次仍失败）')); }
+          var blob=f.slice(c*CHUNK_SIZE,(c+1)*CHUNK_SIZE);
+          function note(loaded){
+            paint(loaded||0);
+            if(ui.stat) ui.stat.innerHTML='正在上传 <b>'+escapeHtml(f.name)+'</b>（'+(fi+1)+'/'+files.length
+              +'）'+fmt(doneBytes+(loaded||0))+' / '+fmt(total);
           }
-          function send(){
-            tries++;
-            fetch('/api/chunk?up='+encodeURIComponent(up)+'&i='+c,{method:'POST',body:blob})
-            .then(function(r3){
-              return r3.json().catch(function(){return null;}).then(function(j3){
-                if(j3&&j3.ok){ sent+=blob.size; paint(); upChunk(c+1); }
-                else{ retryOrFail(new Error((j3&&j3.error)||('请求失败('+r3.status+')'))); }
-              });
-            }).catch(function(){ retryOrFail(new Error('网络错误')); });
-          }
-          send();
+          note(0);
+          post('/api/chunk?up='+encodeURIComponent(up)+'&i='+c, blob, false, note, true).then(function(){
+            if(stopped) return;
+            doneBytes+=blob.size;
+            paint(0);
+            upChunk(c+1);
+          }).catch(stop);
         }
         upChunk(0);
-      }).catch(reject);
+      }).catch(stop);
     }
-    paint();
+    paint(0);
     upFile(0);
   });
 }
-"""
+""".replace("@@CHUNK@@", str(CHUNK_SIZE))
 
 # urlencoded 表单最多解析多少个字段：1MB 的 body 全是 a0=1&a1=1… 这种
 # 碎字段时，parse_qs 会造出十几万个 dict 条目（几十 MB 临时内存）。
@@ -1725,8 +1804,8 @@ function bindXhr(fid, url, resId, progId, okText){{
 }}
 bindXhr('recvForm','/api/receive','recvRes',null,'接收链接已生成：');
 // 控制台“发送文件”走分片上传：先建分享拿 sid，再把文件一片片传上去。
-// 大文件不再整文件一次 POST，不会被反代掐（请求失败(522)），
-// 还有实时百分比和“上传完成”提示。
+// 进度按已发送的字节走；某一片 30 秒没有新数据会中断并重试，
+// 不会再停在同一个百分比上不动。
 document.getElementById('sendForm').addEventListener('submit', function(ev){{
   ev.preventDefault();
   var form=ev.target, res=document.getElementById('sendRes'),
@@ -2080,7 +2159,9 @@ PREVIEW_JS = r"""
       // 同视频：iOS 遇到不支持的格式（如部分 .opus/.oga）可能不报错一直转圈
       var at0=Date.now(), anote=null;
       watch=setInterval(function(){
-        if(my!==token||anote||a.readyState>=1||a.paused&&a.networkState!==2||Date.now()-at0<15000) return;
+        // 不要求已经按下播放：iOS 对不支持的格式常常既不报错也不进入 loading，
+        // 加上 paused 判断后，15 秒提示永远不会出现。
+        if(my!==token||anote||a.readyState>=1||Date.now()-at0<15000) return;
         anote=el('div','pv-amsg','音频加载很慢或浏览器不支持这个格式。'); actions(anote, function(){retryVideo(0);}); box.appendChild(anote);
       },1000);
       a.addEventListener('loadedmetadata', function(){if(anote){anote.remove(); anote=null;} at0=Infinity;});
@@ -2378,8 +2459,8 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
   res.innerHTML=''; btn.disabled=true;
   wrap.style.display='flex'; prog.value=0; pct.textContent='0%';
   stat.textContent='准备上传…';
-  // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
-  // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
+  // 大文件自动分片：每片 1MB。进度按字节走，30 秒没有新数据就中断重试，
+  // 不会像整文件一次 POST 那样被反代掐掉后停在原地。
   chunkUpload({sid:'""" + sid + """', kind:'add'}, files,
     {prog:prog, pct:pct, stat:stat}).then(function(){
       prog.value=100; pct.textContent='100%';
@@ -2421,8 +2502,8 @@ document.getElementById('upForm').addEventListener('submit', function(ev){
   res.innerHTML=''; btn.disabled=true;
   wrap.style.display='flex'; prog.value=0; pct.textContent='0%';
   stat.textContent='准备上传…';
-  // 大文件自动分片上传：每片 4MB，单片请求很快完成，不会像以前整文件
-  // 一次 POST 那样被反代掐掉（请求失败(522)）；进度条+百分比实时显示。
+  // 大文件自动分片：每片 1MB。进度按字节走，30 秒没有新数据就中断重试，
+  // 不会像整文件一次 POST 那样被反代掐掉后停在原地。
   chunkUpload({sid:'""" + sid + """', kind:'upload'}, files,
     {prog:prog, pct:pct, stat:stat}).then(function(){
       prog.value=100; pct.textContent='100%';
@@ -2558,6 +2639,21 @@ class Handler(BaseHTTPRequestHandler):
             pending = True
         if pending:
             self.close_connection = True
+
+    def _discard_body(self, n):
+        # 把已经声明的请求体读掉再回响应。不读的话，浏览器还在上传、
+        # 服务端的响应又写不进填满的发送窗口，两边一起卡住。
+        remain = n
+        while remain > 0:
+            try:
+                data = self.rfile.read(min(65536, remain))
+            except (TimeoutError, OSError):
+                self.close_connection = True
+                return
+            if not data:
+                self.close_connection = True
+                return
+            remain -= len(data)
 
     def _require_auth(self):
         # API 鉴权：通过返回账号字典；未登录回 401，
@@ -2720,17 +2816,74 @@ class Handler(BaseHTTPRequestHandler):
             st = self.server._chunk
         return st, self.server._chunk_lock
 
-    def _chunk_sweep(self, now):
-        # 清理过期没传完的会话与其临时文件
+    def _chunk_book(self):
         st, lock = self._chunk_state()
+        done = getattr(self.server, "_chunk_done", None)
+        if done is None:
+            # 已经成功落盘的 token。完成请求的响应如果在路上丢了，
+            # 客户端会再叫一次 chunk_done；没有这份记录就会被当成
+            # “上传不完整”，文件其实已经在了。
+            self.server._chunk_done = {}
+            done = self.server._chunk_done
+        return st, lock, done
+
+    def _chunk_sweep(self, now):
+        # 清理过期没传完的会话与其临时文件。正在落盘的会话先留着，
+        # 避免和 chunk_done 同时删掉临时文件。
+        st, lock, done = self._chunk_book()
         with lock:
-            dead = [t for t, e in st.items() if e["expires"] <= now]
+            dead = [t for t, e in st.items()
+                    if e["expires"] <= now and not e.get("finishing")]
             for t in dead:
                 e = st.pop(t)
                 try:
                     os.unlink(e["tmp"])
                 except OSError:
                     pass
+            for t in [t for t, exp in done.items() if exp <= now]:
+                done.pop(t, None)
+
+    def _chunk_done_begin(self, token):
+        """返回 (state, extra)。
+        dup：这份上传已经成功落盘，再叫一次直接当成功。
+        busy：另一个请求正在落盘，让客户端等一下再试。
+        bad：会话不存在或没收齐；extra 是要删的临时文件路径或 None。
+        go：可以落盘；extra 是会话本身，并且已经标成 finishing。
+        """
+        st, lock, done = self._chunk_book()
+        now = time.time()
+        with lock:
+            for t in [t for t, exp in done.items() if exp <= now]:
+                done.pop(t, None)
+            if done.get(token, 0) > now:
+                return "dup", None
+            e = st.get(token)
+            if e is None:
+                return "bad", None
+            if e.get("finishing"):
+                return "busy", None
+            if e["expires"] <= now or e["recvd"] != e["size"]:
+                st.pop(token, None)
+                return "bad", e["tmp"]
+            e["finishing"] = True
+            return "go", e
+
+    def _chunk_done_abort(self, token, unlink):
+        st, lock, _done = self._chunk_book()
+        with lock:
+            e = st.pop(token, None)
+        if unlink and e is not None:
+            try:
+                os.unlink(e["tmp"])
+            except OSError:
+                pass
+
+    def _chunk_done_commit(self, token):
+        st, lock, done = self._chunk_book()
+        with lock:
+            st.pop(token, None)
+            # 留 10 分钟给丢了响应的客户端重放完成请求。
+            done[token] = time.time() + 600
 
     def _discard_uploads(self, files):
         for fo in files:
@@ -2739,26 +2892,21 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _chunk_finalize(self, e):
+    def _chunk_finalize(self, e, token):
         # 分片收齐后落盘入库：与普通上传走同样的 files 表结构。
         # 传的过程中分享可能过期/被删：这时文件不能入库，删临时文件。
+        # 成功后先记下 token 再写响应：响应在路上丢了，重放也能认出是同一次。
         want = "send" if e["kind"] == "add" else "receive"
         share = self._valid_share(e["sid"], want)
         if not share:
-            try:
-                os.unlink(e["tmp"])
-            except OSError:
-                pass
+            self._chunk_done_abort(token, True)
             return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
         stored = secrets.token_hex(16)
         try:
             os.rename(e["tmp"], os.path.join(FILES_DIR, stored))
         except OSError:
-            try:
-                os.unlink(e["tmp"])
-            except OSError:
-                pass
-            return self._json({"ok": False, "error": "保存失败，请重试"}, 500)
+            self._chunk_done_abort(token, True)
+            return self._json({"ok": False, "error": "保存失败，请重新上传"}, 500)
         now = int(time.time())
         try:
             with db() as c:
@@ -2771,7 +2919,9 @@ class Handler(BaseHTTPRequestHandler):
                 os.unlink(os.path.join(FILES_DIR, stored))
             except OSError:
                 pass
+            self._chunk_done_abort(token, False)
             raise
+        self._chunk_done_commit(token)
         return self._json({"ok": True})
 
     def _parse_range(self, size):
@@ -3685,9 +3835,13 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         expect_n = -1
                 if not live or (not dup and (n != expect_n or n < 0 or n > CHUNK_SIZE)):
-                    # 序号/大小对不上：不读 body，直接关连接，客户端
-                    # 重传这一片即可（body 最多 4MB，但恶意请求可能谎报
-                    # 超大 Content-Length，不能无脑读完）。
+                    # 序号/大小对不上。片本身不超过上限时先把 body 读掉再返回，
+                    # 否则浏览器还在传、服务端又不读，两边互相堵住，进度会停住。
+                    # 谎报的超大 Content-Length 不能读，直接关连接。
+                    if 0 <= n <= CHUNK_SIZE:
+                        self._discard_body(n)
+                        return self._json(
+                            {"ok": False, "error": "分片已失效，请重新上传"}, 400)
                     return self._fail_close(
                         {"ok": False, "error": "分片已失效，请重新上传"}, 400)
                 try:
@@ -3742,42 +3896,45 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "recvd": recvd})
 
             if p == "/api/chunk_done":
-                # 分片上传第 3 步：收齐确认，落盘入库
+                # 分片上传第 3 步：收齐确认，落盘入库。
+                # 响应丢了客户端会再叫一次：已经入库的直接回成功，
+                # 正在入库的让它等一下再试，避免两路同时 rename。
                 f = self._form()
                 token = f.get("up", "")
                 if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
                     return self._json({"ok": False, "error": "上传会话无效"}, 400)
-                st, lock = self._chunk_state()
-                with lock:
-                    e = st.pop(token, None)
-                if (e is None or e["expires"] <= time.time()
-                        or e["recvd"] != e["size"]):
-                    if e is not None:
+                state, extra = self._chunk_done_begin(token)
+                if state == "dup":
+                    return self._json({"ok": True})
+                if state == "busy":
+                    return self._json({"ok": False, "error": "正在保存，请重试"}, 503)
+                if state != "go":
+                    if extra:
                         try:
-                            os.unlink(e["tmp"])
+                            os.unlink(extra)
                         except OSError:
                             pass
                     return self._json({"ok": False, "error": "上传不完整，请重新上传"}, 400)
-                if e["kind"] == "add":
-                    # 完成阶段重新鉴权：初始化时有权限，不代表传完时还有。
-                    # 用户可能被删、会话可能失效、分享可能易主——这时不能入库。
-                    # 注意：会话已从内存 pop，无论鉴权成败都要删临时文件，
-                    # 否则 sweep 也清不到，会永久占磁盘。
-                    user = self._require_auth()
-                    if not user:
-                        try:
-                            os.unlink(e["tmp"])
-                        except OSError:
-                            pass
-                        return
-                    s = self._valid_share(e["sid"], "send")
-                    if not s or not can_manage_share(user, s):
-                        try:
-                            os.unlink(e["tmp"])
-                        except OSError:
-                            pass
-                        return self._json({"ok": False, "error": "无权限或分享已失效"}, 403)
-                return self._chunk_finalize(e)
+                e = extra
+                try:
+                    if e["kind"] == "add":
+                        # 完成阶段重新鉴权：初始化时有权限，不代表传完时还有。
+                        # 用户可能被删、会话可能失效、分享可能易主——这时不能入库。
+                        # 会话还在内存里（标了 finishing），成败都要摘掉并删临时文件，
+                        # 否则 sweep 看到 finishing 不会清，会一直占磁盘。
+                        user = self._require_auth()
+                        if not user:
+                            self._chunk_done_abort(token, True)
+                            return
+                        s = self._valid_share(e["sid"], "send")
+                        if not s or not can_manage_share(user, s):
+                            self._chunk_done_abort(token, True)
+                            return self._json(
+                                {"ok": False, "error": "无权限或分享已失效"}, 403)
+                    return self._chunk_finalize(e, token)
+                except Exception:
+                    self._chunk_done_abort(token, True)
+                    raise
 
             # 未知路径：body 没读的话关连接，防残留污染 keep-alive
             self._close_if_body_pending()
@@ -3833,9 +3990,11 @@ class Server(ThreadingHTTPServer):
         self._login_fail = {}
         self._login_lock = threading.Lock()
         # 分片上传会话：token -> {sid,kind,filename,size,chunks,next,
-        # recvd,tmp,expires}。放 Server 实例上，测试里每个 Server 互不干扰。
+        # recvd,tmp,expires,finishing}。放 Server 实例上，测试里每个 Server 互不干扰。
         self._chunk = {}
         self._chunk_lock = threading.Lock()
+        # 已成功完成的 token -> 过期时间。完成响应丢失时重放用。
+        self._chunk_done = {}
         super().__init__(server_address, handler, bind_and_activate)
 
     def get_request(self):
@@ -3845,6 +4004,12 @@ class Server(ThreadingHTTPServer):
         # 超时按"连续无数据"计算，正常传大文件不受影响。
         conn, addr = super().get_request()
         conn.settimeout(self.conn_timeout)
+        # 小的 JSON 回包不要等 Nagle 攒包。上传每片都在等这个回包，
+        # 延迟攒一会儿，进度看起来就像一顿一顿地停。
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
         return conn, addr
 
     def server_bind(self):
@@ -3862,6 +4027,60 @@ class Server(ThreadingHTTPServer):
             except (OSError, AttributeError):
                 pass
         super().server_bind()
+
+
+def clamp_public_mss():
+    """把访客真正连上的端口的 TCP MSS 也钳住。
+
+    Python 自己的 TCP_MAXSEG 只影响本进程 listen 的套接字。前面是 Caddy 时，
+    访客连的是 Caddy，大包被 PMTU 黑洞丢掉，上传就会停住。这里在每次启动时
+    补上同样的规则（SHARE_MSS=0 则不动）。失败不影响服务启动。
+    """
+    if MSS <= 0:
+        return []
+    try:
+        if os.geteuid() != 0:
+            return []
+    except AttributeError:
+        return []
+    ports = []
+    if HOST not in ("127.0.0.1", "::1", "localhost"):
+        ports.append(PORT)
+    try:
+        base = caddy_public_base(PORT)
+    except Exception:
+        base = ""
+    if base:
+        try:
+            public_port = urlparse(base).port or 443
+        except ValueError:
+            public_port = None
+        if public_port:
+            ports.append(public_port)
+    seen = []
+    for port in ports:
+        if isinstance(port, int) and 1 <= port <= 65535 and port not in seen:
+            seen.append(port)
+    if not seen:
+        return []
+    for fw in ("iptables", "ip6tables"):
+        if shutil.which(fw) is None:
+            continue
+        for port in seen:
+            for chain, flag in (("OUTPUT", "--sport"), ("INPUT", "--dport")):
+                rule = ["-p", "tcp", flag, str(port), "--tcp-flags", "SYN,RST",
+                        "SYN", "-j", "TCPMSS", "--set-mss", str(MSS)]
+                try:
+                    chk = subprocess.run(
+                        [fw, "-t", "mangle", "-C", chain, *rule],
+                        capture_output=True, timeout=5)
+                    if chk.returncode != 0:
+                        subprocess.run(
+                            [fw, "-t", "mangle", "-A", chain, *rule],
+                            capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+    return seen
 
 
 def check_server(host, port, attempts=10):
@@ -3915,6 +4134,7 @@ def _sweep_startup_files():
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--check":
         sys.exit(check_server(sys.argv[2], int(sys.argv[3])))
+    clamped = clamp_public_mss()
     init_db()
     _sweep_startup_files()
     cleanup_expired()
@@ -3922,7 +4142,8 @@ def main():
     srv = Server((HOST, PORT), Handler)
     srv.daemon_threads = True
     url_host = f"[{HOST}]" if ":" in HOST else HOST
-    print(f"minishare v{VERSION} 启动：http://{url_host}:{PORT}  数据目录={DATA_DIR} MSS={MSS}",
+    extra = (" 公网MSS端口=" + ",".join(str(p) for p in clamped)) if clamped else ""
+    print(f"minishare v{VERSION} 启动：http://{url_host}:{PORT}  数据目录={DATA_DIR} MSS={MSS}{extra}",
           flush=True)
     try:
         srv.serve_forever()
