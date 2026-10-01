@@ -2119,7 +2119,7 @@ PREVIEW_JS = r"""
   closeB.addEventListener('click', close);
   prevB.addEventListener('click', function(){step(-1);});
   nextB.addEventListener('click', function(){step(1);});
-  stage.addEventListener('click', function(ev){ if(ev.target===stage) close(); });
+  // 点媒体四周的黑色区域不再关闭预览（手机上很容易误触），只能点右上角 ✕、按 Esc 或返回键关闭。
   document.addEventListener('keydown', function(ev){
     if(pv.hidden) return;
     if(ev.key==='Escape'){ev.preventDefault(); close(); return;}
@@ -2135,8 +2135,17 @@ PREVIEW_JS = r"""
       else if(!ev.shiftKey&&document.activeElement===last){ev.preventDefault(); first.focus();}
     }
   });
-  stage.addEventListener('touchstart', function(e){ tx=(e.touches.length===1&&pv.getAttribute('data-kind')==='img'&&!stage.classList.contains('zoom'))?e.touches[0].clientX:null; }, {passive:true});
-  stage.addEventListener('touchend', function(e){ if(tx===null) return; var dx=e.changedTouches[0].clientX-tx; tx=null; if(Math.abs(dx)>50) step(dx<0?1:-1); });
+  // 左右滑动切换：图片上、或视频/音频周围的空白处都可以滑；视频本身和控制条上的
+  // 手势（拖进度条等）留给播放器，不拦截、不 preventDefault。
+  function swipeable(t){
+    if(stage.classList.contains('zoom')) return false;
+    if(pv.getAttribute('data-kind')==='img') return true;
+    return !(t.closest&&t.closest('video,audio,iframe,pre,a,button,input'));
+  }
+  stage.addEventListener('touchstart', function(e){
+    if(e.touches.length===1&&swipeable(e.target)){tx=e.touches[0].clientX; ty=e.touches[0].clientY;} else tx=null;
+  }, {passive:true});
+  stage.addEventListener('touchend', function(e){ if(tx===null) return; var dx=e.changedTouches[0].clientX-tx, dy=e.changedTouches[0].clientY-ty; tx=null; if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)*1.5) step(dx<0?1:-1); }, {passive:true});
 })();
 """
 
