@@ -777,8 +777,9 @@ function chunkUpload(params, files, ui){
           }
           var blob=f.slice(c*CHUNK_SIZE,(c+1)*CHUNK_SIZE), tries=0;
           function retryOrFail(err){
-            if(tries<3){ send(); }
-            else{ reject(new Error(err.message+'（第'+(c+1)+'片，已重试3次仍失败）')); }
+            // 退避重试：手机网络抖动时立刻连发 3 次往往全部失败
+            if(tries<4){ setTimeout(send, 800*tries*tries); }
+            else{ reject(new Error(err.message+'（第'+(c+1)+'片，已重试多次仍失败）')); }
           }
           function send(){
             tries++;
@@ -1264,6 +1265,7 @@ html.pv-lock,html.pv-lock body{overflow:hidden}
 .pv-audio{background:rgba(255,255,255,.06);border-radius:16px;padding:28px 22px;text-align:center;width:min(480px,100%)}
 .pv-audio .ic{width:48px;height:48px;color:#ffb27a;margin-bottom:8px}
 .pv-audio audio{width:100%;margin-top:14px}
+.pv-amsg{margin-top:14px;font-size:14px;color:#d0d5dd;line-height:1.6}.pv-amsg .btn{margin:10px 4px 0}
 .pv-msg{text-align:center;max-width:440px;color:#d0d5dd;line-height:1.7}
 .pv-msg .btn{margin:14px 4px 0}
 .pv-nav{position:absolute;top:50%;margin-top:-24px;width:48px;height:48px;min-height:0;padding:0;border-radius:50%;z-index:2}
@@ -2072,8 +2074,16 @@ PREVIEW_JS = r"""
       box.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
       box.appendChild(el('div','',name));
       var a=document.createElement('audio'); a.controls=true; a.preload='metadata';
-      a.onerror=function(){if(my!==token)return; fail('浏览器无法播放这个音频格式，可以下载后播放。');};
-      a.src=src; box.appendChild(a); stage.appendChild(box);
+      a.onerror=function(){if(my!==token)return; clearInterval(watch);
+        fail('音频加载失败：浏览器无法播放这个格式，或网络中断。可以重试，或下载后播放。', function(){retryVideo(0);});};
+      a.src=retries?src+'?r='+retries:src; box.appendChild(a); stage.appendChild(box);
+      // 同视频：iOS 遇到不支持的格式（如部分 .opus/.oga）可能不报错一直转圈
+      var at0=Date.now(), anote=null;
+      watch=setInterval(function(){
+        if(my!==token||anote||a.readyState>=1||a.paused&&a.networkState!==2||Date.now()-at0<15000) return;
+        anote=el('div','pv-amsg','音频加载很慢或浏览器不支持这个格式。'); actions(anote, function(){retryVideo(0);}); box.appendChild(anote);
+      },1000);
+      a.addEventListener('loadedmetadata', function(){if(anote){anote.remove(); anote=null;} at0=Infinity;});
       var pa=a.play(); if(pa&&pa.catch) pa.catch(function(){});
     }else if(kind==='pdf'){
       if(navigator.pdfViewerEnabled===false||(navigator.pdfViewerEnabled===undefined&&/Android|iPhone|iPad|Mobile/i.test(navigator.userAgent))){
