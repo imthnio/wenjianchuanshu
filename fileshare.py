@@ -602,10 +602,15 @@ def set_share_pw(sid, pw):
         c.execute("UPDATE shares SET pw=? WHERE id=?", (pw or None, sid))
 
 def _share_pw_key():
+    # 先只读：每次访问加密分享（视频拖动会连发很多请求）都写库会和其他写事务抢锁。
+    # 第一次没有密钥时才写，INSERT OR IGNORE 保证并发时也只有一个密钥。
+    key = meta_get("share_pw_key")
+    if key:
+        return key
     with db() as c:
         c.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('share_pw_key',?)",
                   (secrets.token_hex(32),))
-        return c.execute("SELECT v FROM meta WHERE k='share_pw_key'").fetchone()["v"]
+    return meta_get("share_pw_key")
 
 def share_unlock_token(sid, pw):
     return hmac.new(_share_pw_key().encode(), f"{sid}:{pw}".encode(),
@@ -3161,8 +3166,10 @@ class Handler(BaseHTTPRequestHandler):
         user = self._user()
         if user and can_manage_share(user, s):
             return False
+        # 按字节比较：compare_digest 遇到非 ASCII 的 str 会抛 TypeError（伪造的 cookie 会变成 500）
         tok = self._cookie().get("sp_" + s["id"], "")
-        return not hmac.compare_digest(tok, share_unlock_token(s["id"], s["pw"]))
+        return not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                       share_unlock_token(s["id"], s["pw"]).encode())
 
     def do_HEAD(self):
         # 原来没有 HEAD，Cloudflare 和浏览器探活会拿到 501。
@@ -3397,7 +3404,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._redirect(f"/s/{sid}")
                 if not self._login_allowed():
                     return self._send(429, share_lock_page(sid, "密码试错太多次，10 分钟后再试"))
-                if (f.get("pw", "") or "").strip().lower() != s["pw"]:
+                given = (f.get("pw", "") or "").strip().lower()
+                if not hmac.compare_digest(given.encode("utf-8", "replace"), s["pw"].encode()):
                     self._login_failed()
                     return self._send(200, share_lock_page(sid, "密码错误"))
                 secure = "; Secure" if self._https_request() else ""
