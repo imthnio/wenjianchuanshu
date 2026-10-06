@@ -42,7 +42,7 @@ class ShareOrderTest(unittest.TestCase):
                           ('tok%d' % uid, uid, now, now + 3600))
             for sid, typ, expiry in [('share', 'send', 0), ('other', 'send', 0),
                                      ('expired', 'send', now - 1), ('recv', 'recv', 0)]:
-                c.execute('INSERT INTO shares VALUES(?,?,?,?,?,?)',
+                c.execute('INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES(?,?,?,?,?,?)',
                           (sid, typ, '', now, expiry, 1))
         self.server = app.Server(('127.0.0.1', 0), app.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -76,31 +76,32 @@ class ShareOrderTest(unittest.TestCase):
         return [r['id'] for r in app.share_files('share')]
 
     def test_migration_moves_pins_and_new_files(self):
-        self.assertEqual(self.ids(), [1, 2, 3, 4])
+        self.assertEqual(self.ids(), [4, 3, 2, 1])  # newest upload first
         self.change(3, 'up')
-        self.assertEqual(self.ids(), [1, 3, 2, 4])
+        self.assertEqual(self.ids(), [3, 4, 2, 1])
         self.change(4, 'pin')
         self.change(2, 'pin')
-        self.assertEqual(self.ids(), [4, 2, 1, 3])
+        self.assertEqual(self.ids(), [4, 2, 3, 1])
         self.change(2, 'up')
         self.change(2, 'pin')  # explicit state is idempotent
-        self.assertEqual(self.ids(), [2, 4, 1, 3])
+        self.assertEqual(self.ids(), [2, 4, 3, 1])
         self.change(4, 'down')  # cannot cross the pinned boundary
-        self.change(1, 'up')
-        self.assertEqual(self.ids(), [2, 4, 1, 3])
+        self.change(3, 'up')
+        self.assertEqual(self.ids(), [2, 4, 3, 1])
         self.change(2, 'unpin')
-        self.assertEqual(self.ids(), [4, 1, 3, 2])
+        self.assertEqual(self.ids(), [4, 3, 1, 2])
         with app.db() as c:
             c.execute('INSERT INTO files(share_id,filename,stored) VALUES(?,?,?)',
                       ('share', 'new.txt', 'new'))
-        self.assertEqual(self.ids(), [4, 1, 3, 2, 5])
+        # a new upload goes to the top, right after the pinned files
+        self.assertEqual(self.ids(), [4, 5, 3, 1, 2])
         app.init_db()  # repeated startup preserves the saved state
-        self.assertEqual(self.ids(), [4, 1, 3, 2, 5])
+        self.assertEqual(self.ids(), [4, 5, 3, 1, 2])
         for fid in self.ids():
             self.change(fid, 'pin')
         self.assertTrue(all(r['pinned'] for r in app.share_files('share')))
         self.change(3, 'down')
-        self.assertEqual(self.ids(), [4, 1, 2, 3, 5])
+        self.assertEqual(self.ids(), [4, 5, 1, 3, 2])
 
     def test_permissions_invalid_input_and_public_page(self):
         for uid, sid, fid, action, expected in [
@@ -110,7 +111,7 @@ class ShareOrderTest(unittest.TestCase):
                 (1, 'share', 999, 'pin', 404), (1, 'share', '²', 'pin', 400),
                 (1, 'share', '9'*30, 'pin', 400), (1, 'share', 1, 'bad', 400)]:
             self.change(fid, action, uid, sid, expected)
-        self.assertEqual(self.ids(), [1, 2, 3, 4])
+        self.assertEqual(self.ids(), [4, 3, 2, 1])
         self.change(4, 'pin', uid=3)  # existing administrator privileges
         for uid in (None, 1, 2, 3):
             status, page = self.request('/s/share', uid)

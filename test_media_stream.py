@@ -31,7 +31,7 @@ class MediaStreamTest(unittest.TestCase):
         self.ids = {}
         with app.db() as c:
             c.execute("INSERT INTO users(id,pw,is_admin,created) VALUES(1,'x',1,?)", (now,))
-            c.execute("INSERT INTO shares VALUES('share','send','t',?,0,1)", (now,))
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES('share','send','t',?,0,1)", (now,))
             for name, size in (("big.mp4", BIG), ("a.MOV", 10), ("b.m4v", 10), ("c.webm", 10),
                                ("d.mkv", 10), ("e.flac", 10), ("f.opus", 10), ("g.avif", 10),
                                ("h.mp3", 10), ("i.m4a", 10)):
