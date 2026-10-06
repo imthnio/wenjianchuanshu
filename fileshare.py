@@ -1575,9 +1575,11 @@ def dash_page(shares, user, public_base=""):
             owner = ("<span class='badge'>我的</span>" if s["owner_id"] == user["id"]
                      else f"<span class='badge recv'>用户#{s['owner_id']}</span>")
         # 提取密码只用于发送分享（接收链接是给别人上传的，不加密码）
-        pw_info, pw_btns = "", ""
+        pw_info, pw_btns, copy_pw = "", "", ""
         if s["type"] == "send":
             if s["pw"]:
+                # 复制链接时一起带上提取码（密码只含数字和字母，可以直接放进 JS 字符串）
+                copy_pw = f",'{s['pw']}'"
                 pw_info = f" · 密码：<b>{html.escape(s['pw'])}</b>"
                 pw_btns = (f"<button class='ghost sm' onclick=\"delSharePw('{s['id']}')\">{icon('x')}删除密码</button>\n"
                            f"<button class='ghost sm' onclick=\"editSharePw('{s['id']}')\">{icon('edit')}修改密码</button>\n")
@@ -1592,7 +1594,7 @@ def dash_page(shares, user, public_base=""):
 <div class='edit-slot' id='ex-{s['id']}'></div><div class='edit-slot' id='pw-{s['id']}'></div>
 <div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div class='edit-slot' id='ti-{s['id']}'></div></div>
 <div class='acts'>
-<button class='ghost sm' onclick="copyLink('{s['id']}','{path}')">{icon('copy')}复制链接</button>
+<button class='ghost sm' onclick="copyLink('{s['id']}','{path}'{copy_pw})">{icon('copy')}复制链接</button>
 <a class='btn ghost sm' href='{path}' target='_blank' rel='noopener'>{icon('external')}打开</a>
 <button class='ghost sm' onclick="editTitle('{s['id']}')">{icon('edit')}改备注</button>
 <button class='ghost sm' onclick="editExpiry('{s['id']}')">{icon('clock')}改过期</button>
@@ -1755,9 +1757,9 @@ function copyText(t, box){{
     }}, fail);
   }} else {{ fail(); }}
 }}
-function copyLink(id, p){{
+function copyLink(id, p, pw){{
   var el = document.getElementById('lk-'+id);
-  var t = fullLink(p);
+  var t = fullLink(p) + (pw ? ' 提取码: ' + pw : '');
   el.textContent = t;
   copyText(t, el);
 }}
@@ -2745,6 +2747,8 @@ class Handler(BaseHTTPRequestHandler):
     # 登录是"密码即账号"（无用户名），天然是暴力破解目标；而且每次尝试
     # 都要做 20 万轮 pbkdf2，不限流会被拿来烧 CPU。规则：同一 IP 10 分钟
     # 内密码错误超过 20 次，该 IP 的登录请求回 429；登录成功清零。
+    # 分享提取密码用另一个计数（bucket="_share_fail"），规则相同但和登录互不影响：
+    # 输错分享密码不会把同一 IP 的控制台登录也锁住。
     _LOGIN_FAIL_LIMIT = 20
     _LOGIN_FAIL_WINDOW = 600
 
@@ -2767,11 +2771,11 @@ class Handler(BaseHTTPRequestHandler):
         return resolve_link_base(self.client_address[0], self.headers.get("Host"),
                                  self.headers, PORT)
 
-    def _login_allowed(self):
+    def _login_allowed(self, bucket="_login_fail"):
         ip = self._rate_key()
         now = time.time()
         with self.server._login_lock:
-            fails = self.server._login_fail
+            fails = getattr(self.server, bucket)
             # 顺手清理过期记录，dict 不会无限增长
             for k in [k for k, ts in fails.items()
                       if not ts or now - ts[-1] >= self._LOGIN_FAIL_WINDOW]:
@@ -2781,10 +2785,10 @@ class Handler(BaseHTTPRequestHandler):
             fails[ip] = ts
             return len(ts) < self._LOGIN_FAIL_LIMIT
 
-    def _login_failed(self):
+    def _login_failed(self, bucket="_login_fail"):
         ip = self._rate_key()
         with self.server._login_lock:
-            self.server._login_fail.setdefault(ip, []).append(time.time())
+            getattr(self.server, bucket).setdefault(ip, []).append(time.time())
 
     def _login_ok(self):
         ip = self._rate_key()
@@ -3394,7 +3398,8 @@ class Handler(BaseHTTPRequestHandler):
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/unlock", p)
             if m:
-                # 访客输入分享密码。和登录共用按 IP 的试错限制，防止爆破 4 位密码
+                # 访客输入分享密码。按 IP 限制试错次数防止爆破 4 位密码，计数和登录分开。
+                # 输对不清零：否则知道某个分享密码的人可以靠反复输对来重置次数，继续猜别的分享
                 sid = m.group(1)
                 f = self._form()
                 s = self._valid_share(sid, "send")
@@ -3402,11 +3407,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, not_found())
                 if not s["pw"]:
                     return self._redirect(f"/s/{sid}")
-                if not self._login_allowed():
+                if not self._login_allowed("_share_fail"):
                     return self._send(429, share_lock_page(sid, "密码试错太多次，10 分钟后再试"))
                 given = (f.get("pw", "") or "").strip().lower()
                 if not hmac.compare_digest(given.encode("utf-8", "replace"), s["pw"].encode()):
-                    self._login_failed()
+                    self._login_failed("_share_fail")
                     return self._send(200, share_lock_page(sid, "密码错误"))
                 secure = "; Secure" if self._https_request() else ""
                 self.send_response(302)
@@ -4130,6 +4135,8 @@ class Server(ThreadingHTTPServer):
         # 放 Server 实例上而不是模块全局：每个 Server 独立计数，测试里
         # 每个用例起一个新 Server 就不会互相污染。
         self._login_fail = {}
+        # 分享提取密码的失败计数，和登录分开（同一把锁）
+        self._share_fail = {}
         self._login_lock = threading.Lock()
         # 分片上传会话：token -> {sid,kind,filename,size,chunks,next,
         # recvd,tmp,expires,finishing}。放 Server 实例上，测试里每个 Server 互不干扰。
