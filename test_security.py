@@ -29,7 +29,7 @@ class SecurityTest(unittest.TestCase):
         with app.db() as c:
             c.execute("INSERT INTO users(id,pw,is_admin,created) VALUES(1,'x',1,?)", (now,))
             c.execute("INSERT INTO sessions VALUES('tok1',1,?,?)", (now, now + 3600))
-            c.execute("INSERT INTO shares VALUES('share','send','t',?,0,1)", (now,))
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES('share','send','t',?,0,1)", (now,))
             self.ids = {}
             for name, data in (("evil.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"),
                                ("page.html", b"<script>alert(1)</script>"),
@@ -161,7 +161,7 @@ class SecurityTest(unittest.TestCase):
         from unittest.mock import patch
         now = int(time.time())
         with app.db() as c:
-            c.execute("INSERT INTO shares VALUES('recv','receive','t',?,0,1)", (now,))
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES('recv','receive','t',?,0,1)", (now,))
         orig = app.Handler._multipart
 
         def cancel_midway(handler, *a, **kw):

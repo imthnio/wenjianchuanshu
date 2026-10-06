@@ -317,7 +317,8 @@ def init_db():
                                 ("users", "pw_plain", "TEXT"),
                                 ("files", "owner_id", "INTEGER"),
                                 ("files", "pinned", "INTEGER NOT NULL DEFAULT 0"),
-                                ("files", "sort_order", "INTEGER")):
+                                ("files", "sort_order", "INTEGER"),
+                                ("shares", "pw", "TEXT")):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -545,7 +546,7 @@ def get_share(sid):
 def share_files(sid):
     with db() as c:
         return c.execute("SELECT * FROM files WHERE share_id=? ORDER BY "
-                         "pinned DESC, sort_order IS NULL, sort_order, id", (sid,)).fetchall()
+                         "pinned DESC, sort_order IS NOT NULL, sort_order, id DESC", (sid,)).fetchall()
 
 def arrange_share_file(sid, fid, action, user):
     if action not in ("up", "down", "pin", "unpin"):
@@ -559,7 +560,7 @@ def arrange_share_file(sid, fid, action, user):
         if not can_manage_share(user, share):
             raise PermissionError("只能修改自己的分享")
         rows = c.execute("SELECT * FROM files WHERE share_id=? ORDER BY "
-                         "pinned DESC, sort_order IS NULL, sort_order, id", (sid,)).fetchall()
+                         "pinned DESC, sort_order IS NOT NULL, sort_order, id DESC", (sid,)).fetchall()
         target = next((r for r in rows if r["id"] == fid), None)
         if target is None:
             raise LookupError("文件不存在")
@@ -584,6 +585,31 @@ def arrange_share_file(sid, fid, action, user):
 
 def is_expired(share):
     return share["expires"] and share["expires"] < time.time()
+
+# ---------------- 分享密码 ----------------
+# 发送分享可以加 4 位提取密码（数字或字母，不区分大小写，统一存小写）。
+# 存明文：分享者要在控制台看到密码好转告别人。访客输对后发一个只对
+# /s/<id> 有效的 cookie，值是 HMAC(密钥, 分享id+密码)：改密码或删密码后
+# 旧 cookie 自动失效。
+def normalize_share_pw(pw):
+    pw = (pw or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{4}", pw):
+        raise ValueError("密码必须是 4 位数字或字母")
+    return pw.lower()
+
+def set_share_pw(sid, pw):
+    with db() as c:
+        c.execute("UPDATE shares SET pw=? WHERE id=?", (pw or None, sid))
+
+def _share_pw_key():
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('share_pw_key',?)",
+                  (secrets.token_hex(32),))
+        return c.execute("SELECT v FROM meta WHERE k='share_pw_key'").fetchone()["v"]
+
+def share_unlock_token(sid, pw):
+    return hmac.new(_share_pw_key().encode(), f"{sid}:{pw}".encode(),
+                    hashlib.sha256).hexdigest()[:32]
 
 def delete_share(sid):
     # 只删除分享链接：文件保留在"全部文件"里，由用户手动删除。
@@ -1543,17 +1569,29 @@ def dash_page(shares, user, public_base=""):
         if is_admin and s["owner_id"] is not None:
             owner = ("<span class='badge'>我的</span>" if s["owner_id"] == user["id"]
                      else f"<span class='badge recv'>用户#{s['owner_id']}</span>")
+        # 提取密码只用于发送分享（接收链接是给别人上传的，不加密码）
+        pw_info, pw_btns = "", ""
+        if s["type"] == "send":
+            if s["pw"]:
+                pw_info = f" · 密码：<b>{html.escape(s['pw'])}</b>"
+                pw_btns = (f"<button class='ghost sm' onclick=\"delSharePw('{s['id']}')\">{icon('x')}删除密码</button>\n"
+                           f"<button class='ghost sm' onclick=\"editSharePw('{s['id']}')\">{icon('edit')}修改密码</button>\n")
+            else:
+                pw_info = " · 无密码"
+                pw_btns = (f"<button class='ghost sm' onclick=\"editSharePw('{s['id']}')\">{icon('edit')}增加密码</button>\n"
+                           "<button class='ghost sm' disabled title='还没有密码，先增加密码'>"
+                           f"{icon('edit')}修改密码</button>\n")
         items.append(f"""<div class='file stacked'><div>
 <span class='badge {cls}'>{typ}</span>{owner}<b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
-<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])}</div>
-<div class='edit-slot' id='ex-{s['id']}'></div>
+<div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])}{pw_info}</div>
+<div class='edit-slot' id='ex-{s['id']}'></div><div class='edit-slot' id='pw-{s['id']}'></div>
 <div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div class='edit-slot' id='ti-{s['id']}'></div></div>
 <div class='acts'>
 <button class='ghost sm' onclick="copyLink('{s['id']}','{path}')">{icon('copy')}复制链接</button>
 <a class='btn ghost sm' href='{path}' target='_blank' rel='noopener'>{icon('external')}打开</a>
 <button class='ghost sm' onclick="editTitle('{s['id']}')">{icon('edit')}改备注</button>
 <button class='ghost sm' onclick="editExpiry('{s['id']}')">{icon('clock')}改过期</button>
-<button class='danger sm' onclick="delShare('{s['id']}')">{icon('trash')}删除链接</button>
+{pw_btns}<button class='danger sm' onclick="delShare('{s['id']}')">{icon('trash')}删除链接</button>
 </div></div>""")
     frows = []
     total_size = 0
@@ -1777,6 +1815,30 @@ function cancelTitle(id){{document.getElementById('ti-'+id).innerHTML='';}}
 function saveTitle(id){{
   var v=document.getElementById('tin-'+id).value.trim();
   apiPost('/api/title','id='+encodeURIComponent(id)+'&title='+encodeURIComponent(v));
+}}
+function editSharePw(id){{
+  var box=document.getElementById('pw-'+id);
+  box.innerHTML='';
+  var inp=document.createElement('input');
+  inp.maxLength=4;inp.style.width='40%';inp.autocomplete='off';
+  inp.setAttribute('autocapitalize','off');inp.spellcheck=false;
+  inp.placeholder='4 位数字或字母';inp.setAttribute('aria-label','分享密码');
+  var ok=document.createElement('button');ok.className='ghost';ok.textContent='确定';
+  ok.onclick=function(){{
+    var v=inp.value.trim();
+    if(!/^[A-Za-z0-9]{{4}}$/.test(v)){{alert('密码必须是 4 位数字或字母（不区分大小写）');inp.focus();return;}}
+    apiPost('/api/share_pw','id='+encodeURIComponent(id)+'&pw='+encodeURIComponent(v));
+  }};
+  inp.onkeydown=function(e){{if(e.key==='Enter')ok.onclick();}};
+  var no=document.createElement('button');no.className='ghost';no.textContent='取消';
+  no.onclick=function(){{box.innerHTML='';}};
+  box.appendChild(inp);box.appendChild(document.createTextNode(' '));
+  box.appendChild(ok);box.appendChild(document.createTextNode(' '));box.appendChild(no);
+  inp.focus();
+}}
+function delSharePw(id){{
+  if(!confirm('确定删除这个分享的密码吗？删除后任何拿到链接的人都能直接打开。'))return;
+  apiPost('/api/share_pw','id='+encodeURIComponent(id)+'&pw=');
 }}
 function saveExpiry(id){{
   var v=document.getElementById('exs-'+id).value;
@@ -2474,7 +2536,7 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
 </script>""")
     title = html.escape(share['title'] or '文件分享')
     manage_note = ("<div class='note'>你是这个分享的管理者：可以调整顺序、置顶、删除或添加文件。"
-                   "置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。</div>"
+                   "置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。新上传的文件排在最前面（置顶文件之后）。</div>"
                    "<div id='orderStatus' class='muted' role='status' aria-live='polite' style='margin-top:6px'></div>"
                    if manage else "")
     listing = ("".join(rows) if rows else
@@ -2487,6 +2549,15 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
 <div class='card' style='padding-top:6px;padding-bottom:6px'>{listing}</div>
 {add_form}{preview}
 <p class='foot'>图片、视频、音频、PDF 和文本可点「查看」在线预览，其他文件请下载。</p>""")
+
+def share_lock_page(sid, err=""):
+    e = f"<div class='err' role='alert'>{html.escape(err)}</div>" if err else ""
+    return page("输入密码", _auth_card(f"""{brand()}
+<p class='sub'>这个分享设置了密码，请输入 4 位提取密码</p>{e}
+<form method='post' action='/s/{sid}/unlock'>
+<input type='text' name='pw' placeholder='提取密码（不区分大小写）' required autofocus maxlength='4'
+ autocomplete='off' autocapitalize='off' spellcheck='false' aria-label='提取密码'>
+<button>打开</button></form>"""), "sm")
 
 def receive_page(sid, share):
     limit, _ = upload_limit()
@@ -3083,6 +3154,16 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return s
 
+    def _share_locked(self, s):
+        # 有密码的发送分享：分享者本人/管理员直接看；访客要带上输对密码后的 cookie
+        if s["type"] != "send" or not s["pw"]:
+            return False
+        user = self._user()
+        if user and can_manage_share(user, s):
+            return False
+        tok = self._cookie().get("sp_" + s["id"], "")
+        return not hmac.compare_digest(tok, share_unlock_token(s["id"], s["pw"]))
+
     def do_HEAD(self):
         # 原来没有 HEAD，Cloudflare 和浏览器探活会拿到 501。
         self._head_only = True
@@ -3172,6 +3253,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, not_found())
                 if s["type"] == "receive":
                     return self._redirect(f"/r/{sid}")
+                if self._share_locked(s):
+                    return self._send(200, share_lock_page(sid))
                 return self._send(200, share_page(sid, s, share_files(sid),
                                                   self._user()))
 
@@ -3181,6 +3264,8 @@ class Handler(BaseHTTPRequestHandler):
                 s = self._valid_share(sid, "send")
                 if not s:
                     return self._send(404, not_found())
+                if self._share_locked(s):
+                    return self._redirect(f"/s/{sid}")
                 with db() as c:
                     f = c.execute(
                         "SELECT * FROM files WHERE id=? AND share_id=?",
@@ -3199,6 +3284,8 @@ class Handler(BaseHTTPRequestHandler):
                 s = self._valid_share(sid, "send")
                 if not s:
                     return self._send(404, not_found())
+                if self._share_locked(s):
+                    return self._redirect(f"/s/{sid}")
                 with db() as c:
                     f = c.execute(
                         "SELECT * FROM files WHERE id=? AND share_id=?",
@@ -3297,6 +3384,31 @@ class Handler(BaseHTTPRequestHandler):
                 # 关连接，防残留污染同一 keep-alive 连接上的下一个请求。
                 self._close_if_body_pending()
                 return self._clear_sid()
+
+            m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/unlock", p)
+            if m:
+                # 访客输入分享密码。和登录共用按 IP 的试错限制，防止爆破 4 位密码
+                sid = m.group(1)
+                f = self._form()
+                s = self._valid_share(sid, "send")
+                if not s:
+                    return self._send(404, not_found())
+                if not s["pw"]:
+                    return self._redirect(f"/s/{sid}")
+                if not self._login_allowed():
+                    return self._send(429, share_lock_page(sid, "密码试错太多次，10 分钟后再试"))
+                if (f.get("pw", "") or "").strip().lower() != s["pw"]:
+                    self._login_failed()
+                    return self._send(200, share_lock_page(sid, "密码错误"))
+                secure = "; Secure" if self._https_request() else ""
+                self.send_response(302)
+                self.send_header("Set-Cookie",
+                                 f"sp_{sid}={share_unlock_token(sid, s['pw'])}; HttpOnly; "
+                                 f"Path=/s/{sid}; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}{secure}")
+                self.send_header("Location", f"/s/{sid}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
             m = re.fullmatch(r"/s/([A-Za-z0-9_\-]{1,16})/add", p)
             if m:
@@ -3580,6 +3692,28 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
                 with db() as c:
                     c.execute("UPDATE shares SET title=? WHERE id=?", (title, sid))
+                return self._json({"ok": True})
+
+            if p == "/api/share_pw":
+                # 增加/修改（pw 为 4 位数字或字母）或删除（pw 为空）发送分享的密码：
+                # 普通用户只能改自己的，管理员可以改任何人的
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid = f.get("id", "")
+                s = self._valid_share(sid)
+                if not s or s["type"] != "send":
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
+                pw = f.get("pw", "")
+                if pw:
+                    try:
+                        pw = normalize_share_pw(pw)
+                    except ValueError as e:
+                        return self._json({"ok": False, "error": str(e)}, 400)
+                set_share_pw(sid, pw)
                 return self._json({"ok": True})
 
             if p == "/api/chpw":
