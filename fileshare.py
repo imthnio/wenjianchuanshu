@@ -318,7 +318,8 @@ def init_db():
                                 ("files", "owner_id", "INTEGER"),
                                 ("files", "pinned", "INTEGER NOT NULL DEFAULT 0"),
                                 ("files", "sort_order", "INTEGER"),
-                                ("shares", "pw", "TEXT")):
+                                ("shares", "pw", "TEXT"),
+                                ("shares", "nodl", "INTEGER NOT NULL DEFAULT 0")):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -596,6 +597,17 @@ def normalize_share_pw(pw):
     if not re.fullmatch(r"[A-Za-z0-9]{4}", pw):
         raise ValueError("密码必须是 4 位数字或字母")
     return pw.lower()
+
+# ---------------- 下载开关 ----------------
+# 发送分享可以关闭下载：访客打开分享页看不到任何下载按钮，/s/<id>/f/<fid>
+# 直接 403；在线查看只保留浏览器能内联显示的格式，不会退回成附件下载。
+# 分享者本人和管理员不受影响。
+def share_nodl(share):
+    return bool(dict(share).get("nodl"))
+
+def set_share_nodl(sid, nodl):
+    with db() as c:
+        c.execute("UPDATE shares SET nodl=? WHERE id=?", (1 if nodl else 0, sid))
 
 def set_share_pw(sid, pw):
     with db() as c:
@@ -1588,6 +1600,15 @@ def dash_page(shares, user, public_base=""):
                 pw_btns = (f"<button class='ghost sm' onclick=\"editSharePw('{s['id']}')\">{icon('edit')}增加密码</button>\n"
                            "<button class='ghost sm' disabled title='还没有密码，先增加密码'>"
                            f"{icon('edit')}修改密码</button>\n")
+            # 下载开关：关闭后访客打开分享页没有下载按钮，也下载不了任何文件
+            if share_nodl(s):
+                pw_info += " · 下载：<b>已关闭</b>"
+                pw_btns += (f"<button class='ghost sm' onclick=\"setShareDl('{s['id']}',1)\">"
+                            f"{icon('download')}开启下载</button>\n")
+            else:
+                pw_info += " · 下载：已开启"
+                pw_btns += (f"<button class='ghost sm' onclick=\"setShareDl('{s['id']}',0)\">"
+                            f"{icon('x')}关闭下载</button>\n")
         items.append(f"""<div class='file stacked'><div>
 <span class='badge {cls}'>{typ}</span>{owner}<b id='ttl-{s['id']}'>{html.escape(s['title'] or '(无备注)')}</b>
 <div class='muted'>{len(files)} 个文件 · {hsize(total)} · 到期：{htime(s['expires'])}{pw_info}</div>
@@ -1842,6 +1863,10 @@ function editSharePw(id){{
   box.appendChild(inp);box.appendChild(document.createTextNode(' '));
   box.appendChild(ok);box.appendChild(document.createTextNode(' '));box.appendChild(no);
   inp.focus();
+}}
+function setShareDl(id, on){{
+  if(!on&&!confirm('确定关闭下载吗？关闭后别人打开分享页不会显示下载按钮，也无法下载任何文件（仍可在线查看）。'))return;
+  apiPost('/api/share_dl','id='+encodeURIComponent(id)+'&on='+(on?1:0));
 }}
 function delSharePw(id){{
   if(!confirm('确定删除这个分享的密码吗？删除后任何拿到链接的人都能直接打开。'))return;
@@ -2113,6 +2138,9 @@ PREVIEW_JS = r"""
       dlA=document.getElementById('pvDl'), closeB=document.getElementById('pvClose'),
       prevB=document.getElementById('pvPrev'), nextB=document.getElementById('pvNext'),
       countEl=document.getElementById('pvCount');
+  var nodl=pv.hasAttribute('data-nodl');
+  // 关闭下载：媒体控件不显示下载项，预览区不弹右键菜单
+  if(nodl) stage.addEventListener('contextmenu', function(e){e.preventDefault();});
   var cur=-1, pushed=false, lastFocus=null, token=0, TEXT_LIMIT=1024*1024, tx=null, ty=0, watch=null, resumeAt=0, retries=0;
   var VTYPES={mp4:'video/mp4',m4v:'video/mp4',mov:'video/quicktime',webm:'video/webm',ogv:'video/ogg',ogg:'video/ogg',mkv:'video/x-matroska'};
   function el(tag, cls, text){var e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e;}
@@ -2125,6 +2153,7 @@ PREVIEW_JS = r"""
   function spinner(){var s=el('div','pv-spin'); s.setAttribute('role','status'); s.setAttribute('aria-label','加载中'); stage.appendChild(s); return s;}
   function actions(box, retry){
     if(retry){var r=el('button','btn pv-retry','重试'); r.type='button'; r.addEventListener('click', retry); box.appendChild(r);}
+    if(nodl) return;
     var a=el('a','btn','下载文件'); a.href=items[cur].dataset.dl; a.setAttribute('download',''); box.appendChild(a);
     var o=el('a','btn ghost','新窗口打开'); o.href=items[cur].dataset.src; o.target='_blank'; o.rel='noopener'; box.appendChild(o);
   }
@@ -2141,7 +2170,8 @@ PREVIEW_JS = r"""
   function renderVideo(b, my){
     var src=b.dataset.src, name=b.dataset.name, ext=(name.split('.').pop()||'').toLowerCase();
     var wrap=el('div','pv-vwrap'), v=document.createElement('video');
-    v.controls=true; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    v.controls=true; if(nodl){v.setAttribute('controlsList','nodownload'); v.disablePictureInPicture=true;}
+    v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
     v.preload='metadata';
     var busy=el('div','pv-vload'); busy.setAttribute('role','status');
     busy.appendChild(el('span','pv-spin sm')); busy.appendChild(el('span','','正在加载视频…'));
@@ -2204,7 +2234,8 @@ PREVIEW_JS = r"""
     clear(); cur=i;
     var b=items[i], kind=b.dataset.kind, src=b.dataset.src, name=b.dataset.name, my=token;
     nameEl.textContent=name; metaEl.textContent=b.dataset.meta||'';
-    openA.href=src; dlA.href=b.dataset.dl;
+    if(openA) openA.href=src;
+    if(dlA) dlA.href=b.dataset.dl;
     prevB.hidden=nextB.hidden=items.length<2;
     countEl.textContent=items.length>1?(i+1)+' / '+items.length:'';
     pv.setAttribute('data-kind', kind);
@@ -2222,6 +2253,7 @@ PREVIEW_JS = r"""
       box.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
       box.appendChild(el('div','',name));
       var a=document.createElement('audio'); a.controls=true; a.preload='metadata';
+      if(nodl) a.setAttribute('controlsList','nodownload');
       a.onerror=function(){if(my!==token)return; clearInterval(watch);
         fail('音频加载失败：浏览器无法播放这个格式，或网络中断。可以重试，或下载后播放。', function(){retryVideo(0);});};
       a.src=retries?src+'?r='+retries:src; box.appendChild(a); stage.appendChild(box);
@@ -2360,12 +2392,15 @@ def _view_kind(filename):
 
 _KIND_ICON = {"img": "image", "vid": "film", "aud": "music", "pdf": "file", "txt": "text"}
 
-def _preview_modal():
-    return f"""<div class='pv' id='pv' hidden role='dialog' aria-modal='true' aria-labelledby='pvName'>
-<div class='pv-bar'><div class='pv-title'><div class='pv-name' id='pvName'></div><div class='pv-meta' id='pvMeta'></div></div>
-<a class='btn pv-btn' id='pvOpen' href='#' target='_blank' rel='noopener' title='在新窗口打开'>{icon('external')}<span class='lbl'>新窗口</span></a>
+def _preview_modal(nodl=False):
+    # 关闭下载时不放"下载"和"新窗口"按钮（新窗口打开的媒体页浏览器自带保存）
+    nodl_attr = " data-nodl='1'" if nodl else ""
+    btns = "" if nodl else f"""<a class='btn pv-btn' id='pvOpen' href='#' target='_blank' rel='noopener' title='在新窗口打开'>{icon('external')}<span class='lbl'>新窗口</span></a>
 <a class='btn pv-btn' id='pvDl' href='#' download title='下载'>{icon('download')}<span class='lbl'>下载</span></a>
-<button type='button' class='pv-btn icon-only' id='pvClose' aria-label='关闭预览（Esc）' title='关闭（Esc）'>{icon('x')}</button></div>
+"""
+    return f"""<div class='pv' id='pv'{nodl_attr} hidden role='dialog' aria-modal='true' aria-labelledby='pvName'>
+<div class='pv-bar'><div class='pv-title'><div class='pv-name' id='pvName'></div><div class='pv-meta' id='pvMeta'></div></div>
+{btns}<button type='button' class='pv-btn icon-only' id='pvClose' aria-label='关闭预览（Esc）' title='关闭（Esc）'>{icon('x')}</button></div>
 <div class='pv-body'><div class='pv-stage' id='pvStage'></div>
 <button type='button' class='pv-nav pv-prev' id='pvPrev' aria-label='上一个'>{icon('left')}</button>
 <button type='button' class='pv-nav pv-next' id='pvNext' aria-label='下一个'>{icon('right')}</button>
@@ -2388,6 +2423,8 @@ def _looks_utf8(path):
 def share_page(sid, share, files, user=None):
     # user 能管理这个分享（本人或管理员）时，页面上可以追加和删除文件
     manage = user is not None and can_manage_share(user, share)
+    # 关闭下载只限制访客：分享者本人和管理员照常下载
+    nodl = share_nodl(share) and not manage
     rows = []
     pinned_flags = [bool(dict(f).get("pinned", 0)) for f in files]
     total = 0
@@ -2398,7 +2435,7 @@ def share_page(sid, share, files, user=None):
         kind = _view_kind(f["filename"])
         ext = os.path.splitext(f["filename"])[1][1:5]
         meta = hsize(fd.get("size")) + (f" · {htime(fd['created'])}" if fd.get("created") else "")
-        dl = f"/s/{sid}/f/{f['id']}"
+        dl = "" if nodl else f"/s/{sid}/f/{f['id']}"
         # 图片和视频都不在页面里直接内联显示：没点"查看"就不加载任何媒体内容。
         # 点"查看"由 PREVIEW_JS 在弹层里创建预览元素。
         view_btn = ""
@@ -2408,8 +2445,8 @@ def share_page(sid, share, files, user=None):
                         f"data-meta='{html.escape(meta)}' aria-label='查看 {name}'>"
                         f"{icon('play' if kind in ('vid', 'aud') else 'eye')}查看</button>")
         dl_cls = "btn ghost" if kind else "btn"
-        dl_btn = (f"<a class='{dl_cls}' href='{dl}' download aria-label='下载 {name}'>"
-                  f"{icon('download')}下载</a>")
+        dl_btn = "" if nodl else (f"<a class='{dl_cls}' href='{dl}' download aria-label='下载 {name}'>"
+                                  f"{icon('download')}下载</a>")
         badge = " <span class='badge pin'>📌 置顶</span>" if pinned_flags[index] else ""
         tile = (f"<div class='ftile k-{kind or 'other'}' aria-hidden='true'>"
                 f"{icon(_KIND_ICON.get(kind, 'file'))}<span>{html.escape(ext)}</span></div>")
@@ -2548,14 +2585,18 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
                    if manage else "")
     listing = ("".join(rows) if rows else
                "<div class='empty'><span class='big'>📭</span>文件都被删除啦</div>")
-    preview = (_preview_modal() + "<script>" + PREVIEW_JS + "</script>") if rows else ""
+    preview = (_preview_modal(nodl) + "<script>" + PREVIEW_JS + "</script>") if rows else ""
+    foot = ("分享者已关闭下载：图片、视频、音频、PDF 和文本可点「查看」在线预览，其他文件不能查看或下载。"
+            if nodl else "图片、视频、音频、PDF 和文本可点「查看」在线预览，其他文件请下载。")
+    if manage and share_nodl(share):
+        manage_note += "<div class='note'>这个分享已关闭下载：别人打开时看不到下载按钮，也无法下载文件。你是管理者，仍可下载。</div>"
     return page("下载文件", f"""<div class='card'><div class='hero'><div class='logo' aria-hidden='true'>📦</div>
 <div style='min-width:0'><h1>{title}</h1>
 <div class='chips'><span class='chip'>共 <b>{len(files)}</b> 个文件</span><span class='chip'>{hsize(total)}</span>
 <span class='chip'>到期：<b>{htime(share['expires'])}</b></span></div></div></div>{manage_note}</div>
 <div class='card' style='padding-top:6px;padding-bottom:6px'>{listing}</div>
 {add_form}{preview}
-<p class='foot'>图片、视频、音频、PDF 和文本可点「查看」在线预览，其他文件请下载。</p>""")
+<p class='foot'>{foot}</p>""")
 
 def share_lock_page(sid, err=""):
     e = f"<div class='err' role='alert'>{html.escape(err)}</div>" if err else ""
@@ -2626,6 +2667,10 @@ def content_disposition(kind, filename):
 def not_found():
     return page("不存在", "<div class='auth'><div class='card empty'><span class='big'>😅</span>"
                 "<h1>链接不存在或已过期</h1><p class='muted'>请检查链接是否正确，或联系分享者。</p></div></div>", "sm")
+
+def nodl_page():
+    return page("已关闭下载", "<div class='auth'><div class='card empty'><span class='big'>🚫</span>"
+                "<h1>分享者已关闭下载</h1><p class='muted'>这个分享的文件不能下载，请联系分享者。</p></div></div>", "sm")
 
 def error_page():
     return page("出错", "<div class='auth'><div class='card empty'><span class='big'>😵</span>"
@@ -3127,11 +3172,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._stream_file(path, filename, ctype, "attachment",
                                  (("Content-Security-Policy", FILE_CSP),))
 
-    def _send_file_inline(self, path, filename):
+    def _send_file_inline(self, path, filename, allow_download=True):
         """在线查看：Content-Disposition: inline + 支持 Range 分片（视频拖进度条需要）。
         能否内联只看扩展名白名单（_view_kind），不看猜出来的 MIME 前缀：
         之前 image/svg+xml 以 image/ 开头也被内联，SVG 里的脚本能在本站域名下执行。"""
         kind = _view_kind(filename)
+        if not allow_download and (not kind or (
+                kind in ("img", "vid", "aud") and
+                guess_type(filename).split("/")[0] not in ("image", "video", "audio"))):
+            return self._send(403, nodl_page())
         if not kind:
             # 不在白名单：不内联，退回普通下载（防 MIME 混淆）
             return self._send_file(path, filename)
@@ -3162,6 +3211,13 @@ class Handler(BaseHTTPRequestHandler):
         if want_type and s["type"] != want_type:
             return None
         return s
+
+    def _share_nodl(self, s):
+        # 关闭下载的分享：访客不能下载；分享者本人/管理员不受限制
+        if not share_nodl(s):
+            return False
+        user = self._user()
+        return not (user and can_manage_share(user, s))
 
     def _share_locked(self, s):
         # 有密码的发送分享：分享者本人/管理员直接看；访客要带上输对密码后的 cookie
@@ -3283,6 +3339,8 @@ class Handler(BaseHTTPRequestHandler):
                         (fid, sid)).fetchone()
                 if not f:
                     return self._send(404, not_found())
+                if self._share_nodl(s):
+                    return self._send(403, nodl_page())
                 path = os.path.join(FILES_DIR, f["stored"])
                 if not os.path.isfile(path):
                     return self._send(404, not_found())
@@ -3306,6 +3364,9 @@ class Handler(BaseHTTPRequestHandler):
                 path = os.path.join(FILES_DIR, f["stored"])
                 if not os.path.isfile(path):
                     return self._send(404, not_found())
+                if self._share_nodl(s):
+                    # 不能内联的格式会退回成附件下载，关闭下载时直接拒绝
+                    return self._send_file_inline(path, f["filename"], allow_download=False)
                 return self._send_file_inline(path, f["filename"])
 
             m = re.fullmatch(r"/r/([A-Za-z0-9_\-]{1,16})", p)
@@ -3727,6 +3788,24 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as e:
                         return self._json({"ok": False, "error": str(e)}, 400)
                 set_share_pw(sid, pw)
+                return self._json({"ok": True})
+
+            if p == "/api/share_dl":
+                # 开启（on=1）或关闭（on=0）发送分享的下载：普通用户只能改自己的，管理员可以改任何人的
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid = f.get("id", "")
+                s = self._valid_share(sid)
+                if not s or s["type"] != "send":
+                    return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+                if not can_manage_share(user, s):
+                    return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
+                on = f.get("on", "")
+                if on not in ("0", "1"):
+                    return self._json({"ok": False, "error": "参数无效"}, 400)
+                set_share_nodl(sid, on == "0")
                 return self._json({"ok": True})
 
             if p == "/api/chpw":
