@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.2.3"
+VERSION = "1.3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -1918,7 +1918,15 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   stat.textContent='创建分享…';
   var title=form.querySelector("input[name=title]").value,
       expiry=form.querySelector("select[name=expiry]").value,
-      createdLink=null;
+      createdLink=null, createdId=null;
+  // 传完（或中途失败）后按所选有效期从现在重新计时，见 /api/share_create
+  function applyExpiry(){{
+    if(!createdId) return Promise.resolve();
+    return fetch('/api/expiry',{{method:'POST',
+      headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+      body:'id='+encodeURIComponent(createdId)+'&expiry='+encodeURIComponent(expiry)}})
+    .catch(function(){{}});
+  }}
   fetch('/api/share_create',{{method:'POST',
     headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
     body:'title='+encodeURIComponent(title)+'&expiry='+encodeURIComponent(expiry)}})
@@ -1926,9 +1934,9 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   .then(function(x){{
     if(!x.j.ok) throw new Error(x.j.error||('请求失败('+x.s+')'));
     stat.textContent='准备上传…';
-    createdLink=x.j.link;
+    createdLink=x.j.link; createdId=x.j.id;
     return chunkUpload({{sid:x.j.id, kind:'add'}}, files,
-      {{prog:prog, pct:pct, stat:stat}}).then(function(){{return x.j.link;}});
+      {{prog:prog, pct:pct, stat:stat}}).then(applyExpiry).then(function(){{return x.j.link;}});
   }})
   .then(function(link){{
     prog.value=100; pct.textContent='100%';
@@ -1938,6 +1946,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   }})
   .catch(function(err){{
     btn.disabled=false; stat.textContent='';
+    applyExpiry();
     var html="<div class='err'>"+escapeHtml(err.message||'失败')+"</div>";
     if(createdLink){{
       html+="<div class='ok'>已上传的文件已保留，分享链接：</div><div class='linkbox'>"
@@ -3663,6 +3672,11 @@ class Handler(BaseHTTPRequestHandler):
                 secs = _expiry_seconds(f.get("expiry"))
                 now = int(time.time())
                 sid = new_share_id()
+                # 文件是建好分享之后才分片传上来的：有效期很短（10 分钟这类）时，
+                # 大文件还没传完分享就过期了，上传失败、链接也被删。先给至少
+                # 1 天，前端传完后再调 /api/expiry 从“传完那一刻”重新计时。
+                if secs:
+                    secs = max(secs, 86400)
                 with db() as c:
                     c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
                               " VALUES(?,?,?,?,?,?)",
