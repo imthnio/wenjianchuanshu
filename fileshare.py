@@ -1558,8 +1558,14 @@ def login_page(err=""):
 <button>登录</button></form>
 <p class='muted' style='margin:14px 0 0;text-align:center'>没有用户名：不同的密码对应不同的账号，找管理员要你的密码。</p>"""), "sm")
 
-_EXPIRY_OPTIONS = ("<option value='7'>7 天后过期</option><option value='1'>1 天后过期</option>"
-                   "<option value='30'>30 天后过期</option><option value='0'>永久有效</option>")
+# 有效期选项：值是数字表示天数（兼容老版本），带 m/h 后缀表示分钟/小时。
+# 第一项以外按时长从短到长排；默认 7 天。
+EXPIRY_CHOICES = (("10m", "10 分钟后过期"), ("20m", "20 分钟后过期"), ("30m", "30 分钟后过期"),
+                  ("1h", "1 小时后过期"), ("2h", "2 小时后过期"), ("3h", "3 小时后过期"),
+                  ("1", "1 天后过期"), ("2", "2 天后过期"), ("3", "3 天后过期"),
+                  ("7", "7 天后过期"), ("30", "30 天后过期"), ("0", "永久有效"))
+_EXPIRY_OPTIONS = "".join(f"<option value='{v}'{' selected' if v == '7' else ''}>{t}</option>"
+                          for v, t in EXPIRY_CHOICES)
 
 def _drop_zone(input_attrs, hint=""):
     # 整块区域都是 <input type=file>（透明覆盖），点击或把文件拖进来都能选；
@@ -1808,8 +1814,7 @@ function editExpiry(id){{
   var box=document.getElementById('ex-'+id);
   box.innerHTML='';
   var sel=document.createElement('select'); sel.id='exs-'+id;
-  [['1','1 天后过期'],['7','7 天后过期'],['30','30 天后过期'],
-   ['0','永久有效']].forEach(function(item){{
+  {json.dumps(EXPIRY_CHOICES, ensure_ascii=False)}.forEach(function(item){{
     var opt=document.createElement('option'); opt.value=item[0];
     opt.textContent=item[1]; sel.appendChild(opt);
   }});
@@ -3621,14 +3626,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not files:
                     return self._json({"ok": False, "error": "没有收到文件"}, 400)
                 title = (fields.get("title") or "").strip()[:100]
-                days = _expiry_days(fields.get("expiry"))
+                secs = _expiry_seconds(fields.get("expiry"))
                 now = int(time.time())
                 try:
                     sid = new_share_id()
                     with db() as c:
                         c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
                                   " VALUES(?,?,?,?,?,?)",
-                                  (sid, "send", title, now, now + days * 86400 if days else 0,
+                                  (sid, "send", title, now, now + secs if secs else 0,
                                    user["id"]))
                         for fo in files:
                             c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
@@ -3655,14 +3660,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 f = self._form()
                 title = (f.get("title") or "").strip()[:100]
-                days = _expiry_days(f.get("expiry"))
+                secs = _expiry_seconds(f.get("expiry"))
                 now = int(time.time())
                 sid = new_share_id()
                 with db() as c:
                     c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
                               " VALUES(?,?,?,?,?,?)",
                               (sid, "send", title, now,
-                               now + days * 86400 if days else 0, user["id"]))
+                               now + secs if secs else 0, user["id"]))
                 return self._json({"ok": True, "link": f"/s/{sid}", "id": sid})
 
             if p == "/api/receive":
@@ -3686,13 +3691,13 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                     return self._json({"ok": False, "error": "创建接收链接不需要上传文件"}, 400)
                 title = (fields.get("title") or "").strip()[:100]
-                days = _expiry_days(fields.get("expiry"))
+                secs = _expiry_seconds(fields.get("expiry"))
                 now = int(time.time())
                 sid = new_share_id()
                 with db() as c:
                     c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id)"
                               " VALUES(?,?,?,?,?,?)",
-                              (sid, "receive", title, now, now + days * 86400 if days else 0,
+                              (sid, "receive", title, now, now + secs if secs else 0,
                                user["id"]))
                 return self._json({"ok": True, "link": f"/r/{sid}", "id": sid})
 
@@ -3740,11 +3745,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
                 if not can_manage_share(user, s):
                     return self._json({"ok": False, "error": "只能修改自己的分享"}, 403)
-                days = _expiry_days(f.get("expiry"))
+                secs = _expiry_seconds(f.get("expiry"))
                 now = int(time.time())
                 with db() as c:
                     c.execute("UPDATE shares SET expires=? WHERE id=?",
-                              (now + days * 86400 if days else 0, sid))
+                              (now + secs if secs else 0, sid))
                 return self._json({"ok": True})
 
             if p == "/api/title":
@@ -4190,12 +4195,16 @@ def _small_int(v):
     v = (v or "").strip()
     return int(v) if re.fullmatch(r"[0-9]{1,18}", v) else None
 
-def _expiry_days(v):
-    try:
-        d = int(v or 7)
-    except (TypeError, ValueError):
-        d = 7
-    return max(0, min(d, 365))
+def _expiry_seconds(v):
+    """有效期转成秒数，0 表示永久。纯数字是天数（最多 365 天），
+    带 m / h 后缀是分钟 / 小时（最多 365 天），其他值按默认 7 天。"""
+    v = (v or "").strip().lower()
+    m = re.fullmatch(r"(\d{1,6})([mh]?)", v)
+    if not m or (m.group(2) and int(m.group(1)) == 0):
+        return 7 * 86400
+    n = int(m.group(1))
+    unit = {"m": 60, "h": 3600, "": 86400}[m.group(2)]
+    return min(n * unit, 365 * 86400)
 
 
 # ---------------- 主程序 ----------------
