@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -661,6 +661,47 @@ def delete_files(ids):
                 c.execute("DELETE FROM files WHERE id=?", (fid,))
                 removed += 1
     return removed
+
+def split_filename(fn):
+    # 改名时扩展名（格式）固定不变，只能改前面的部分
+    return os.path.splitext(fn)
+
+def rename_file(fid, stem, user, sid=None):
+    """改文件名，扩展名保持原样。sid 非空时只改这个分享里的文件（分享页），
+    否则按"全部文件"的权限：管理员可改任何文件，普通用户只能改自己的。"""
+    # 和上传时的 _clean_filename 一样去掉控制字符和双向文本控制符
+    stem = re.sub("[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]", "", stem or "").strip()
+    if not stem:
+        raise ValueError("文件名不能为空")
+    if "/" in stem or "\\" in stem:
+        raise ValueError("文件名不能包含 / 或 \\")
+    with db() as c:
+        # 和删除、排序串行：校验之后文件不会被别人删掉或挪走
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT f.filename, f.share_id, f.owner_id, s.type AS stype,"
+                        " s.expires, s.owner_id AS sowner"
+                        " FROM files f LEFT JOIN shares s ON s.id=f.share_id"
+                        " WHERE f.id=?", (fid,)).fetchone()
+        # 已过期（还没被清理）的分享里的文件在"全部文件"里也不显示，同样不许改
+        if not row or (row["stype"] is not None and row["expires"] and
+                       row["expires"] <= time.time()):
+            raise LookupError("文件不存在")
+        if sid is not None:
+            if row["share_id"] != sid or row["stype"] != "send":
+                raise LookupError("文件不存在")
+            if not can_manage_share(user, {"owner_id": row["sowner"]}):
+                raise PermissionError("只能修改自己的分享")
+        elif not user["is_admin"] and row["owner_id"] != user["id"]:
+            raise PermissionError("只能修改自己的文件")
+        ext = split_filename(row["filename"])[1]
+        new = stem + ext
+        # 新名字的扩展名必须和原来一致：原来没有扩展名时，不允许靠 "a.exe" 加出一个格式
+        if split_filename(new)[1] != ext or new in (".", ".."):
+            raise ValueError("不能修改文件格式（扩展名）")
+        if len(new) > 200:
+            raise ValueError("文件名太长（最多 200 个字符）")
+        c.execute("UPDATE files SET filename=? WHERE id=?", (new, fid))
+    return new
 
 def add_existing_files(sid, ids, user):
     """把可见的已有文件加入发送分享，原文件及原分享保持独立。"""
@@ -1650,11 +1691,14 @@ def dash_page(shares, user, public_base=""):
         delbtn = (f"<button class='danger sm' onclick=\"delOneFile({fid})\">删除</button>"
                   if is_admin else "")
         dlbtn = f"<a class='btnlink' href='/dl/{fid}'><button class='ghost sm' tabindex='-1'>下载</button></a> "
+        # 能在这里看到的文件都能改名：管理员看到全部，普通用户只看到自己的
+        rnbtn = rename_btn(fid, fn, with_icon=False) + " "
         frows.append(f"""<div class='frow'>{"<div>" + ck + "</div>" if is_admin else ""}
 <div class='fname'><b>{html.escape(fn)}</b>
-<div class='muted'><span class='badge {fcls}'>{ftyp}</span>{ownermk}来自{fsrc}<span class='m-meta'> · {hsize(fsz)} · {htime(fct)}</span></div></div>
+<div class='muted'><span class='badge {fcls}'>{ftyp}</span>{ownermk}来自{fsrc}<span class='m-meta'> · {hsize(fsz)} · {htime(fct)}</span></div>
+<div class='edit-slot' id='rn-{fid}'></div></div>
 <div class='c-size'>{hsize(fsz)}</div><div class='c-time'>{htime(fct)}</div>
-<div class='acts'>{dlbtn}{delbtn}</div></div>""")
+<div class='acts'>{dlbtn}{rnbtn}{delbtn}</div></div>""")
     nock = "" if is_admin else " nock"
     if frows:
         flist = (f"<div class='ftable{nock}' id='fileTable'><div class='fhead'>"
@@ -1810,6 +1854,7 @@ function delFilesByIds(ids){{
   if(!confirm('确定彻底删除选中的 '+ids.length+' 个文件吗？删除后无法恢复。'))return;
   apiPost('/api/del_files','ids='+encodeURIComponent(ids.join(',')));
 }}
+{RENAME_JS}
 function editExpiry(id){{
   var box=document.getElementById('ex-'+id);
   box.innerHTML='';
@@ -2434,6 +2479,59 @@ def _looks_utf8(path):
         # 只是在 64KB 边界切断了一个多字节字符
         return len(data) == 65536 and e.start >= len(data) - 3
 
+# 改文件名：在 slot 里放一个只编辑主文件名的输入框，扩展名作为固定后缀显示。
+# 按钮带 data-id / data-stem / data-ext / data-sid（分享页才有）。
+RENAME_JS = r"""
+function renameFile(btn){
+  var d=btn.dataset, box=document.getElementById('rn-'+d.id);
+  if(!box)return;
+  box.innerHTML='';
+  var inp=document.createElement('input');
+  inp.value=d.stem;inp.maxLength=200;inp.setAttribute('aria-label','新文件名');
+  inp.placeholder='输入新文件名';
+  var ext=document.createElement('span');ext.className='muted';ext.textContent=d.ext;
+  ext.title='文件格式不能修改';
+  var ok=document.createElement('button');ok.type='button';ok.className='ghost sm';ok.textContent='确定';
+  var no=document.createElement('button');no.type='button';no.className='ghost sm';no.textContent='取消';
+  var msg=document.createElement('span');msg.className='muted';msg.setAttribute('role','status');
+  function save(){
+    var v=inp.value.trim();
+    if(!v){msg.textContent='文件名不能为空';return;}
+    if(/[\/\\]/.test(v)){msg.textContent='文件名不能包含 / 或 \\';return;}
+    if(v===d.stem){box.innerHTML='';return;}
+    ok.disabled=true;msg.textContent='正在保存…';
+    fetch('/api/file_rename',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'id='+encodeURIComponent(d.id)+'&name='+encodeURIComponent(v)+
+        (d.sid?'&sid='+encodeURIComponent(d.sid):'')})
+    .then(function(r){return r.text().then(function(t){
+      var j=null;try{j=JSON.parse(t);}catch(e){}
+      if(!r.ok||!j||!j.ok)throw new Error((j&&j.error)||('HTTP '+r.status));
+    });})
+    .then(function(){location.reload();})
+    .catch(function(e){ok.disabled=false;msg.textContent='改名失败：'+(e.message||'网络错误');});
+  }
+  ok.onclick=save;
+  no.onclick=function(){box.innerHTML='';};
+  inp.addEventListener('keydown',function(ev){
+    if(ev.key==='Enter'&&!ev.isComposing){ev.preventDefault();save();}
+    else if(ev.key==='Escape'){box.innerHTML='';}
+  });
+  box.appendChild(inp);box.appendChild(ext);box.appendChild(ok);box.appendChild(no);box.appendChild(msg);
+  inp.focus();inp.select();
+}
+"""
+
+def rename_btn(fid, filename, sid="", with_icon=True):
+    stem, ext = split_filename(filename)
+    attrs = (f"data-id='{fid}' data-stem='{html.escape(stem)}' "
+             f"data-ext='{html.escape(ext)}'")
+    if sid:
+        attrs += f" data-sid='{html.escape(sid)}'"
+    return (f"<button type='button' class='ghost sm' {attrs} onclick='renameFile(this)' "
+            f"aria-label='修改文件名 {html.escape(filename)}'>"
+            f"{icon('edit') if with_icon else ''}改名</button>")
+
 def share_page(sid, share, files, user=None):
     # user 能管理这个分享（本人或管理员）时，页面上可以追加和删除文件
     manage = user is not None and can_manage_share(user, share)
@@ -2473,9 +2571,12 @@ def share_page(sid, share, files, user=None):
 <button class='ghost sm order-btn'{up_disabled} onclick='arrangeFile({f['id']},"up")' aria-label='上移 {name}'>{icon('up')}上移</button>
 <button class='ghost sm order-btn'{down_disabled} onclick='arrangeFile({f['id']},"down")' aria-label='下移 {name}'>{icon('down')}下移</button>
 <button class='ghost sm order-btn' onclick='arrangeFile({f['id']},"{action}")'>{icon('pin')}{label}</button>
+{rename_btn(f['id'], f['filename'], sid)}
 <button class='danger sm' onclick='delShareFile({f['id']},this)'>{icon('trash')}删除</button></div>"""
+        rn_slot = f"<div class='edit-slot' id='rn-{f['id']}'></div>" if manage else ""
         rows.append(f"""<div class='sf' id='file-{f['id']}'><div class='sf-main'>{tile}
-<div class='sf-info'><div class='sf-name'>{name}{badge}</div><div class='muted sf-meta'>{meta}</div></div></div>
+<div class='sf-info'><div class='sf-name'>{name}{badge}</div><div class='muted sf-meta'>{meta}</div>
+{rn_slot}</div></div>
 <div class='sf-acts'>{view_btn}{dl_btn}</div>{manage_row}</div>""")
     add_form = ""
     if manage:
@@ -2541,7 +2642,7 @@ function delShareFile(fid, el){
   })
   .catch(function(){ el.disabled = false; alert('请求失败'); });
 }
-""" + CHUNK_JS + UI_JS + """
+""" + CHUNK_JS + UI_JS + RENAME_JS + """
 var existingSearch=document.getElementById('existingSearch');
 if(existingSearch){
   existingSearch.addEventListener('input',function(){
@@ -2593,7 +2694,7 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
 });
 </script>""")
     title = html.escape(share['title'] or '文件分享')
-    manage_note = ("<div class='note'>你是这个分享的管理者：可以调整顺序、置顶、删除或添加文件。"
+    manage_note = ("<div class='note'>你是这个分享的管理者：可以调整顺序、置顶、改名、删除或添加文件（改名不能改文件格式）。"
                    "置顶数量不限；上移、下移在各自分组内生效，自动保存。新置顶或取消置顶的文件排到对应组末尾。新上传的文件排在最前面（置顶文件之后）。</div>"
                    "<div id='orderStatus' class='muted' role='status' aria-live='polite' style='margin-top:6px'></div>"
                    if manage else "")
@@ -3593,6 +3694,27 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self._json({"ok": False, "error": str(e)}, 400)
                 return self._json({"ok": True})
+
+            if p == "/api/file_rename":
+                # 改文件名（扩展名不变）。带 sid 是分享页（分享者或管理员），
+                # 不带是"全部文件"（管理员或文件所有者）。
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                sid, fid = f.get("sid", ""), f.get("id", "")
+                if ((sid and not re.fullmatch(r"[A-Za-z0-9_\-]{1,16}", sid)) or
+                        not re.fullmatch(r"[0-9]{1,18}", fid)):
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                try:
+                    name = rename_file(int(fid), f.get("name", ""), user, sid or None)
+                except PermissionError as e:
+                    return self._json({"ok": False, "error": str(e)}, 403)
+                except LookupError as e:
+                    return self._json({"ok": False, "error": str(e)}, 404)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                return self._json({"ok": True, "filename": name})
 
             if p == "/api/share_file_existing":
                 user = self._require_auth()

@@ -706,7 +706,7 @@ class Connectivity(unittest.TestCase):
         self.assertIn("NAT_DETECTED", https)
         self.assertIn("自动检测：本机出口 IP", https)
         self.assertIn("location.origin", program)
-        self.assertIn('VERSION = "1.3.0"', program)
+        self.assertIn('VERSION = "1.4.0"', program)
 
     def test_public_mss_clamp_skipped_for_normal_user(self):
         # 普通用户启动不能改防火墙。root 上才会按 Caddy 的公网端口钳 MSS。
