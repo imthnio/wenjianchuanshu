@@ -33,7 +33,7 @@ class FileRenameTest(unittest.TestCase):
                           ('tok%d' % uid, uid, now, now + 3600))
             for sid, typ, expiry, owner in [('share', 'send', 0, 1), ('other', 'send', 0, 2),
                                             ('expired', 'send', now - 1, 1),
-                                            ('recv', 'recv', 0, 1)]:
+                                            ('recv', 'receive', 0, 1)]:
                 c.execute('INSERT INTO shares(id,type,title,created,expires,owner_id)'
                           ' VALUES(?,?,?,?,?,?)', (sid, typ, '', now, expiry, owner))
             for fid, sid, name, owner in [(1, 'share', '俄罗斯鼠疫.mov', 1),
