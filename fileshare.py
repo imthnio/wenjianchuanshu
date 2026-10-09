@@ -1939,7 +1939,7 @@ function bindXhr(fid, url, resId, progId, okText){{
       try{{var j=JSON.parse(xhr.responseText);
         if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
           setTimeout(()=>location.reload(), 1500);
-        }}else{{res.innerHTML="<div class='err'>"+(j.error||'失败')+"</div>";}}
+        }}else{{res.innerHTML="<div class='err'>"+escapeHtml(j.error||'失败')+"</div>";}}
       }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
     }};
     xhr.onerror=function(){{if(prog)prog.style.display='none';res.innerHTML="<div class='err'>网络错误</div>";}};
@@ -2031,11 +2031,11 @@ function postForm(url, form, resId, okHtml){{
   }})
   .then(function(j){{
     if(j.ok){{res.innerHTML=okHtml;}}
-    else{{res.innerHTML="<div class='err'>"+(j.error||'失败')+"</div>";}}
+    else{{res.innerHTML="<div class='err'>"+escapeHtml(j.error||'失败')+"</div>";}}
     return j;
   }})
   .catch(function(e){{
-    res.innerHTML="<div class='err'>请求失败："+(e&&e.message?e.message:'网络错误')+"</div>";
+    res.innerHTML="<div class='err'>请求失败："+escapeHtml(e&&e.message?e.message:'网络错误')+"</div>";
     return {{ok:false}};
   }})
   .then(function(j){{
