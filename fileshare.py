@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -1252,28 +1252,51 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
 # 设计：浅色为主，系统深色模式时自动切换；所有样式内联在页面里，
 # 不依赖任何 CDN，裸 VPS 断网也能正常显示。
 CSS = """
-:root{--bg:#f4f6fa;--card:#fff;--text:#1f2937;--muted:#667085;--border:#e3e7ee;--line:#eef1f5;
---hover:#f3f5f9;--accent:#2563eb;--accent-h:#1d4ed8;--accent-soft:#eaf1ff;--accent-text:#1d4ed8;
---danger:#d92d20;--danger-soft:#fef3f2;--danger-line:#fbcfca;--ok:#067647;--ok-soft:#ecfdf3;--ok-line:#abefc6;
---warn:#b54708;--warn-soft:#fffaeb;--r:14px;--r-sm:10px;
---shadow:0 1px 2px rgba(16,24,40,.04),0 2px 12px rgba(16,24,40,.05);color-scheme:light}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161a21;--text:#e7e9ee;--muted:#9aa4b2;
---border:#2a303b;--line:#212631;--hover:#1d222b;--accent:#2f6fed;--accent-h:#4a82f0;--accent-soft:#17233d;
---accent-text:#8db3ff;--danger:#f97066;--danger-soft:#2a1715;--danger-line:#5c2a25;--ok:#47cd89;
---ok-soft:#0f2519;--ok-line:#1f4d33;--warn:#fdb022;--warn-soft:#2a2111;--shadow:none;color-scheme:dark}}
+/* 配色、圆角和动效曲线取自 Lucian UX/UI Prompt 主题 tokens · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/ */
+:root{color-scheme:light;
+--ux-page:#F4F2EE;--ux-surface:#FFFFFF;--ux-surface-2:#F5F3EF;--ux-surface-3:#EAE7E1;
+--ux-ink:#16151B;--ux-ink-2:#57535F;--ux-ink-3:#8E8A97;--ux-line:rgba(22,21,27,.09);--ux-line-2:rgba(22,21,27,.17);
+--ux-accent:#6A57F2;--ux-accent-2:#2F8FE0;--ux-accent-soft:rgba(106,87,242,.12);--ux-accent-ink:#FFFFFF;
+--ux-mint:#119C72;--ux-warn:#D6731E;--ux-danger:#D93A55;
+--ux-glass:rgba(255,255,255,.58);--ux-glass-line:rgba(255,255,255,.85);
+--ux-shadow:rgba(40,30,80,.14);--ux-shadow-strong:rgba(40,30,80,.3);
+--ux-grad:linear-gradient(120deg,#7B61FF,#3D8BFF 55%,#1FB89A);
+--ux-ease:cubic-bezier(.2,.8,.2,1);--ux-spring:cubic-bezier(.34,1.45,.64,1);
+/* 页面里原有的变量名都指向 --ux-*，深色模式只需要换 --ux-* */
+--bg:var(--ux-page);--card:var(--ux-surface);--text:var(--ux-ink);--muted:var(--ux-ink-2);
+--border:var(--ux-line-2);--line:var(--ux-line);--hover:var(--ux-surface-2);
+--accent:var(--ux-accent);--accent-h:color-mix(in srgb,var(--ux-accent) 86%,var(--ux-ink));
+--accent-soft:var(--ux-accent-soft);--accent-text:var(--ux-accent);--accent-ink:var(--ux-accent-ink);
+--danger:color-mix(in srgb,var(--ux-danger) 88%,var(--ux-ink));--danger-soft:color-mix(in srgb,var(--ux-danger) 9%,var(--ux-surface));
+--danger-line:color-mix(in srgb,var(--ux-danger) 34%,transparent);
+--ok:color-mix(in srgb,var(--ux-mint) 80%,var(--ux-ink));--ok-soft:color-mix(in srgb,var(--ux-mint) 11%,var(--ux-surface));
+--ok-line:color-mix(in srgb,var(--ux-mint) 32%,transparent);
+--warn:color-mix(in srgb,var(--ux-warn) 78%,var(--ux-ink));--warn-soft:color-mix(in srgb,var(--ux-warn) 12%,var(--ux-surface));
+--r:22px;--r-sm:12px;
+--shadow:0 0 0 1px var(--ux-line),0 18px 32px -24px var(--ux-shadow-strong)}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;
+--ux-page:#07080D;--ux-surface:#13141C;--ux-surface-2:#1A1B25;--ux-surface-3:#252632;
+--ux-ink:#F4F0E8;--ux-ink-2:rgba(244,240,232,.68);--ux-ink-3:rgba(244,240,232,.42);
+--ux-line:rgba(255,255,255,.08);--ux-line-2:rgba(255,255,255,.16);
+--ux-accent:#B7A4FF;--ux-accent-2:#7DB4FF;--ux-accent-soft:rgba(183,164,255,.15);--ux-accent-ink:#0B0C12;
+--ux-mint:#7EE8C0;--ux-warn:#FFB26B;--ux-danger:#FF7D8C;
+--ux-glass:rgba(255,255,255,.07);--ux-glass-line:rgba(255,255,255,.18);
+--ux-shadow:rgba(0,0,0,.45);--ux-shadow-strong:rgba(0,0,0,.72);
+--ux-grad:linear-gradient(120deg,#B7A4FF,#7DB4FF 55%,#A5F2D3);
+--danger:var(--ux-danger);--ok:var(--ux-mint);--warn:var(--ux-warn)}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--text);letter-spacing:-.01em;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 .wrap{margin:0 auto;padding:20px 16px 88px}
 .wrap-sm{max-width:440px}.wrap-md{max-width:760px}.wrap-lg{max-width:1080px}
-h1{font-size:22px;line-height:1.35;margin:0 0 6px;letter-spacing:-.01em}
-h2{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+h1{font-size:23px;line-height:1.35;margin:0 0 6px;letter-spacing:-.025em;font-weight:760}
+h2{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:8px;letter-spacing:-.02em;font-weight:720}
 h3{font-size:15px;margin:0 0 10px}
 p{margin:0 0 10px}
 a{color:var(--accent-text);text-decoration:none}a:hover{text-decoration:underline}
 .muted{color:var(--muted);font-size:13px}
 small.muted{font-size:12px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card{background:var(--card);border:0;border-radius:var(--r);padding:22px;margin-bottom:16px;box-shadow:var(--shadow)}
 .card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
 .card-head p{margin:0}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;align-items:start}
@@ -1282,39 +1305,42 @@ small.muted{font-size:12px}
 .stack>.card{margin-bottom:0}
 label.fld{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 input,select,textarea{font:inherit;font-size:15px;color:var(--text);background:var(--card);border:1px solid var(--border);
-  border-radius:var(--r-sm);padding:10px 12px;width:100%;margin:6px 0;min-height:44px;transition:border-color .15s,box-shadow .15s}
-input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+  border-radius:var(--r-sm);padding:10px 12px;width:100%;margin:6px 0;min-height:44px;transition:border-color .3s var(--ux-ease),box-shadow .3s var(--ux-ease)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px var(--ux-accent-soft)}
+select{-webkit-appearance:none;appearance:none;padding-right:40px;cursor:pointer;background-repeat:no-repeat;background-position:right 14px center;background-size:14px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238E8A97' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")}
 input[type=checkbox]{width:18px;height:18px;min-height:0;margin:0;accent-color:var(--accent);flex:none;cursor:pointer}
 button,.btn{font:inherit;font-size:14px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  min-height:40px;padding:0 16px;border-radius:var(--r-sm);border:1px solid transparent;background:var(--accent);color:#fff;
-  cursor:pointer;text-decoration:none;white-space:nowrap;transition:background .15s,border-color .15s,box-shadow .15s,transform .05s;
+  min-height:40px;padding:0 16px;border-radius:var(--r-sm);border:1px solid transparent;background:var(--accent);color:var(--accent-ink);
+  cursor:pointer;text-decoration:none;white-space:nowrap;transition:background-color .3s var(--ux-ease),border-color .3s var(--ux-ease),box-shadow .3s var(--ux-ease),color .3s var(--ux-ease),transform .45s var(--ux-spring);
   -webkit-tap-highlight-color:transparent;vertical-align:middle;margin:0}
 button:hover,.btn:hover{background:var(--accent-h);text-decoration:none}
-button:active,.btn:active{transform:translateY(1px)}
-button:focus-visible,.btn:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:2px}
+button:active,.btn:active{transform:scale(.95)}
+:focus-visible{outline:2px solid var(--ux-accent);outline-offset:3px}
+input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 form>button,button.block,.btn.block{width:100%;min-height:46px;margin-top:10px;font-size:15px}
 button.ghost,.btn.ghost{background:var(--card);color:var(--text);border-color:var(--border)}
 button.ghost:hover,.btn.ghost:hover{background:var(--hover)}
 button.danger,.btn.danger{background:var(--card);color:var(--danger);border-color:var(--danger-line)}
 button.danger:hover,.btn.danger:hover{background:var(--danger-soft)}
-button.sm,.btn.sm{min-height:32px;padding:0 10px;font-size:13px;font-weight:500;border-radius:8px}
+button.sm,.btn.sm{min-height:32px;padding:0 11px;font-size:13px;font-weight:600;border-radius:10px}
 button.icon-only{padding:0;width:40px}
-.btn-view{min-height:44px;padding:0 20px;font-size:15px;box-shadow:0 2px 10px color-mix(in srgb,var(--accent) 35%,transparent)}
+.btn-view{min-height:44px;padding:0 20px;font-size:15px;border-radius:14px;box-shadow:0 14px 24px -14px color-mix(in srgb,var(--accent) 85%,transparent)}
 .ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .sm .ic{width:15px;height:15px}
 a.btnlink{display:inline-flex;text-decoration:none}
 a.btnlink>button{pointer-events:none}
-.linkbox{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--accent-soft);color:var(--accent-text);
-  border:1px dashed color-mix(in srgb,var(--accent) 40%,transparent);border-radius:8px;padding:8px 12px;word-break:break-all;margin:8px 0}
+.linkbox{position:relative;overflow:hidden;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--ux-surface-2);color:var(--text);
+  border:0;box-shadow:0 0 0 1px var(--ux-line-2);border-radius:12px;padding:9px 12px;word-break:break-all;margin:8px 0;transition:box-shadow .45s var(--ux-ease)}
 .err,.ok{border-radius:var(--r-sm);padding:10px 12px;margin:8px 0;font-size:14px;border:1px solid}
 .err{background:var(--danger-soft);border-color:var(--danger-line);color:var(--danger)}
 .ok{background:var(--ok-soft);border-color:var(--ok-line);color:var(--ok)}
 span.err,span.ok{display:inline-block}
 progress{-webkit-appearance:none;appearance:none;width:100%;height:8px;border:0;border-radius:99px;background:var(--line);overflow:hidden;vertical-align:middle}
 progress::-webkit-progress-bar{background:var(--line);border-radius:99px}
-progress::-webkit-progress-value{background:var(--accent);border-radius:99px;transition:width .2s}
-progress::-moz-progress-bar{background:var(--accent);border-radius:99px}
+progress::-webkit-progress-value{background:var(--ux-grad);border-radius:99px;transition:width .2s}
+progress::-moz-progress-bar{background:var(--ux-grad);border-radius:99px}
 .prog{display:flex;align-items:center;gap:10px;margin:12px 0 4px}.prog .muted{min-width:3em;text-align:right;font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 140px}
 .badge{display:inline-flex;align-items:center;gap:3px;font-size:12px;font-weight:600;line-height:1;padding:4px 8px;border-radius:99px;
@@ -1323,22 +1349,33 @@ progress::-moz-progress-bar{background:var(--accent);border-radius:99px}
 .badge.pin{background:var(--warn-soft);color:var(--warn)}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:4px 0 18px}
 .brand{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700;margin:0;color:var(--text)}
-.brand .logo{width:36px;height:36px;border-radius:10px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:19px;flex:none}
+.brand .logo{width:38px;height:38px;border-radius:13px;background:var(--ux-grad);color:#fff;display:grid;place-items:center;font-size:19px;flex:none;box-shadow:0 12px 22px -12px var(--ux-shadow-strong)}
 .userchip{display:flex;align-items:center;gap:10px;font-size:14px}
-.userchip .who{background:var(--card);border:1px solid var(--border);border-radius:99px;padding:4px 12px}
+.userchip .who{background:var(--card);border:0;box-shadow:0 0 0 1px var(--ux-line);border-radius:99px;padding:5px 13px;font-weight:600}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;box-shadow:var(--shadow)}
-.stat b{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}
+.stat{background:var(--card);border:0;border-radius:var(--r);padding:16px 18px;box-shadow:var(--shadow)}
+.stat b{display:block;font-size:24px;line-height:1.2;font-weight:780;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
 .stat span{color:var(--muted);font-size:13px}
+/* 拖拽上传区：移植自 Lucian UX/UI Prompt #032 · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/#032 */
 .drop{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;text-align:center;
-  border:2px dashed var(--border);border-radius:var(--r);padding:22px 14px;margin:4px 0 6px;background:var(--hover);color:var(--muted);
-  cursor:pointer;transition:border-color .15s,background .15s;min-height:120px}
-.drop:hover,.drop.over{border-color:var(--accent);background:var(--accent-soft)}
-.drop.has{border-style:solid;border-color:var(--accent)}
+  border:0;border-radius:26px;padding:24px 14px;margin:4px 0 8px;background:var(--card);color:var(--muted);cursor:pointer;min-height:176px;
+  transition:transform .5s var(--ux-spring),background-color .3s var(--ux-ease)}
+.drop-dash{position:absolute;left:1px;top:1px;width:calc(100% - 2px);height:calc(100% - 2px);overflow:visible;pointer-events:none}
+.drop-dash rect{fill:none;stroke:var(--ux-line-2);stroke-width:2;stroke-dasharray:8 7;transition:stroke .3s var(--ux-ease)}
+.drop:hover .drop-dash rect,.drop.over .drop-dash rect{stroke:var(--ux-accent);animation:drop-march .9s linear infinite}
+.drop.has .drop-dash rect{stroke:var(--ux-accent)}
+@keyframes drop-march{to{stroke-dashoffset:-30}}
+.drop.over{transform:scale(1.03);background:color-mix(in srgb,var(--ux-accent) 7%,var(--ux-surface))}
+.drop:focus-within{outline:2px solid var(--ux-accent);outline-offset:4px}
 .drop input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;margin:0;min-height:0}
-.drop .ic{width:28px;height:28px;color:var(--accent)}
-.drop b{color:var(--text);font-size:15px}
-.drop-files{font-size:13px;color:var(--accent-text);word-break:break-all}
+.drop-orb{width:60px;height:60px;border-radius:20px;display:grid;place-items:center;color:#fff;background:linear-gradient(140deg,#5B8CFF,#8B6CFF);
+  box-shadow:0 16px 28px -14px rgba(91,108,255,.8);transition:transform .5s var(--ux-spring);margin-bottom:10px}
+.drop-orb svg{width:28px;height:28px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.drop:hover .drop-orb{transform:translateY(-4px)}
+.drop.over .drop-orb{transform:translateY(-8px) scale(1.1) rotate(-6deg)}
+.drop b{color:var(--text);font-size:15.5px;font-weight:720;letter-spacing:-.02em}
+.drop>.muted{font-size:12.5px;color:var(--ux-ink-3)}
+.drop-files{font-size:13px;font-weight:600;color:var(--accent-text);word-break:break-all;margin-top:4px}
 .drop-files:empty{display:none}
 .file{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 0;border-top:1px solid var(--line)}
 .file:first-child{border-top:0}
@@ -1363,26 +1400,26 @@ progress::-moz-progress-bar{background:var(--accent);border-radius:99px}
 .m-meta{display:none}
 .empty{text-align:center;padding:28px 12px;color:var(--muted)}
 .empty .big{font-size:40px;line-height:1;margin-bottom:8px;display:block}
-details{border:1px solid var(--border);border-radius:var(--r-sm);padding:0 14px;margin-top:14px}
+details{border:0;box-shadow:0 0 0 1px var(--ux-line-2);border-radius:16px;padding:0 14px;margin-top:14px}
 details>summary{cursor:pointer;padding:12px 0;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px}
 details>summary::-webkit-details-marker{display:none}
-details>summary::before{content:"▸";color:var(--muted);transition:transform .15s}
+details>summary::before{content:"▸";color:var(--muted);transition:transform .45s var(--ux-spring)}
 details[open]>summary::before{transform:rotate(90deg)}
 details[open]{padding-bottom:14px}
 .existing-file{justify-content:flex-start;cursor:pointer;padding:10px 4px;gap:10px}
-.existing-file:hover{background:var(--hover)}
+.existing-file{border-radius:12px}.existing-file:hover{background:var(--hover)}
 input.fileck{margin:0}
 .auth{margin-top:8vh}
 .auth .brand{justify-content:center;margin-bottom:6px}
 .auth h1{text-align:center;font-size:20px}
 .auth .sub{text-align:center;color:var(--muted);font-size:14px;margin-bottom:16px}
 .hero{display:flex;gap:14px;align-items:flex-start}
-.hero .logo{width:48px;height:48px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:24px;flex:none}
+.hero .logo{width:52px;height:52px;border-radius:17px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:25px;flex:none}
 .hero h1{margin:2px 0 4px;word-break:break-word;overflow-wrap:anywhere}
 .chips{display:flex;gap:6px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);background:var(--hover);border:1px solid var(--line);border-radius:99px;padding:3px 10px}
+.chip{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);background:var(--hover);border:0;box-shadow:0 0 0 1px var(--ux-line);border-radius:99px;padding:3px 11px}
 .chip b{color:var(--text);font-weight:600}
-.note{background:var(--accent-soft);color:var(--accent-text);border-radius:var(--r-sm);padding:10px 12px;font-size:13px;margin-top:14px}
+.note{background:var(--accent-soft);color:var(--text);border-radius:14px;padding:11px 14px;font-size:13px;margin-top:14px;line-height:1.65}
 .sf{display:flex;align-items:center;gap:12px 14px;padding:14px 0;border-top:1px solid var(--line);flex-wrap:wrap;scroll-margin-top:16px}
 .sf:first-child{border-top:0}
 .sf:target{animation:flash 2s ease-out}
@@ -1394,18 +1431,18 @@ input.fileck{margin:0}
 .sf-meta{margin-top:2px}
 .sf-acts{display:flex;gap:8px;flex:none;align-items:center}
 .sf-manage{flex-basis:100%;display:flex;gap:6px;flex-wrap:wrap;padding-left:56px}
-.ftile{width:44px;height:44px;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;flex:none;
+.ftile{width:44px;height:44px;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;flex:none;
   background:var(--hover);color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.02em;line-height:1;gap:2px;text-transform:uppercase}
 .ftile .ic{width:20px;height:20px}
-.ftile.k-img{background:#e8f7ee;color:#067647}.ftile.k-vid{background:#f3ebff;color:#6d28d9}
-.ftile.k-aud{background:#fff1e6;color:#c2410c}.ftile.k-pdf{background:#fdecec;color:#c01f1f}
-.ftile.k-txt{background:#eaf1ff;color:#1d4ed8}
-@media (prefers-color-scheme:dark){.ftile.k-img{background:#10261a;color:#6ce0a0}.ftile.k-vid{background:#221a36;color:#c4a6ff}
-.ftile.k-aud{background:#2b1c10;color:#ffb27a}.ftile.k-pdf{background:#2d1515;color:#ff9a9a}.ftile.k-txt{background:#17233d;color:#8db3ff}}
-.diskfoot{position:fixed;left:12px;bottom:12px;background:rgba(17,24,39,.86);color:#fff;font-size:12px;padding:7px 12px;border-radius:99px;
-  z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
-.diskbar{width:90px;height:5px;border-radius:3px;background:rgba(255,255,255,.25);overflow:hidden}
-.diskbar i{display:block;height:100%;background:#40c463;border-radius:3px}
+.ftile.k-img{--c:var(--ux-mint)}.ftile.k-vid{--c:var(--ux-accent)}.ftile.k-aud{--c:var(--ux-warn)}
+.ftile.k-pdf{--c:var(--ux-danger)}.ftile.k-txt{--c:var(--ux-accent-2)}
+.ftile[class*=k-]:not(.k-other){background:color-mix(in srgb,var(--c) 14%,var(--ux-surface));color:color-mix(in srgb,var(--c) 82%,var(--ux-ink))}
+@media (prefers-color-scheme:dark){.ftile[class*=k-]:not(.k-other){color:var(--c)}}
+.diskfoot{position:fixed;left:12px;bottom:12px;background:var(--ux-glass);color:var(--text);font-size:12px;font-weight:600;padding:7px 13px;border-radius:99px;
+  z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 0 0 1px var(--ux-glass-line),0 14px 28px -16px var(--ux-shadow-strong);
+  -webkit-backdrop-filter:blur(14px) saturate(1.4);backdrop-filter:blur(14px) saturate(1.4)}
+.diskbar{width:90px;height:5px;border-radius:3px;background:var(--ux-line-2);overflow:hidden}
+.diskbar i{display:block;height:100%;background:var(--ux-grad);border-radius:3px}
 .foot{text-align:center;color:var(--muted);font-size:12px;margin-top:8px}
 html.pv-lock,html.pv-lock body{overflow:hidden}
 .pv{position:fixed;inset:0;z-index:3000;display:flex;flex-direction:column;background:#0b0d12;color:#f2f4f7}
@@ -1449,9 +1486,61 @@ html.pv-lock,html.pv-lock body{overflow:hidden}
 .pv-vhint{position:absolute;top:52px;left:50%;transform:translateX(-50%);width:min(520px,calc(100% - 24px));background:rgba(0,0,0,.7);color:#fde68a;
   font-size:13px;line-height:1.5;padding:8px 12px;border-radius:10px;text-align:center;pointer-events:none;z-index:1}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* 复制链接按钮：移植自 Lucian UX/UI Prompt #008 · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/#008 */
+.copybtn{position:relative;overflow:visible}
+.cp-ic{position:relative;width:15px;height:15px;flex:none}
+button:not(.sm) .cp-ic{width:18px;height:18px}
+.cp-ic svg{position:absolute;inset:0;width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;
+  transition:opacity .25s var(--ux-ease),transform .5s var(--ux-spring)}
+.cp-ok{opacity:0;transform:scale(.4) rotate(-30deg)}
+.cp-ok path{stroke-width:2.6;stroke-dasharray:22;stroke-dashoffset:22;transition:stroke-dashoffset .4s var(--ux-ease) .1s}
+.copybtn.is-copied,.copybtn.is-copied:hover{background:var(--ux-mint);border-color:var(--ux-mint);color:var(--ux-accent-ink)}
+.copybtn.is-copied .cp-cp{opacity:0;transform:scale(.4) rotate(30deg)}
+.copybtn.is-copied .cp-ok{opacity:1;transform:none}
+.copybtn.is-copied .cp-ok path{stroke-dashoffset:0}
+.cp-tip{position:absolute;right:-6px;top:-40px;padding:7px 12px;border-radius:10px;background:var(--ux-ink);color:var(--ux-page);font-size:13px;font-weight:650;
+  white-space:nowrap;pointer-events:none;opacity:0;transform:translateY(8px) scale(.8);transform-origin:80% 100%;
+  transition:opacity .25s var(--ux-ease),transform .5s var(--ux-spring);z-index:5}
+.cp-tip::after{content:"";position:absolute;right:24px;bottom:-5px;width:10px;height:10px;background:inherit;border-radius:2px;transform:rotate(45deg)}
+.copybtn.is-copied .cp-tip{opacity:1;transform:none}
+.linkbox::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 20%,color-mix(in srgb,var(--ux-mint) 30%,transparent) 50%,transparent 80%);
+  transform:translateX(-110%);pointer-events:none}
+.linkbox.is-copied::after{animation:cp-sweep .7s var(--ux-ease)}
+@keyframes cp-sweep{to{transform:translateX(110%)}}
+.linkbox.is-copied{box-shadow:0 0 0 1.5px var(--ux-mint),0 0 0 6px color-mix(in srgb,var(--ux-mint) 16%,transparent)}
+/* 叠放通知：移植自 Lucian UX/UI Prompt #070 · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/#070 */
+.ux{-webkit-font-smoothing:antialiased;letter-spacing:-.01em;-webkit-tap-highlight-color:transparent;overflow-wrap:break-word}
+.ux,.ux *,.ux *::before,.ux *::after{box-sizing:border-box}
+.tst-zone{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));width:min(350px,calc(100vw - 32px));height:300px;z-index:2500;pointer-events:none;outline:none}
+.tst-t{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:12px;min-height:68px;padding:12px 12px 12px 14px;border-radius:20px;
+  background:var(--ux-surface);color:var(--ux-ink);box-shadow:0 0 0 1px var(--ux-line),0 16px 30px -18px var(--ux-shadow-strong);transform-origin:50% 100%;
+  transform:translate(var(--dx,0px),var(--y,0px)) scale(var(--s,1));opacity:var(--o,1);transition:transform .5s var(--ux-spring),opacity .35s;
+  touch-action:pan-y;user-select:none;-webkit-user-select:none;pointer-events:auto}
+.tst-t.drag{transition:none}
+.tst-t.enter{transform:translateY(90px) scale(.9);opacity:0}
+.tst-t.leave{transform:translate(var(--dx,0px),var(--y,0px)) scale(var(--s,1));opacity:0;pointer-events:none}
+.tst-t.leave.side{transform:translate(calc(var(--dir,1) * 420px),var(--y,0px)) rotate(calc(var(--dir,1) * 8deg))}
+.tst-t>*{transition:opacity .25s}
+.tst-t.back>*{opacity:0}
+.tst-ic{width:36px;height:36px;flex:none;border-radius:12px;display:grid;place-items:center;background:color-mix(in srgb,var(--c) 15%,transparent);color:var(--c)}
+.tst-ic svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.tst-tx{flex:1;min-width:0}
+.tst-tx b{display:block;font-size:14px;font-weight:780;letter-spacing:-.02em;word-break:break-word}
+.tst-tx small{display:block;margin-top:2px;font-size:12.5px;font-weight:600;color:var(--ux-ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tst-tx small:empty{display:none}
+.tst-x{width:30px;height:30px;min-height:0;flex:none;border:0;padding:0;border-radius:50%;display:grid;place-items:center;background:none;color:var(--ux-ink-3)}
+.tst-x:hover{background:var(--ux-surface-2);color:var(--ux-ink)}
+.tst-x svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round}
+.tst-x:focus-visible{outline:2px solid var(--ux-accent);outline-offset:1px}
+.tst-bar{position:absolute;left:16px;right:16px;bottom:0;height:2px;border-radius:2px;background:var(--c);opacity:.5;transform-origin:0 50%;transform:scaleX(var(--left,1))}
+.tst-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition-duration:.001ms!important;scroll-behavior:auto!important}
+  .drop-dash rect,.linkbox::after,.sf:target{animation:none!important}
+}
 @media (max-width:700px){
   .wrap{padding:14px 12px 84px}
-  .card{padding:16px;border-radius:12px}
+  .card{padding:16px;border-radius:18px}
   h1{font-size:20px}
   .stats{gap:8px}.stat{padding:10px 12px}.stat b{font-size:18px}
   .file{flex-wrap:wrap}.file>.acts{flex:1 1 100%;justify-content:flex-start}
@@ -1472,6 +1561,7 @@ html.pv-lock,html.pv-lock body{overflow:hidden}
   .pv-btn .lbl{display:none}
   .pv-btn{padding:0;width:42px}
   .pv-nav{width:40px;height:40px;margin-top:-20px}.pv-prev{left:6px}.pv-next{right:6px}
+  .tst-zone{bottom:calc(60px + env(safe-area-inset-bottom))}
 }
 """
 
@@ -1506,16 +1596,22 @@ def icon(name):
             + _ICON_PATHS[name] + "</svg>")
 
 _FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-            "%3Crect width='64' height='64' rx='16' fill='%232563eb'/%3E"
+            "%3Crect width='64' height='64' rx='18' fill='%236A57F2'/%3E"
             "%3Cpath d='M16 22a4 4 0 0 1 4-4h9l4 5h11a4 4 0 0 1 4 4v15a4 4 0 0 1-4 4H20a4 4 0 0 1-4-4z' fill='white'/%3E%3C/svg%3E")
+
+# 复制按钮里的两个图标：叠在一起的方块，复制成功后重画成对勾（Lucian #008）
+COPY_ICON = ("<span class='cp-ic' aria-hidden='true'><svg class='cp-cp' viewBox='0 0 24 24'>"
+             "<rect x='8.5' y='8.5' width='11' height='11' rx='2.5'/>"
+             "<path d='M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2'/></svg>"
+             "<svg class='cp-ok' viewBox='0 0 24 24'><path d='M5.5 12.5l4.2 4.2L18.5 8'/></svg></span>")
 
 def page(title, body, size="md"):
     # size: sm（登录/提示）、md（分享页/接收页）、lg（控制台）
     return ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
             "<meta name='color-scheme' content='light dark'>"
-            "<meta name='theme-color' content='#f4f6fa' media='(prefers-color-scheme: light)'>"
-            "<meta name='theme-color' content='#0e1116' media='(prefers-color-scheme: dark)'>"
+            "<meta name='theme-color' content='#F4F2EE' media='(prefers-color-scheme: light)'>"
+            "<meta name='theme-color' content='#07080D' media='(prefers-color-scheme: dark)'>"
             f"<link rel='icon' href=\"{_FAVICON}\">"
             f"<title>{html.escape(title)}</title><style>{CSS}</style></head>"
             f"<body><main class='wrap wrap-{size}'>{body}</main></body></html>").encode("utf-8")
@@ -1611,7 +1707,10 @@ _EXPIRY_OPTIONS = "".join(f"<option value='{v}'{' selected' if v == '7' else ''}
 def _drop_zone(input_attrs, hint=""):
     # 整块区域都是 <input type=file>（透明覆盖），点击或把文件拖进来都能选；
     # 选中后由 UI_JS 显示文件名和总大小。
-    return (f"<label class='drop'>{icon('upload')}<b>点击选择文件，或拖到这里</b>"
+    return (f"<label class='drop'><svg class='drop-dash' aria-hidden='true'><rect width='100%' height='100%' rx='25'/></svg>"
+            "<span class='drop-orb' aria-hidden='true'><svg viewBox='0 0 28 28'><path d='M8.5 20.5H7a5 5 0 0 1-.6-10 "
+            "7 7 0 0 1 13.4-1.6A5.5 5.5 0 0 1 21 20.5h-1.5M14 13v10M10.5 16.5L14 13l3.5 3.5'/></svg></span>"
+            f"<b>点击选择文件，或拖到这里</b>"
             f"<span class='muted'>{hint or '支持多选，大文件自动分片上传'}</span>"
             f"<span class='drop-files' aria-live='polite'></span>"
             f"<input type='file' {input_attrs} aria-label='选择文件'></label>")
@@ -1662,7 +1761,7 @@ def dash_page(shares, user, public_base=""):
 <div class='edit-slot' id='ex-{s['id']}'></div><div class='edit-slot' id='pw-{s['id']}'></div>
 <div class='linkbox' id='lk-{s['id']}'>{html.escape(link)}</div><div class='edit-slot' id='ti-{s['id']}'></div></div>
 <div class='acts'>
-<button class='ghost sm' onclick="copyLink('{s['id']}','{path}'{copy_pw})">{icon('copy')}复制链接</button>
+<button class='ghost sm copybtn' id='cpb-{s['id']}' onclick="copyLink('{s['id']}','{path}'{copy_pw})">{COPY_ICON}复制链接</button>
 <a class='btn ghost sm' href='{path}' target='_blank' rel='noopener'>{icon('external')}打开</a>
 <button class='ghost sm' onclick="editTitle('{s['id']}')">{icon('edit')}改备注</button>
 <button class='ghost sm' onclick="editExpiry('{s['id']}')">{icon('clock')}改过期</button>
@@ -1799,7 +1898,7 @@ def dash_page(shares, user, public_base=""):
 <input type='password' name='new2' placeholder='重复新密码' required minlength='4' autocomplete='new-password' aria-label='重复新密码'>
 <button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div></div>
 <script>
-""" + CHUNK_JS + UI_JS + DASH_JS + f"""
+""" + CHUNK_JS + UI_JS + TOAST_JS + DASH_JS + f"""
 var _UPW={upw_json};
 var PUBLIC_BASE = {pub_js};
 function fullLink(p){{
@@ -1824,12 +1923,28 @@ function copyText(t, box){{
   }}
   if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {{
     navigator.clipboard.writeText(t).then(function(){{
-      box.innerHTML = '<span class="ok">已复制到剪贴板</span>';
+      // 链接保持可见：按钮图标重画成对勾、链接框扫过一道光、冒出"已复制"（Lucian #008）
+      var nx = box.nextElementSibling;
+      cpFlash(box._cpBtn || (nx && nx.classList.contains('copybtn') ? nx : null), box);
     }}, fail);
   }} else {{ fail(); }}
 }}
+function cpFlash(btn, box){{
+  [btn, box].forEach(function(el){{
+    if(!el) return;
+    clearTimeout(el._cpT);
+    el.classList.remove('is-copied'); void el.offsetWidth; el.classList.add('is-copied');
+    el._cpT = setTimeout(function(){{ el.classList.remove('is-copied'); }}, 1800);
+  }});
+  if(!btn) return;
+  var tip = btn.querySelector('.cp-tip');
+  if(!tip){{ tip = document.createElement('span'); tip.className = 'cp-tip'; tip.setAttribute('role','status'); btn.appendChild(tip); }}
+  tip.textContent = '已复制';
+  setTimeout(function(){{ if(!btn.classList.contains('is-copied')) tip.textContent = ''; }}, 1900);
+}}
 function copyLink(id, p, pw){{
   var el = document.getElementById('lk-'+id);
+  el._cpBtn = document.getElementById('cpb-'+id);
   var t = fullLink(p) + (pw ? ' 提取码: ' + pw : '');
   el.textContent = t;
   copyText(t, el);
@@ -1847,7 +1962,7 @@ function delOneFile(id){{delFilesByIds([id]);}}
 function delFiles(){{
   var ids=[], cks=document.querySelectorAll('.fileck:checked'), i;
   for(i=0;i<cks.length;i++){{ids.push(cks[i].value);}}
-  if(!ids.length){{alert('请先勾选要删除的文件');return;}}
+  if(!ids.length){{uxToast('请先勾选要删除的文件','info');return;}}
   delFilesByIds(ids);
 }}
 function delFilesByIds(ids){{
@@ -1904,7 +2019,7 @@ function editSharePw(id){{
   var ok=document.createElement('button');ok.className='ghost';ok.textContent='确定';
   ok.onclick=function(){{
     var v=inp.value.trim();
-    if(!/^[A-Za-z0-9]{{4}}$/.test(v)){{alert('密码必须是 4 位数字或字母（不区分大小写）');inp.focus();return;}}
+    if(!/^[A-Za-z0-9]{{4}}$/.test(v)){{uxToast('密码必须是 4 位数字或字母','err','不区分大小写');inp.focus();return;}}
     apiPost('/api/share_pw','id='+encodeURIComponent(id)+'&pw='+encodeURIComponent(v));
   }};
   inp.onkeydown=function(e){{if(e.key==='Enter')ok.onclick();}};
@@ -1937,7 +2052,7 @@ function bindXhr(fid, url, resId, progId, okText){{
     xhr.onload=function(){{
       if(prog)prog.style.display='none';
       try{{var j=JSON.parse(xhr.responseText);
-        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
+        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
           setTimeout(()=>location.reload(), 1500);
         }}else{{res.innerHTML="<div class='err'>"+escapeHtml(j.error||'失败')+"</div>";}}
       }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
@@ -1986,7 +2101,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   .then(function(link){{
     prog.value=100; pct.textContent='100%';
     stat.innerHTML="<b style='color:var(--ok)'>上传完成 ✅</b>";
-    res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+fullLink(link)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
+    res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+fullLink(link)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
     setTimeout(()=>location.reload(), 1500);
   }})
   .catch(function(err){{
@@ -1995,7 +2110,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
     var html="<div class='err'>"+escapeHtml(err.message||'失败')+"</div>";
     if(createdLink){{
       html+="<div class='ok'>已上传的文件已保留，分享链接：</div><div class='linkbox'>"
-        +fullLink(createdLink)+"</div><button class='ghost' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>复制链接</button>";
+        +fullLink(createdLink)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
     }}
     res.innerHTML=html;
   }});
@@ -2060,12 +2175,14 @@ function apiPost(url, body){{
     }});
   }})
   .then(function(j){{
-    if(j.ok){{location.reload();}}
-    else{{alert('操作失败：'+(j.error||'未知错误'));}}
+    if(j.ok){{try{{uxFlash('操作成功');}}catch(e){{}}location.reload();}}
+    else{{say('操作失败：'+(j.error||'未知错误'));}}
   }})
   .catch(function(e){{
-    alert('请求失败：'+(e&&e.message?e.message:'网络错误')+'，请检查网络后重试');
+    say('请求失败：'+(e&&e.message?e.message:'网络错误')+'，请检查网络后重试');
   }});
+  // 页面上有通知栈就弹通知，没有（比如单独拿出来跑）退回 alert，失败绝不静默
+  function say(m){{if(typeof uxToast==='function')uxToast(m,'err');else alert(m);}}
 }}
 document.getElementById('pwForm').addEventListener('submit', function(ev){{
   ev.preventDefault();
@@ -2479,6 +2596,95 @@ def _looks_utf8(path):
         # 只是在 64KB 边界切断了一个多字节字符
         return len(data) == 65536 and e.start >= len(data) - 3
 
+# 叠放通知：移植自 Lucian UX/UI Prompt #070 · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/#070
+# 代替 alert() 弹窗。uxToast(标题, 'ok'|'err'|'info', 小字说明)。新通知从底部升到最前，
+# 旧的缩到后面；鼠标移上去展开成列表并暂停倒计时；左右划掉单条。
+# 操作成功后页面会刷新，用 sessionStorage 把"成功"带到刷新后的页面再弹。
+TOAST_JS = r"""
+var uxToast = (function () {
+  var zone = null, live = null, list = [], open = false, DUR = 4500, ticking = false, last = 0;
+  var rm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var ICON = { ok: '<svg viewBox="0 0 18 18"><path d="M4 9.4l3.2 3.2L14 5.6"/></svg>', err: '<svg viewBox="0 0 18 18"><path d="M9 5v5M9 13h.01"/></svg>', info: '<svg viewBox="0 0 18 18"><path d="M9 8v5M9 5h.01"/></svg>' };
+  var COLOR = { ok: 'var(--ux-mint)', err: 'var(--ux-danger)', info: 'var(--ux-accent)' };
+  function ensure() {
+    if (zone) return;
+    zone = document.createElement('div');
+    zone.className = 'ux tst-zone'; zone.setAttribute('role', 'region'); zone.setAttribute('aria-label', '通知'); zone.tabIndex = -1;
+    live = document.createElement('div'); live.className = 'tst-live'; live.setAttribute('aria-live', 'polite');
+    zone.appendChild(live); document.body.appendChild(zone);
+    zone.addEventListener('pointerenter', function (e) { if (e.pointerType === 'mouse') setOpen(true); });
+    zone.addEventListener('pointerleave', function (e) { if (e.pointerType === 'mouse' && !zone.contains(document.activeElement)) setOpen(false); });
+    zone.addEventListener('focusin', function () { setOpen(true); });
+    zone.addEventListener('focusout', function (e) { if (!zone.contains(e.relatedTarget)) setOpen(false); });
+    zone.addEventListener('click', function (e) { if (!e.target.closest('button') && list.length > 1) setOpen(!open); });
+  }
+  function layout() {
+    var acc = 0;
+    list.forEach(function (t, i) {
+      var el = t.el;
+      el.classList.toggle('back', !open && i > 0);
+      if (open) { el.style.setProperty('--y', -acc + 'px'); el.style.setProperty('--s', 1); el.style.setProperty('--o', 1); acc += el.offsetHeight + 8; }
+      else { el.style.setProperty('--y', -(i * 14) + 'px'); el.style.setProperty('--s', (1 - i * 0.06).toFixed(2)); el.style.setProperty('--o', i > 2 ? 0 : 1); }
+      el.style.zIndex = 50 - i;
+      el.inert = !open && i > 0;
+    });
+    if (!list.length) open = false;
+  }
+  function remove(t, dir) {
+    var i = list.indexOf(t);
+    if (i < 0) return;
+    list.splice(i, 1);
+    t.el.classList.add('leave');
+    if (dir) { t.el.style.setProperty('--dir', dir); t.el.classList.add('side'); }
+    setTimeout(function () { t.el.remove(); }, 450);
+    layout();
+  }
+  function tick(now) {
+    var dt = now - last; last = now;
+    if (!open) list.slice().forEach(function (t, i) {
+      if (i > 0) return;
+      t.left -= dt;
+      t.el.style.setProperty('--left', Math.max(0, t.left / DUR).toFixed(3));
+      if (t.left <= 0) remove(t);
+    });
+    // 没有通知就停掉动画循环，下一条来了再开
+    if (list.length) requestAnimationFrame(tick); else ticking = false;
+  }
+  function setOpen(v) { if (open === v) return; open = v; layout(); }
+  return function push(title, kind, sub) {
+    kind = ICON[kind] ? kind : 'info';
+    ensure();
+    var el = document.createElement('div');
+    el.className = 'tst-t enter';
+    el.style.setProperty('--c', COLOR[kind]);
+    el.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+    el.innerHTML = '<span class="tst-ic" aria-hidden="true">' + ICON[kind] + '</span><span class="tst-tx"><b></b><small></small></span><button class="tst-x" type="button" aria-label="关闭通知"><svg viewBox="0 0 14 14"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg></button><span class="tst-bar" aria-hidden="true"></span>';
+    el.querySelector('b').textContent = title; el.querySelector('small').textContent = sub || '';
+    var t = { el: el, left: DUR };
+    zone.appendChild(el);
+    list.unshift(t);
+    void el.offsetWidth;
+    el.classList.remove('enter');
+    layout();
+    live.textContent = title;
+    el.querySelector('.tst-x').addEventListener('click', function () { remove(t); });
+    var sx = 0, dx = 0, down = false;
+    el.addEventListener('pointerdown', function (e) { if (e.target.closest('button')) return; down = true; sx = e.clientX; dx = 0; el.setPointerCapture(e.pointerId); el.classList.add('drag'); });
+    el.addEventListener('pointermove', function (e) { if (!down) return; dx = e.clientX - sx; el.style.setProperty('--dx', dx + 'px'); el.style.setProperty('--o', Math.max(0.2, 1 - Math.abs(dx) / 260)); });
+    var end = function () { if (!down) return; down = false; el.classList.remove('drag'); if (Math.abs(dx) > 90) remove(t, dx > 0 ? 1 : -1); else { el.style.setProperty('--dx', '0px'); layout(); } };
+    el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+    if (!ticking) { ticking = true; last = performance.now(); requestAnimationFrame(tick); }
+    if (rm) el.style.transition = 'none';
+  };
+})();
+function uxFlash(msg){ try { sessionStorage.setItem('uxFlash', msg); } catch (e) {} }
+(function(){
+  var m = null;
+  try { m = sessionStorage.getItem('uxFlash'); sessionStorage.removeItem('uxFlash'); } catch (e) {}
+  if (m) uxToast(m, 'ok');
+})();
+"""
+
 # 改文件名：在 slot 里放一个只编辑主文件名的输入框，扩展名作为固定后缀显示。
 # 按钮带 data-id / data-stem / data-ext / data-sid（分享页才有）。
 RENAME_JS = r"""
@@ -2638,11 +2844,11 @@ function delShareFile(fid, el){
   .then(function(r){return r.json();})
   .then(function(j){
     if(j.ok) location.reload();
-    else { el.disabled = false; alert(j.error || '删除失败'); }
+    else { el.disabled = false; uxToast(j.error || '删除失败', 'err'); }
   })
-  .catch(function(){ el.disabled = false; alert('请求失败'); });
+  .catch(function(){ el.disabled = false; uxToast('请求失败', 'err', '请检查网络后重试'); });
 }
-""" + CHUNK_JS + UI_JS + RENAME_JS + """
+""" + CHUNK_JS + UI_JS + TOAST_JS + RENAME_JS + """
 var existingSearch=document.getElementById('existingSearch');
 if(existingSearch){
   existingSearch.addEventListener('input',function(){
