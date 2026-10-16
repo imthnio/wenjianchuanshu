@@ -69,7 +69,8 @@ else
   fi
   echo "正在下载 minishare..."
   # 按顺序试多个下载地址：GitHub 官方 -> jsdelivr 镜像（部分网络连 GitHub 很慢或连不上）
-  MIRRORS="https://raw.githubusercontent.com/${MINISHARE_REPO}/main https://cdn.jsdelivr.net/gh/${MINISHARE_REPO}@main"
+  # MINISHARE_BRANCH：从哪个分支下载，不设就用 main
+  MIRRORS="https://raw.githubusercontent.com/${MINISHARE_REPO}/${MINISHARE_BRANCH:-main} https://cdn.jsdelivr.net/gh/${MINISHARE_REPO}@${MINISHARE_BRANCH:-main}"
   dl() { # 用法: dl 文件名 —— 每个镜像都试一遍，成功就返回
     for m in $MIRRORS; do
       # raw.githubusercontent.com 有约 5 分钟的 CDN 缓存：刚推上去的修复，
