@@ -1274,7 +1274,7 @@ CSS = """
 --warn:color-mix(in srgb,var(--ux-warn) 78%,var(--ux-ink));--warn-soft:color-mix(in srgb,var(--ux-warn) 12%,var(--ux-surface));
 --r:22px;--r-sm:12px;
 --shadow:0 0 0 1px var(--ux-line),0 18px 32px -24px var(--ux-shadow-strong)}
-@media (prefers-color-scheme:dark){:root{color-scheme:dark;
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
 --ux-page:#07080D;--ux-surface:#13141C;--ux-surface-2:#1A1B25;--ux-surface-3:#252632;
 --ux-ink:#F4F0E8;--ux-ink-2:rgba(244,240,232,.68);--ux-ink-3:rgba(244,240,232,.42);
 --ux-line:rgba(255,255,255,.08);--ux-line-2:rgba(255,255,255,.16);
@@ -1283,7 +1283,20 @@ CSS = """
 --ux-glass:rgba(255,255,255,.07);--ux-glass-line:rgba(255,255,255,.18);
 --ux-shadow:rgba(0,0,0,.45);--ux-shadow-strong:rgba(0,0,0,.72);
 --ux-grad:linear-gradient(120deg,#B7A4FF,#7DB4FF 55%,#A5F2D3);
---danger:var(--ux-danger);--ok:var(--ux-mint);--warn:var(--ux-warn)}}
+--danger:var(--ux-danger);--ok:var(--ux-mint);--warn:var(--ux-warn);--g1:rgba(255,255,255,.2);--g2:rgba(255,255,255,.03);--g3:rgba(255,255,255,.1);--hi:rgba(255,255,255,.5);--rim:rgba(255,255,255,.16);--drop:rgba(0,0,0,.75)}}
+:root[data-theme="dark"]{color-scheme:dark;
+--ux-page:#07080D;--ux-surface:#13141C;--ux-surface-2:#1A1B25;--ux-surface-3:#252632;
+--ux-ink:#F4F0E8;--ux-ink-2:rgba(244,240,232,.68);--ux-ink-3:rgba(244,240,232,.42);
+--ux-line:rgba(255,255,255,.08);--ux-line-2:rgba(255,255,255,.16);
+--ux-accent:#B7A4FF;--ux-accent-2:#7DB4FF;--ux-accent-soft:rgba(183,164,255,.15);--ux-accent-ink:#0B0C12;
+--ux-mint:#7EE8C0;--ux-warn:#FFB26B;--ux-danger:#FF7D8C;
+--ux-glass:rgba(255,255,255,.07);--ux-glass-line:rgba(255,255,255,.18);
+--ux-shadow:rgba(0,0,0,.45);--ux-shadow-strong:rgba(0,0,0,.72);
+--ux-grad:linear-gradient(120deg,#B7A4FF,#7DB4FF 55%,#A5F2D3);
+--danger:var(--ux-danger);--ok:var(--ux-mint);--warn:var(--ux-warn);--g1:rgba(255,255,255,.2);--g2:rgba(255,255,255,.03);--g3:rgba(255,255,255,.1);--hi:rgba(255,255,255,.5);--rim:rgba(255,255,255,.16);--drop:rgba(0,0,0,.75)}
+:root[data-theme="light"]{color-scheme:light}
+:root{--g1:rgba(255,255,255,.66);--g2:rgba(255,255,255,.16);--g3:rgba(255,255,255,.4);--hi:rgba(255,255,255,.95);--rim:rgba(255,255,255,.65);--drop:rgba(70,48,160,.42)}
+:root:not([data-theme="light"]){}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);letter-spacing:-.01em;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
@@ -1437,7 +1450,8 @@ input.fileck{margin:0}
 .ftile.k-img{--c:var(--ux-mint)}.ftile.k-vid{--c:var(--ux-accent)}.ftile.k-aud{--c:var(--ux-warn)}
 .ftile.k-pdf{--c:var(--ux-danger)}.ftile.k-txt{--c:var(--ux-accent-2)}
 .ftile[class*=k-]:not(.k-other){background:color-mix(in srgb,var(--c) 14%,var(--ux-surface));color:color-mix(in srgb,var(--c) 82%,var(--ux-ink))}
-@media (prefers-color-scheme:dark){.ftile[class*=k-]:not(.k-other){color:var(--c)}}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .ftile[class*=k-]:not(.k-other){color:var(--c)}}
+:root[data-theme="dark"] .ftile[class*=k-]:not(.k-other){color:var(--c)}
 .diskfoot{position:fixed;left:12px;bottom:12px;background:var(--ux-glass);color:var(--text);font-size:12px;font-weight:600;padding:7px 13px;border-radius:99px;
   z-index:1000;display:flex;align-items:center;gap:8px;box-shadow:0 0 0 1px var(--ux-glass-line),0 14px 28px -16px var(--ux-shadow-strong);
   -webkit-backdrop-filter:blur(14px) saturate(1.4);backdrop-filter:blur(14px) saturate(1.4)}
@@ -1534,8 +1548,32 @@ button:not(.sm) .cp-ic{width:18px;height:18px}
 .tst-x:focus-visible{outline:2px solid var(--ux-accent);outline-offset:1px}
 .tst-bar{position:absolute;left:16px;right:16px;bottom:0;height:2px;border-radius:2px;background:var(--c);opacity:.5;transform-origin:0 50%;transform:scaleX(var(--left,1))}
 .tst-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+/* 已确认风格：移植自 Lucian UX/UI Prompt #001 Liquid glass button · MIT License (c) 2026 Seokwoooo · https://lucianlabs.dev/uxui-prompt/#001 */
+body{background:radial-gradient(900px 500px at 12% -10%,color-mix(in srgb,#8B6CFF 16%,transparent),transparent 70%),radial-gradient(800px 480px at 100% 0,color-mix(in srgb,#33B6FF 12%,transparent),transparent 70%),var(--ux-page);background-attachment:fixed;min-height:100vh}
+.card,.stat{transition:transform .5s var(--ux-spring),box-shadow .6s var(--ux-ease)}
+.brand .logo{background:var(--ux-grad);border-radius:14px;box-shadow:0 16px 28px -14px rgba(91,108,255,.8)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only){border-radius:999px;position:relative;overflow:hidden;isolation:isolate;
+  box-shadow:inset 0 1.5px 0 rgba(255,255,255,.35),0 12px 24px -14px var(--drop),0 3px 8px -4px var(--drop);
+  transition:transform .55s var(--ux-spring),box-shadow .6s var(--ux-ease),background-color .3s var(--ux-ease)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only)::before{content:"";position:absolute;top:-40%;bottom:-40%;left:0;width:38%;pointer-events:none;background:linear-gradient(100deg,transparent,rgba(255,255,255,.45) 50%,transparent);transform:translateX(-150%) skewX(-12deg);transition:transform 1.1s var(--ux-ease)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only):hover::before{transform:translateX(300%) skewX(-12deg)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only):active{transform:scale(1.03,.92)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only):is(.ghost,.danger),.userchip .who,.ux-theme{color:var(--ux-ink);border:0;background:linear-gradient(150deg,var(--g1),var(--g2) 55%,var(--g3));
+  -webkit-backdrop-filter:blur(18px) saturate(180%);backdrop-filter:blur(18px) saturate(180%);
+  box-shadow:inset 0 1.5px 0 var(--hi),inset 0 0 0 1px var(--rim),0 0 0 1px var(--ux-line),0 12px 24px -16px var(--drop)}
+:where(button,.btn):not(.pv *,.tst-zone *,.ux-theme,.icon-only).danger{color:var(--danger)}
+.copybtn{overflow:visible}
+input:not([type=checkbox]):not([type=file]),select,textarea{background-color:var(--ux-surface-2);border-color:var(--ux-line);border-radius:14px}
+input:focus,select:focus,textarea:focus{background-color:var(--ux-surface)}
+progress::-webkit-progress-value{background:var(--ux-grad)}progress::-moz-progress-bar{background:var(--ux-grad)}
+/* 明暗切换：参考 Lucian UX/UI Prompt #021 · MIT License (c) 2026 Seokwoooo */
+.ux-theme{position:fixed;right:14px;bottom:14px;z-index:50;width:44px;height:44px;min-height:0;padding:0;font-size:19px;border-radius:50%}
+.ux-theme span{display:inline-block;transition:transform .55s var(--ux-spring)}
+.ux-theme:hover span{transform:rotate(-20deg) scale(1.1)}
+html.pv-lock .ux-theme{display:none}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{transition-duration:.001ms!important;scroll-behavior:auto!important}
+  :where(button,.btn)::before{display:none}
   .drop-dash rect,.linkbox::after,.sf:target{animation:none!important}
 }
 @media (max-width:700px){
@@ -1605,16 +1643,24 @@ COPY_ICON = ("<span class='cp-ic' aria-hidden='true'><svg class='cp-cp' viewBox=
              "<path d='M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2'/></svg>"
              "<svg class='cp-ok' viewBox='0 0 24 24'><path d='M5.5 12.5l4.2 4.2L18.5 8'/></svg></span>")
 
+_THEME_INIT = ("<script id='ux-theme-init'>(function(){try{var t=localStorage.getItem('ux-theme');"
+    "if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}})()</script>")
+_THEME_TOGGLE = ("<button type='button' class='ux-theme' aria-label='切换亮色/暗色' title='切换亮色/暗色' "
+    "onclick=\"var d=document.documentElement,a=d.getAttribute('data-theme');"
+    "var n=(a?a==='dark':matchMedia('(prefers-color-scheme: dark)').matches)?'light':'dark';"
+    "d.setAttribute('data-theme',n);try{localStorage.setItem('ux-theme',n)}catch(e){}\"><span>◐</span></button>")
+
 def page(title, body, size="md"):
     # size: sm（登录/提示）、md（分享页/接收页）、lg（控制台）
     return ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
-            "<meta name='color-scheme' content='light dark'>"
+            "<meta name='color-scheme' content='light dark'>" + _THEME_INIT +
             "<meta name='theme-color' content='#F4F2EE' media='(prefers-color-scheme: light)'>"
             "<meta name='theme-color' content='#07080D' media='(prefers-color-scheme: dark)'>"
             f"<link rel='icon' href=\"{_FAVICON}\">"
             f"<title>{html.escape(title)}</title><style>{CSS}</style></head>"
-            f"<body><main class='wrap wrap-{size}'>{body}</main></body></html>").encode("utf-8")
+            f"<body><main class='wrap wrap-{size}'>{body}</main>"
+            + _THEME_TOGGLE + "</body></html>").encode("utf-8")
 
 def brand(tag="div"):
     return f"<{tag} class='brand'><span class='logo' aria-hidden='true'>🗂️</span>文件分享</{tag}>"
