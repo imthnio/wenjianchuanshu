@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -310,6 +310,12 @@ def init_db():
             filename TEXT, stored TEXT, size INTEGER, created INTEGER,
             owner_id INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_id)")
+        # 在线记事本：share_token 非空表示已开启分享（/n/<token>），ver 防止多个页面互相覆盖
+        c.execute("""CREATE TABLE IF NOT EXISTS notes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER,
+            title TEXT, content TEXT NOT NULL DEFAULT '',
+            created INTEGER, updated INTEGER, ver INTEGER NOT NULL DEFAULT 1,
+            share_token TEXT UNIQUE, share_pw TEXT)""")
         # 兼容老版本数据库：补上新增的列
         for table, col, typ in (("sessions", "user_id", "INTEGER"),
                                 ("shares", "owner_id", "INTEGER"),
@@ -497,9 +503,11 @@ def set_user_pw(uid, pw):
 def delete_user(uid):
     # 删账号：踢掉他的所有会话；他的分享链接失效（文件按现有规则保留，
     # 在"全部文件"里显示为"链接已删"，管理员可手动清理）。
+    # 笔记同理：关闭分享，内容保留给管理员处理。
     with db() as c:
         for r in c.execute("SELECT id FROM shares WHERE owner_id=?", (uid,)).fetchall():
             c.execute("DELETE FROM shares WHERE id=?", (r["id"],))
+        c.execute("UPDATE notes SET share_token=NULL, share_pw=NULL WHERE owner_id=?", (uid,))
         c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
         c.execute("DELETE FROM users WHERE id=?", (uid,))
 
@@ -747,6 +755,124 @@ def add_existing_files(sid, ids, user):
                 pass
         raise
     return len(created)
+
+# ---------------- 在线记事本 ----------------
+# 登录后在控制台新建笔记，在 /note/<id> 编辑（自动保存）。开启分享后得到
+# /n/<token> 只读链接，可加 6 位数字密码；访客和作者都能下载成 txt。
+# 关闭分享会清掉 token 和密码，再次开启是一个新链接，旧链接立即失效。
+NOTE_MAX_CHARS = 200_000
+# 表单是 urlencoded：一个字最多编码成 12 个字符（4 字节 UTF-8 × %XX）
+NOTE_FORM_MAX = NOTE_MAX_CHARS * 12 + 64 * 1024
+
+class NoteConflict(Exception):
+    pass
+
+def can_manage_note(user, note):
+    # 管理员可操作任何笔记；普通用户只能操作自己的
+    return user["is_admin"] or note["owner_id"] == user["id"]
+
+def get_note(nid):
+    with db() as c:
+        return c.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+
+def note_by_token(token):
+    with db() as c:
+        return c.execute("SELECT * FROM notes WHERE share_token=?", (token,)).fetchone()
+
+def list_notes(user):
+    # 列表不带正文，只取字数
+    where = "" if user["is_admin"] else " WHERE owner_id=?"
+    args = () if user["is_admin"] else (user["id"],)
+    with db() as c:
+        return c.execute("SELECT id, owner_id, title, length(content) AS chars, created, updated,"
+                         " share_token, share_pw FROM notes" + where +
+                         " ORDER BY updated DESC, id DESC", args).fetchall()
+
+def _clean_note_title(title):
+    title = re.sub("[\x00-\x1f\x7f‪-‮⁦-⁩]", "", title or "").strip()
+    return title[:100]
+
+def create_note(user, title=""):
+    now = int(time.time())
+    with db() as c:
+        cur = c.execute("INSERT INTO notes(owner_id,title,content,created,updated)"
+                        " VALUES(?,?,?,?,?)", (user["id"], _clean_note_title(title), "", now, now))
+        return cur.lastrowid
+
+def _managed_note(c, nid, user):
+    note = c.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+    if not note:
+        raise LookupError("笔记不存在")
+    if not can_manage_note(user, note):
+        raise PermissionError("只能操作自己的笔记")
+    return note
+
+def save_note(nid, user, title, content, ver):
+    """保存标题和正文。ver 是页面打开时的版本号：别的页面先保存过就拒绝，
+    避免两个标签页互相覆盖。返回新的 (版本号, 更新时间)。"""
+    content = (content or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    if len(content) > NOTE_MAX_CHARS:
+        raise ValueError("笔记太长（最多 %d 字）" % NOTE_MAX_CHARS)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        note = _managed_note(c, nid, user)
+        if note["ver"] != ver:
+            raise NoteConflict("这篇笔记已在别的页面修改过，请先复制你的内容，再刷新页面")
+        now = int(time.time())
+        c.execute("UPDATE notes SET title=?, content=?, updated=?, ver=ver+1 WHERE id=?",
+                  (_clean_note_title(title), content, now, nid))
+        return ver + 1, now
+
+def delete_note(nid, user):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        _managed_note(c, nid, user)
+        c.execute("DELETE FROM notes WHERE id=?", (nid,))
+
+def set_note_share(nid, user, on):
+    """开启分享返回 token（已开启的保持原链接）；关闭分享返回 None。"""
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        note = _managed_note(c, nid, user)
+        if not on:
+            c.execute("UPDATE notes SET share_token=NULL, share_pw=NULL WHERE id=?", (nid,))
+            return None
+        if note["share_token"]:
+            return note["share_token"]
+        for _ in range(20):
+            token = secrets.token_urlsafe(9)
+            if not c.execute("SELECT 1 FROM notes WHERE share_token=?", (token,)).fetchone():
+                c.execute("UPDATE notes SET share_token=? WHERE id=?", (token, nid))
+                return token
+    raise RuntimeError("cannot generate note token")
+
+def set_note_share_pw(nid, user, pw):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        note = _managed_note(c, nid, user)
+        if not note["share_token"]:
+            raise ValueError("请先开启分享")
+        c.execute("UPDATE notes SET share_pw=? WHERE id=?", (pw or None, nid))
+
+def normalize_note_pw(pw):
+    # 笔记分享密码：6 位数字（文件分享仍是 4 位数字或字母）
+    pw = (pw or "").strip()
+    if not re.fullmatch(r"[0-9]{6}", pw):
+        raise ValueError("密码必须是 6 位数字")
+    return pw
+
+def note_unlock_token(token, pw):
+    # 和发送分享共用密钥，加前缀区分，两边的 cookie 不能互用
+    return share_unlock_token("note:" + token, pw)
+
+def note_txt_name(title):
+    # 下载文件名：去掉 Windows / macOS 不允许的字符，没有标题就叫"笔记"
+    name = re.sub(r'[\\/:*?"<>|]', "_", _clean_note_title(title)).strip(" .")
+    return (name[:80] or "笔记") + ".txt"
+
+def note_txt_bytes(content):
+    # 带 BOM：老版 Windows 记事本才能认出 UTF-8，不会把中文显示成乱码
+    return b"\xef\xbb\xbf" + (content or "").encode("utf-8")
 
 def cleanup_expired():
     now = int(time.time())
@@ -1433,6 +1559,15 @@ input.fileck{margin:0}
 .chip{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);background:var(--hover);border:0;box-shadow:0 0 0 1px var(--ux-line);border-radius:99px;padding:3px 11px}
 .chip b{color:var(--text);font-weight:600}
 .note{background:var(--accent-soft);color:var(--text);border-radius:14px;padding:11px 14px;font-size:13px;margin-top:14px;line-height:1.65}
+.nt-top{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:6px}
+.nt-title{font-size:18px;font-weight:600}
+.nt-body{min-height:56vh;resize:vertical;font:15px/1.75 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4}
+.nt-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-top:6px}
+.nt-bar .acts{justify-content:flex-start}
+.nt-stat.err-t{color:var(--danger)}.nt-stat.ok-t{color:var(--ok)}
+.nt-pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;margin:0;font:15px/1.75 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4;
+  background:var(--ux-surface-2);box-shadow:0 0 0 1px var(--ux-line);border-radius:14px;padding:14px 16px;color:var(--text)}
+.nt-pre:empty::before{content:"（空白笔记）";color:var(--muted)}
 .sf{display:flex;align-items:center;gap:12px 14px;padding:14px 0;border-top:1px solid var(--line);flex-wrap:wrap;scroll-margin-top:16px}
 .sf:first-child{border-top:0}
 .sf:target{animation:flash 2s ease-out}
@@ -1907,6 +2042,35 @@ def dash_page(shares, user, public_base=""):
 <input type='text' name='remark' placeholder='备注名（可选，如：张三）' maxlength='50' aria-label='备注名'>
 <button class='ghost' style='width:100%'>添加用户</button></form><div id='userRes'></div></div>
 """
+    # 在线记事本：管理员看全部用户的笔记，普通用户只看自己的
+    nrows = []
+    for n in list_notes(user):
+        nid = n["id"]
+        nowner = ""
+        if is_admin and n["owner_id"] is not None:
+            nowner = ("<span class='badge'>我的</span>" if n["owner_id"] == user["id"]
+                      else f"<span class='badge recv'>用户#{n['owner_id']}</span>")
+        nlink, ncopy, nshare = "", "", " · 未分享"
+        if n["share_token"]:
+            npath = f"/n/{n['share_token']}"
+            # token 只含 URL 安全字符，密码只含数字和字母，可以直接放进 JS 字符串
+            ncopy_pw = f",'{n['share_pw']}'" if n["share_pw"] else ""
+            nshare = " · 已分享" + (f" · 密码：<b>{html.escape(n['share_pw'])}</b>"
+                                    if n["share_pw"] else "")
+            nlink = f"<div class='linkbox' id='lk-note.{nid}'>{html.escape(public_link(npath, base))}</div>"
+            ncopy = (f"<button class='ghost sm copybtn' id='cpb-note.{nid}' "
+                     f"onclick=\"copyLink('note.{nid}','{npath}'{ncopy_pw})\">{COPY_ICON}复制链接</button>\n")
+        nrows.append(f"""<div class='file stacked'><div>
+<span class='badge'>笔记</span>{nowner}<b>{html.escape(n['title'] or '无标题笔记')}</b>
+<div class='muted'>{n['chars'] or 0} 字 · 更新于 {htime(n['updated'])}{nshare}</div>{nlink}</div>
+<div class='acts'><a class='btn ghost sm' href='/note/{nid}'>{icon('edit')}编辑</a>
+<a class='btn ghost sm' href='/note/{nid}/txt'>{icon('download')}下载 TXT</a>
+{ncopy}<button class='danger sm' onclick="delNote({nid})">{icon('trash')}删除</button></div></div>""")
+    nlist = "".join(nrows) or "<div class='empty'><span class='big'>📝</span>还没有笔记，点「新建笔记」写第一篇</div>"
+    notes_card = f"""<div class='card'><div class='card-head'><div><h2>📝 在线记事本</h2>
+<p class='muted'>随手记东西，停止输入后自动保存。可以生成只读分享链接，也能下载成 txt。</p></div>
+<button type='button' onclick='newNote(this)'>{icon('edit')}新建笔记</button></div>
+{nlist}</div>"""
     stats = (f"<div class='stats'><div class='stat'><b>{len(shares)}</b><span>有效分享</span></div>"
              f"<div class='stat'><b>{len(frows)}</b><span>文件</span></div>"
              f"<div class='stat'><b>{hsize(total_size)}</b><span>文件总大小</span></div></div>")
@@ -1931,6 +2095,7 @@ def dash_page(shares, user, public_base=""):
 <select name='expiry' aria-label='有效期'>{_EXPIRY_OPTIONS}</select>
 <button>{icon('open')}生成接收链接</button></form><div id='recvRes'></div></div>
 </div>
+{notes_card}
 <div class='card'><div class='card-head'><h2>{share_title}</h2><span class='muted'>{len(shares)} 个</span></div>{lst}</div>
 <div class='card'><div class='card-head'><div><h2>{file_title}</h2>
 <p class='muted'>{filehint}</p></div></div>
@@ -1944,7 +2109,7 @@ def dash_page(shares, user, public_base=""):
 <input type='password' name='new2' placeholder='重复新密码' required minlength='4' autocomplete='new-password' aria-label='重复新密码'>
 <button class='ghost' style='width:100%'>修改密码</button></form><div id='pwRes'></div></div></div>
 <script>
-""" + CHUNK_JS + UI_JS + TOAST_JS + DASH_JS + f"""
+""" + CHUNK_JS + UI_JS + TOAST_JS + DASH_JS + NOTE_DASH_JS + f"""
 var _UPW={upw_json};
 var PUBLIC_BASE = {pub_js};
 function fullLink(p){{
@@ -2235,7 +2400,7 @@ document.getElementById('pwForm').addEventListener('submit', function(ev){{
   postForm('/api/chpw', this, 'pwRes', "<div class='ok'>密码已修改</div>");
 }});
 function userDel(id){{
-  if(!confirm('确定删除这个用户吗？他的分享链接会失效，文件会保留在「全部文件」里。'))return;
+  if(!confirm('确定删除这个用户吗？他的分享链接会失效，文件会保留在「全部文件」里，笔记会保留并关闭分享。'))return;
   apiPost('/api/user_del','id='+encodeURIComponent(id));
 }}
 function resetPw(id){{
@@ -2965,12 +3130,21 @@ document.getElementById('addForm').addEventListener('submit', function(ev){
 {add_form}{preview}
 <p class='foot'>{foot}</p>""")
 
-def share_lock_page(sid, err=""):
+def share_lock_page(sid, err="", action=None, note=False):
+    # note：笔记分享，提交到 /n/<token>/unlock，密码是 6 位数字
     e = f"<div class='err' role='alert'>{html.escape(err)}</div>" if err else ""
+    action = action or f"/s/{sid}/unlock"
+    if note:
+        hint = "请输入 6 位数字密码"
+        field = ("placeholder='6 位数字密码' maxlength='6' inputmode='numeric' "
+                 "pattern='[0-9]{6}'")
+    else:
+        hint = "请输入 4 位提取密码"
+        field = "placeholder='提取密码（不区分大小写）' maxlength='4'"
     return page("输入密码", _auth_card(f"""{brand()}
-<p class='sub'>这个分享设置了密码，请输入 4 位提取密码</p>{e}
-<form method='post' action='/s/{sid}/unlock'>
-<input type='text' name='pw' placeholder='提取密码（不区分大小写）' required autofocus maxlength='4'
+<p class='sub'>这个分享设置了密码，{hint}</p>{e}
+<form method='post' action='{action}'>
+<input type='text' name='pw' {field} required autofocus
  autocomplete='off' autocapitalize='off' spellcheck='false' aria-label='提取密码'>
 <button>打开</button></form>"""), "sm")
 
@@ -3014,6 +3188,195 @@ document.getElementById('upForm').addEventListener('submit', function(ev){
 <div id='upStat' class='muted'></div></form>
 <div id='res'></div></div>
 """ + up_script)
+
+# 笔记页面共用的复制：http://IP 打开时没有剪贴板 API，退回 execCommand
+NOTE_COPY_JS = r"""
+function ntCopy(text, btn){
+  function done(){
+    if(btn){btn.classList.remove('is-copied');void btn.offsetWidth;btn.classList.add('is-copied');
+      setTimeout(function(){btn.classList.remove('is-copied');},1800);}
+    uxToast('已复制','ok');
+  }
+  function legacy(){
+    var ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');
+    ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();
+    var ok=false;try{ok=document.execCommand('copy');}catch(e){}
+    document.body.removeChild(ta);
+    if(ok)done();else uxToast('浏览器不允许自动复制','err','请手动选中后复制');
+  }
+  if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(text).then(done,legacy);
+  else legacy();
+}
+"""
+
+# 笔记编辑页：停止输入 1.2 秒自动保存，Ctrl/⌘+S 立即保存。保存带版本号，
+# 别的页面先保存过会返回 409，这时停止自动保存，避免覆盖。
+NOTE_EDIT_JS = r"""
+(function(){
+  var N=NOTE, title=document.getElementById('ntTitle'), body=document.getElementById('ntBody'),
+      stat=document.getElementById('ntStat'), count=document.getElementById('ntCount');
+  var dirty=false, saving=null, timer=null, broken=false;
+  function setStat(t,cls){stat.textContent=t;stat.className='muted nt-stat'+(cls?' '+cls:'');}
+  function updCount(){count.textContent='共 '+body.value.length+' 字';}
+  function hm(){var d=new Date();return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);}
+  function post(url,data){
+    var parts=[],k;for(k in data)parts.push(encodeURIComponent(k)+'='+encodeURIComponent(data[k]));
+    return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:parts.join('&')})
+    .then(function(r){return r.text().then(function(t){
+      var j=null;try{j=JSON.parse(t);}catch(e){}
+      if(!r.ok||!j||!j.ok){var err=new Error((j&&j.error)||('HTTP '+r.status));err.status=r.status;throw err;}
+      return j;
+    });});
+  }
+  function save(){
+    clearTimeout(timer);
+    if(broken)return Promise.reject(new Error('笔记已在别的页面修改过，请刷新'));
+    if(saving)return saving.then(function(){return dirty?save():null;});
+    if(!dirty)return Promise.resolve();
+    dirty=false;setStat('正在保存…');
+    saving=post('/api/note_save',{id:N.id,ver:N.ver,title:title.value,content:body.value})
+    .then(function(j){N.ver=j.ver;saving=null;if(!dirty)setStat('已保存 '+hm(),'ok-t');})
+    .catch(function(e){saving=null;dirty=true;if(e.status===409)broken=true;
+      setStat('保存失败：'+(e.message||'网络错误'),'err-t');throw e;});
+    return saving;
+  }
+  function later(){clearTimeout(timer);timer=setTimeout(function(){save().catch(function(){});},1200);}
+  function changed(){dirty=true;updCount();if(!broken){setStat('有未保存的修改');later();}}
+  title.addEventListener('input',changed);body.addEventListener('input',changed);
+  document.addEventListener('keydown',function(e){
+    if((e.ctrlKey||e.metaKey)&&!e.altKey&&(e.key==='s'||e.key==='S')){e.preventDefault();save().catch(function(){});}
+  });
+  window.addEventListener('beforeunload',function(e){if(dirty||saving){e.preventDefault();e.returnValue='';}});
+  document.getElementById('ntSave').onclick=function(){save().catch(function(){});};
+  document.getElementById('ntDl').onclick=function(){
+    save().then(function(){location.href='/note/'+N.id+'/txt';})
+    .catch(function(e){uxToast('下载前保存失败','err',e.message);});
+  };
+  // 分享相关操作先保存，保证别人看到的是最新内容；成功后刷新页面
+  function act(url,data,msg){
+    return save().then(function(){return post(url,data);})
+    .then(function(){uxFlash(msg);location.reload();})
+    .catch(function(e){uxToast('操作失败：'+(e.message||'网络错误'),'err');});
+  }
+  var full=N.link&&N.link.charAt(0)==='/'?location.origin+N.link:N.link;
+  var lk=document.getElementById('ntLink');if(lk)lk.textContent=full;
+  Array.prototype.forEach.call(document.querySelectorAll('[data-act]'),function(b){
+    b.addEventListener('click',function(){
+      var a=b.getAttribute('data-act');
+      if(a==='share')act('/api/note_share',{id:N.id,on:1},'已开启分享');
+      else if(a==='unshare'){
+        if(confirm('确定关闭分享吗？现在的链接会立即失效，以后再开启会是一个新链接。'))
+          act('/api/note_share',{id:N.id,on:0},'已关闭分享');
+      }else if(a==='copy')ntCopy(full+(N.pw?' 提取码: '+N.pw:''),b);
+      else if(a==='delpw'){
+        if(confirm('确定删除密码吗？删除后拿到链接的人都能直接打开。'))
+          act('/api/note_share_pw',{id:N.id,pw:''},'密码已删除');
+      }else if(a==='setpw'){
+        var box=document.getElementById('ntPwSlot');box.innerHTML='';
+        var inp=document.createElement('input');inp.maxLength=6;inp.autocomplete='off';
+        inp.inputMode='numeric';inp.spellcheck=false;
+        inp.placeholder='6 位数字';inp.setAttribute('aria-label','分享密码');
+        var ok=document.createElement('button');ok.type='button';ok.className='ghost';ok.textContent='确定';
+        ok.onclick=function(){
+          var v=inp.value.trim();
+          if(!/^[0-9]{6}$/.test(v)){uxToast('密码必须是 6 位数字','err');inp.focus();return;}
+          act('/api/note_share_pw',{id:N.id,pw:v},'密码已设置');
+        };
+        inp.onkeydown=function(e){if(e.key==='Enter'&&!e.isComposing)ok.onclick();};
+        var no=document.createElement('button');no.type='button';no.className='ghost';no.textContent='取消';
+        no.onclick=function(){box.innerHTML='';};
+        box.appendChild(inp);box.appendChild(ok);box.appendChild(no);inp.focus();
+      }else if(a==='delete'){
+        if(!confirm('确定删除这篇笔记吗？删除后无法恢复，分享链接也会失效。'))return;
+        post('/api/note_del',{id:N.id}).then(function(){
+          dirty=false;clearTimeout(timer);uxFlash('笔记已删除');location.href='/dash';
+        }).catch(function(e){uxToast('删除失败：'+(e.message||'网络错误'),'err');});
+      }
+    });
+  });
+  updCount();
+})();
+"""
+
+# 控制台里的笔记列表：新建后直接进入编辑页
+NOTE_DASH_JS = r"""
+function newNote(btn){
+  btn.disabled=true;
+  fetch('/api/note_create',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''})
+  .then(function(r){return r.text().then(function(t){
+    var j=null;try{j=JSON.parse(t);}catch(e){}
+    if(!r.ok||!j||!j.ok)throw new Error((j&&j.error)||('HTTP '+r.status));
+    location.href='/note/'+j.id;
+  });})
+  .catch(function(e){btn.disabled=false;uxToast('新建失败：'+(e.message||'网络错误'),'err');});
+}
+function delNote(id){
+  if(!confirm('确定删除这篇笔记吗？删除后无法恢复，分享链接也会失效。'))return;
+  apiPost('/api/note_del','id='+encodeURIComponent(id));
+}
+"""
+
+def _note_title(note):
+    return note["title"] or "无标题笔记"
+
+def note_editor_page(note, user, public_base=""):
+    nid, token, pw = note["id"], note["share_token"], note["share_pw"]
+    owner = ""
+    if user["is_admin"] and note["owner_id"] != user["id"]:
+        owner = f"<p class='muted'><span class='badge recv'>用户#{note['owner_id']}</span> 的笔记，你是管理员可以修改</p>"
+    link = public_link(f"/n/{token}", public_base) if token else ""
+    if token:
+        if pw:
+            pw_info = f"访问需要密码：<b>{html.escape(pw)}</b>"
+            pw_btns = (f"<button type='button' class='ghost sm' data-act='setpw'>{icon('edit')}修改密码</button>"
+                       f"<button type='button' class='ghost sm' data-act='delpw'>{icon('x')}删除密码</button>")
+        else:
+            pw_info = "没有密码，拿到链接就能打开。"
+            pw_btns = f"<button type='button' class='ghost sm' data-act='setpw'>{icon('edit')}增加密码</button>"
+        share_body = f"""<p class='muted'>拿到链接的人可以查看、复制和下载 txt，不能修改。{pw_info}</p>
+<div class='linkbox' id='ntLink'>{html.escape(link)}</div><div class='edit-slot' id='ntPwSlot'></div>
+<div class='acts' style='justify-content:flex-start;margin-top:8px'>
+<button type='button' class='ghost sm copybtn' data-act='copy'>{COPY_ICON}复制链接</button>
+<a class='btn ghost sm' href='/n/{token}' target='_blank' rel='noopener'>{icon('external')}打开</a>
+{pw_btns}<button type='button' class='danger sm' data-act='unshare'>{icon('x')}关闭分享</button></div>"""
+    else:
+        share_body = ("<p class='muted'>还没有分享。开启后会生成一个只读链接，别人打开就能查看和下载 txt。</p>"
+                      f"<button type='button' data-act='share'>{icon('open')}开启分享</button>")
+    title = html.escape(note["title"] or "")
+    content = html.escape(note["content"] or "")
+    data = json.dumps({"id": nid, "ver": note["ver"], "link": link, "pw": pw or ""},
+                      ensure_ascii=False).replace("<", "\\u003c")
+    # textarea 开头的第一个换行会被浏览器吃掉：先补一个，正文以空行开头时才不会丢
+    return page(_note_title(note), f"""<div class='card'>
+<div class='nt-top'><a class='btn ghost sm' href='/dash'>{icon('left')}返回控制台</a>
+<span class='muted nt-stat ok-t' id='ntStat' role='status' aria-live='polite'>已保存</span></div>{owner}
+<input id='ntTitle' class='nt-title' maxlength='100' placeholder='笔记标题（可选）' aria-label='笔记标题' value='{title}'>
+<textarea id='ntBody' class='nt-body' maxlength='{NOTE_MAX_CHARS}' placeholder='在这里写点什么…停止输入后自动保存' aria-label='笔记内容' spellcheck='false'>
+{content}</textarea>
+<div class='nt-bar'><span class='muted' id='ntCount'></span><div class='acts'>
+<button type='button' id='ntSave'>保存</button>
+<button type='button' class='ghost' id='ntDl'>{icon('download')}下载 TXT</button>
+<button type='button' class='danger' data-act='delete'>{icon('trash')}删除笔记</button></div></div></div>
+<div class='card'><h2>🔗 分享笔记</h2>{share_body}</div>
+<script>var NOTE={data};
+""" + TOAST_JS + NOTE_COPY_JS + NOTE_EDIT_JS + "</script>", "lg")
+
+def note_view_page(token, note):
+    content = note["content"] or ""
+    return page(_note_title(note), f"""<div class='card'><div class='hero'><div class='logo' aria-hidden='true'>📝</div>
+<div style='min-width:0'><h1>{html.escape(_note_title(note))}</h1>
+<div class='chips'><span class='chip'>共 <b>{len(content)}</b> 字</span>
+<span class='chip'>更新于 <b>{htime(note['updated'])}</b></span></div></div></div>
+<div class='acts' style='justify-content:flex-start;margin-top:14px'>
+<a class='btn' href='/n/{token}/txt' download>{icon('download')}下载 TXT</a>
+<button type='button' class='ghost copybtn' id='ntCopyAll'>{COPY_ICON}复制全文</button></div></div>
+<div class='card'><pre class='nt-pre' id='ntText'>
+{html.escape(content)}</pre></div>
+<p class='foot'>只读分享：可以查看、复制和下载，不能修改。</p>
+<script>""" + TOAST_JS + NOTE_COPY_JS + """
+document.getElementById('ntCopyAll').onclick=function(){ntCopy(document.getElementById('ntText').textContent,this);};
+</script>""")
 
 # 所有文件响应（下载和除 PDF 外的在线查看）都带这个 CSP：即使文件内容是网页
 # 或脚本，被浏览器打开时也只能在无来源的沙箱里，不能读写本站数据。
@@ -3250,14 +3613,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
         self.end_headers()
 
-    def _form(self):
+    def _form(self, limit=1_000_000):
+        # limit：表单最大字节数，笔记保存用 NOTE_FORM_MAX，其余默认 1MB
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             # Content-Length 填了垃圾值：之前 int() 直接抛 ValueError，
             # 走通用 except 变成 500；畸形请求应 400。
             raise BadUpload("bad content length")
-        if n < 0 or n > 1_000_000:
+        if n < 0 or n > limit:
             raise BadUpload("form too large")
         raw = self.rfile.read(n) if n > 0 else b""
         try:
@@ -3568,6 +3932,33 @@ class Handler(BaseHTTPRequestHandler):
             extra = ()
         return self._stream_file(path, filename, ctype, "inline", extra)
 
+    def _send_txt(self, title, content):
+        # 笔记下载：总是作为附件，带和文件下载相同的沙箱 CSP
+        body = note_txt_bytes(content)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", content_disposition("attachment", note_txt_name(title)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", FILE_CSP)
+        self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
+
+    def _note_locked(self, note):
+        # 有密码的笔记分享：作者/管理员直接看；访客要带上输对密码后的 cookie
+        if not note["share_pw"]:
+            return False
+        user = self._user()
+        if user and can_manage_note(user, note):
+            return False
+        tok = self._cookie().get("np_" + note["share_token"], "")
+        return not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                       note_unlock_token(note["share_token"], note["share_pw"]).encode())
+
     def _valid_share(self, sid, want_type=None):
         s = get_share(sid)
         if not s:
@@ -3735,6 +4126,34 @@ class Handler(BaseHTTPRequestHandler):
                     # 不能内联的格式会退回成附件下载，关闭下载时直接拒绝
                     return self._send_file_inline(path, f["filename"], allow_download=False)
                 return self._send_file_inline(path, f["filename"])
+
+            m = re.fullmatch(r"/note/(\d{1,18})(/txt)?", p)
+            if m:
+                # 笔记编辑页 / 作者下载：只有作者和管理员能打开
+                user = self._user()
+                if not user:
+                    return self._redirect("/login")
+                note = get_note(int(m.group(1)))
+                if not note or not can_manage_note(user, note):
+                    return self._send(404, not_found())
+                if m.group(2):
+                    return self._send_txt(note["title"], note["content"])
+                return self._send(200, note_editor_page(note, user, self._link_base()))
+
+            m = re.fullmatch(r"/n/([A-Za-z0-9_\-]{1,32})(/txt)?", p)
+            if m:
+                # 笔记只读分享页 / 访客下载 txt
+                token = m.group(1)
+                note = note_by_token(token)
+                if not note:
+                    return self._send(404, not_found())
+                if self._note_locked(note):
+                    if m.group(2):
+                        return self._redirect(f"/n/{token}")
+                    return self._send(200, share_lock_page(token, action=f"/n/{token}/unlock", note=True))
+                if m.group(2):
+                    return self._send_txt(note["title"], note["content"])
+                return self._send(200, note_view_page(token, note))
 
             m = re.fullmatch(r"/r/([A-Za-z0-9_\-]{1,16})", p)
             if m:
@@ -4224,6 +4643,86 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         c.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
                 return self._json({"ok": True})
+
+            # ---- 在线记事本 ----
+            if p == "/api/note_create":
+                user = self._require_auth()
+                if not user:
+                    return
+                f = self._form()
+                nid = create_note(user, f.get("title", ""))
+                return self._json({"ok": True, "id": nid, "url": f"/note/{nid}"})
+
+            if p in ("/api/note_save", "/api/note_del", "/api/note_share", "/api/note_share_pw"):
+                # 作者或管理员才能操作；正文可能很长，保存接口放宽表单上限
+                user = self._require_auth()
+                if not user:
+                    return
+                try:
+                    f = self._form(NOTE_FORM_MAX if p == "/api/note_save" else 1_000_000)
+                except BadUpload:
+                    return self._fail_close({"ok": False, "error": "笔记太长，保存失败"}, 413)
+                nid = _small_int(f.get("id", ""))
+                if nid is None:
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
+                try:
+                    if p == "/api/note_save":
+                        ver = _small_int(f.get("ver", ""))
+                        if ver is None:
+                            return self._json({"ok": False, "error": "参数错误"}, 400)
+                        ver, updated = save_note(nid, user, f.get("title", ""),
+                                                 f.get("content", ""), ver)
+                        return self._json({"ok": True, "ver": ver, "updated": updated})
+                    if p == "/api/note_del":
+                        delete_note(nid, user)
+                        return self._json({"ok": True})
+                    if p == "/api/note_share":
+                        on = f.get("on", "")
+                        if on not in ("0", "1"):
+                            return self._json({"ok": False, "error": "参数无效"}, 400)
+                        token = set_note_share(nid, user, on == "1")
+                        return self._json({"ok": True,
+                                           "link": f"/n/{token}" if token else ""})
+                    pw = f.get("pw", "")
+                    if pw:
+                        pw = normalize_note_pw(pw)
+                    set_note_share_pw(nid, user, pw)
+                    return self._json({"ok": True})
+                except NoteConflict as e:
+                    return self._json({"ok": False, "error": str(e)}, 409)
+                except PermissionError as e:
+                    return self._json({"ok": False, "error": str(e)}, 403)
+                except LookupError as e:
+                    return self._json({"ok": False, "error": str(e)}, 404)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+
+            m = re.fullmatch(r"/n/([A-Za-z0-9_\-]{1,32})/unlock", p)
+            if m:
+                # 访客输入笔记分享密码：和发送分享共用试错计数
+                token = m.group(1)
+                f = self._form()
+                note = note_by_token(token)
+                if not note:
+                    return self._send(404, not_found())
+                if not note["share_pw"]:
+                    return self._redirect(f"/n/{token}")
+                action = f"/n/{token}/unlock"
+                if not self._login_allowed("_share_fail"):
+                    return self._send(429, share_lock_page(token, "密码试错太多次，10 分钟后再试", action, True))
+                given = (f.get("pw", "") or "").strip().lower()
+                if not hmac.compare_digest(given.encode("utf-8", "replace"), note["share_pw"].encode()):
+                    self._login_failed("_share_fail")
+                    return self._send(200, share_lock_page(token, "密码错误", action, True))
+                secure = "; Secure" if self._https_request() else ""
+                self.send_response(302)
+                self.send_header("Set-Cookie",
+                                 f"np_{token}={note_unlock_token(token, note['share_pw'])}; HttpOnly; "
+                                 f"Path=/n/{token}; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}{secure}")
+                self.send_header("Location", f"/n/{token}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
             # ---- 用户管理（仅管理员；账号没有注册入口，只能由管理员添加） ----
             if p == "/api/user_add":
