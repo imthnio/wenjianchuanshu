@@ -459,15 +459,20 @@ elif command -v rc-update >/dev/null 2>&1; then
   if [ -f /etc/init.d/caddy ]; then
     # 同上：备份用户原来的 caddy 启动脚本
     cp /etc/init.d/caddy "$BACKUP_DIR/caddy.initd"
+    # 先用旧启动脚本停掉旧 caddy：新脚本换成 supervise-daemon 后找不到旧进程，
+    # 旧 caddy 会一直占着端口，新的起不来。
+    rc-service caddy stop >/dev/null 2>&1 || true
   fi
+  # supervise-daemon：caddy 意外退出 5 秒后自动拉起（等同 systemd 版的 Restart=on-failure）
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
 name="caddy"
 description="Caddy Web Server (minishare HTTPS)"
 command="/usr/local/bin/caddy"
 command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
-command_background=true
-pidfile="/run/caddy.pid"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
 depend() {
 	use net
 	after minishare

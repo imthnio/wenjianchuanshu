@@ -193,6 +193,16 @@ PY
   restart() {
     if [ "$INIT" = systemd ]; then systemctl restart minishare; else rc-service minishare restart; fi
   }
+  # 旧版 OpenRC 服务文件没有自动重启（command_background），程序一挂就一直挂着。
+  # 修复时顺手升级成 supervise-daemon。必须先用旧服务文件把进程停掉再改：
+  # 改完后 OpenRC 按新方式去找进程，找不到旧的，旧进程会占着端口让新的起不来。
+  if [ "$INIT" = openrc ] && ! grep -q '^supervisor=supervise-daemon' "$SERVICE"; then
+    rc-service minishare stop || true
+    cp "$SERVICE" "$SERVICE.backup.$(date +%Y%m%d%H%M%S).$$"
+    sed -i -e '/^command_background=/d' -e '/^pidfile=/d' \
+      -e 's|^command_args=.*|&\nsupervisor=supervise-daemon\nrespawn_delay=3\nrespawn_max=0|' "$SERVICE"
+    echo "已为 OpenRC 服务开启自动重启（程序意外退出后 3 秒自动拉起）。"
+  fi
   if ! restart || ! "$PYTHON" "$APP_DIR/fileshare.py" --check "$BIND" "$PORT"; then
     echo "更新后检查未通过，恢复原程序。"
     cp "$BACKUP" "$APP_DIR/fileshare.py"

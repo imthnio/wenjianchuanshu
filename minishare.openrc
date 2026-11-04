@@ -6,8 +6,12 @@ description="极简网页文件传送服务"
 
 command="@PYTHON@"
 command_args="@APP_DIR@/fileshare.py"
-command_background=true
-pidfile="/run/minishare.pid"
+# 用 supervise-daemon 看着进程：程序意外退出（崩溃、被系统杀掉）3 秒后自动拉起，
+# 不限次数。原来的 command_background 只负责放到后台，挂了就一直挂着，
+# 套 Cloudflare 的站点会一直 520。效果等同 systemd 版的 Restart=always。
+supervisor=supervise-daemon
+respawn_delay=3
+respawn_max=0
 output_log="/var/log/minishare.log"
 error_log="/var/log/minishare.log"
 
