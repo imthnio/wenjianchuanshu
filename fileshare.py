@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from email.utils import formatdate, parsedate_to_datetime
 
 # ---------------- 配置 ----------------
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SHARE_DATA", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -755,6 +755,52 @@ def add_existing_files(sid, ids, user):
                 pass
         raise
     return len(created)
+
+# ---------------- 给同一台服务器上的其他程序用的接口 ----------------
+# 比如 ytdlp-web（存视频）：下好的视频点「上传到文件传输」，直接进某个发送分享。
+# 鉴权用一把随机密钥，存在数据目录的 ext-key 文件里（0600，只有 root 能读）。
+# 同机程序自己去读这个文件，不用人工复制粘贴；能读到它的人本来就是 root。
+# 请求头带 Authorization: Bearer <密钥>。
+def ext_key_path():
+    return os.path.join(DATA_DIR, "ext-key")
+
+def ext_key():
+    """读密钥，没有就生成一把。返回字符串，失败返回 None（接口就当没开）。"""
+    path = ext_key_path()
+    try:
+        with open(path, encoding="ascii") as f:
+            key = f.read().strip()
+        if re.fullmatch(r"[0-9a-f]{64}", key):
+            return key
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    key = secrets.token_hex(32)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".ext-key-", dir=DATA_DIR)
+        with os.fdopen(fd, "w", encoding="ascii") as out:
+            out.write(key + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    return key
+
+def ext_list_shares():
+    """所有没过期的发送分享（不分账号，等同管理员看到的列表），新的在前。"""
+    now = int(time.time())
+    with db() as c:
+        rows = c.execute(
+            "SELECT s.id, s.title, s.created, s.expires, u.remark,"
+            " COUNT(f.id) AS n, COALESCE(SUM(f.size),0) AS bytes"
+            " FROM shares s LEFT JOIN files f ON f.share_id=s.id"
+            " LEFT JOIN users u ON u.id=s.owner_id"
+            " WHERE s.type='send' AND (s.expires=0 OR s.expires IS NULL OR s.expires>?)"
+            " GROUP BY s.id ORDER BY s.created DESC, s.id", (now,)).fetchall()
+    return [{"id": r["id"], "title": r["title"] or "", "files": r["n"],
+             "size": hsize(r["bytes"]), "owner": r["remark"] or "",
+             "expires": r["expires"] or 0} for r in rows]
 
 # ---------------- 在线记事本 ----------------
 # 登录后在控制台新建笔记，在 /note/<id> 编辑（自动保存）。开启分享后得到
@@ -3570,6 +3616,108 @@ class Handler(BaseHTTPRequestHandler):
         with self.server._login_lock:
             self.server._login_fail.pop(ip, None)
 
+    def _ext_auth(self):
+        """同机程序接口的鉴权。失败时已经回了响应，返回 False。
+        和登录共用失败计数：连错太多次先拒 10 分钟。"""
+        if not self._login_allowed():
+            self._close_if_body_pending()
+            self._json({"ok": False, "error": "错误太多次，10 分钟后再试"}, 429)
+            return False
+        key = ext_key()
+        got = (self.headers.get("Authorization") or "").strip()
+        if got.lower().startswith("bearer "):
+            got = got[7:].strip()
+        else:
+            got = ""
+        if key and got and hmac.compare_digest(got.encode(), key.encode()):
+            return True
+        self._login_failed()
+        self._close_if_body_pending()
+        self._json({"ok": False, "error": "密钥不对"}, 401)
+        return False
+
+    def _ext_upload(self):
+        """POST /api/ext/upload?share=<分享ID>&name=<文件名>，请求体就是文件本身。
+        必须带 Content-Length。先写临时文件，收齐后再入库。"""
+        if not self._ext_auth():
+            return
+        try:
+            q = parse_qs(urlparse(self.path).query, max_num_fields=10)
+        except TypeError:
+            q = parse_qs(urlparse(self.path).query)
+        except ValueError:
+            self._close_if_body_pending()
+            return self._json({"ok": False, "error": "参数错误"}, 400)
+        sid = (q.get("share") or [""])[0]
+        name = _clean_filename((q.get("name") or [""])[0])
+        try:
+            n = int(self.headers.get("Content-Length") or "-1")
+        except (TypeError, ValueError):
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            return self._json({"ok": False, "error": "缺少 Content-Length"}, 411)
+        if not self._valid_share(sid, "send"):
+            self._close_if_body_pending()
+            return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+        if n > upload_limit()[0]:
+            return self._fail_close({"ok": False, "error": too_large_msg()}, 413)
+        # ext_ 开头的临时文件：进程中途崩溃留下的，启动时 _sweep_startup_files 会清掉
+        tmp = os.path.join(FILES_DIR, "ext_" + secrets.token_hex(16))
+        try:
+            with open(tmp, "wb") as out:
+                remain = n
+                while remain > 0:
+                    data = self.rfile.read(min(1024 * 1024, remain))
+                    if not data:
+                        raise BadUpload("truncated")
+                    out.write(data)
+                    remain -= len(data)
+        except (BadUpload, TimeoutError, ConnectionError) as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            if isinstance(e, BadUpload):
+                return self._fail_close({"ok": False, "error": "文件没传完整"}, 400)
+            self.close_connection = True
+            return
+        except OSError as oe:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            if oe.errno == errno.ENOSPC:
+                return self._fail_close({"ok": False, "error": "服务器磁盘空间不足"}, 507)
+            raise
+        # 传的过程中分享可能被删或过期：收齐后再查一次
+        share = self._valid_share(sid, "send")
+        stored = secrets.token_hex(16)
+        try:
+            if not share:
+                raise LookupError
+            os.rename(tmp, os.path.join(FILES_DIR, stored))
+            tmp = None
+            with db() as c:
+                cur = c.execute("INSERT INTO files(share_id,filename,stored,size,created,owner_id)"
+                                " VALUES(?,?,?,?,?,?)",
+                                (sid, name, stored, n, int(time.time()), share["owner_id"]))
+                fid = cur.lastrowid
+        except LookupError:
+            os.unlink(tmp)
+            return self._json({"ok": False, "error": "分享不存在或已过期"}, 404)
+        except Exception:
+            for path in (tmp, os.path.join(FILES_DIR, stored)):
+                try:
+                    if path:
+                        os.unlink(path)
+                except OSError:
+                    pass
+            raise
+        self.log_message("ext upload %s -> %s (%d bytes)", name, sid, n)
+        return self._json({"ok": True, "file_id": fid, "share": sid,
+                           "title": share["title"] or "", "name": name})
+
     def _require_admin(self):
         # 仅管理员：通过返回账号字典，否则 401/403
         user = self._require_auth()
@@ -4010,6 +4158,21 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as c:
                     c.execute("SELECT 1")
                 return self._json({"service": "minishare", "ok": True})
+            if p == "/api/ext/shares":
+                if not self._ext_auth():
+                    return
+                shares = ext_list_shares()
+                if "fmt=tsv" in (urlparse(self.path).query or ""):
+                    # 纯文本格式：一行一个分享，字段用 Tab 隔开。给没有 JSON 模块的
+                    # 程序用（比如只装了 perl-base 的 Debian 上的 ytdlp-web）。
+                    def cell(v):
+                        return re.sub(r"[\t\r\n]+", " ", str(v))
+                    lines = ["\t".join(cell(s[k]) for k in
+                                       ("id", "files", "size", "expires", "owner", "title"))
+                             for s in shares]
+                    return self._send(200, "".join(l + "\n" for l in lines),
+                                      "text/plain; charset=utf-8")
+                return self._json({"ok": True, "shares": shares})
             if not has_users():
                 if p in ("/", "/setup"):
                     return self._send(200, setup_page())
@@ -4209,6 +4372,8 @@ class Handler(BaseHTTPRequestHandler):
             if self._cross_site_post():
                 self._close_if_body_pending()
                 return self._json({"ok": False, "error": "拒绝跨站请求，请在本站页面操作"}, 403)
+            if p == "/api/ext/upload":
+                return self._ext_upload()
             if p == "/setup" and not has_users():
                 f = self._form()
                 pw1, pw2 = f.get("pw1", ""), f.get("pw2", "")
@@ -5260,6 +5425,7 @@ def main():
         sys.exit(check_server(sys.argv[2], int(sys.argv[3])))
     clamped = clamp_public_mss()
     init_db()
+    ext_key()
     _sweep_startup_files()
     cleanup_expired()
     threading.Thread(target=cleanup_loop, daemon=True).start()

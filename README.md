@@ -16,6 +16,12 @@
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then if command -v apk >/dev/null 2>&1; then apk add --no-cache curl; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y curl; fi; fi; (curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-https.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/enable-https.sh || curl -fSL --connect-timeout 20 --max-time 180 --retry 2 -o /tmp/minishare-https.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/enable-https.sh || wget -q -T 180 -O /tmp/minishare-https.sh https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/enable-https.sh || wget -q -T 180 -O /tmp/minishare-https.sh https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/enable-https.sh) && sh /tmp/minishare-https.sh
 ```
 
+## 和「存视频」一起用
+
+同一台 VPS 上还装了 [存视频（vps-ytdlp）](https://github.com/imthnio/vps-ytdlp) 时，存视频的任务上会多一个「上传到文件传输」按钮：选一个发送分享，下好的视频直接放进去，不用先下到电脑再传上来。不用做任何设置，两边自己认得对方。
+
+（技术细节：minishare 1.7.0 起启动时在数据目录生成 `ext-key`，只有 root 能读。同机程序带着它调用 `GET /api/ext/shares` 和 `POST /api/ext/upload`。）
+
 ## 赞赏支持
 如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
 微信扫一扫下方赞赏码即可：
