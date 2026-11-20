@@ -777,13 +777,29 @@ def ext_key():
     except OSError:
         return None
     key = secrets.token_hex(32)
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(prefix=".ext-key-", dir=DATA_DIR)
-        with os.fdopen(fd, "w", encoding="ascii") as out:
-            out.write(key + "\n")
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as out:
+                out.write(key + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        tmp = None
     except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return None
     return key
 
@@ -835,7 +851,7 @@ def list_notes(user):
                          " ORDER BY updated DESC, id DESC", args).fetchall()
 
 def _clean_note_title(title):
-    title = re.sub("[\x00-\x1f\x7f‪-‮⁦-⁩]", "", title or "").strip()
+    title = re.sub("[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]", "", title or "").strip()
     return title[:100]
 
 def create_note(user, title=""):
@@ -1153,9 +1169,15 @@ def _fix_header_encoding(v):
 def _split_params(disp):
     """按分号切 Content-Disposition 的参数，但双引号里的分号不算分隔符。
     直接 disp.split(";") 会把 filename="a;b.txt" 从中间切断，文件名被截成 "\"a"。"""
-    parts, cur, quoted = [], [], False
+    parts, cur, quoted, esc = [], [], False, False
     for ch in disp:
-        if ch == '"':
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\" and quoted:
+            cur.append(ch)
+            esc = True
+        elif ch == '"':
             quoted = not quoted
             cur.append(ch)
         elif ch == ";" and not quoted:
@@ -1167,8 +1189,9 @@ def _split_params(disp):
     return parts
 
 def _disp_param(disp, key):
-    """从 Content-Disposition 头取参数，支持 filename*=UTF-8''... 形式"""
+    """从 Content-Disposition 头取参数，支持 filename*=UTF-8''... 形式（按 RFC 6266 优先于 filename=）"""
     kl = key.lower()
+    plain = None
     for part in _split_params(disp):
         p = part.strip()
         pl = p.lower()
@@ -1184,12 +1207,12 @@ def _disp_param(disp, key):
                     # 畸形输入按普通文件名处理，不应 500。
                     return unquote(val, encoding="utf-8", errors="replace")
             return v.strip('"')
-        if pl.startswith(kl + "="):
+        if plain is None and pl.startswith(kl + "="):
             v = p.split("=", 1)[1].strip()
             if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
                 v = v[1:-1]
-            return _fix_header_encoding(v)
-    return None
+            plain = _fix_header_encoding(v)
+    return plain
 
 def _clean_filename(fn):
     # 去掉控制字符：恶意文件名里的 CR/LF 会污染下载响应头（响应拆分攻击）
@@ -1216,6 +1239,8 @@ def parse_multipart(rfile, content_length, boundary, max_bytes):
     try:
         total = int(content_length)
     except (TypeError, ValueError):
+        raise BadUpload("bad content length")
+    if total <= 0:
         raise BadUpload("bad content length")
     if total > max_bytes + _PRECHECK_SLACK:
         # 明显超大的直接拒掉，不必读完整个请求体
@@ -2173,18 +2198,30 @@ function copyText(t, box){{
   // 剪贴板 API 只在安全上下文（HTTPS / localhost）可用；默认用
   // http://IP:端口 打开时 navigator.clipboard 是 undefined，
   // 直接调用会抛 TypeError，按钮点了没任何反应。先判断再调，
-  // 不可用时明确告诉用户手动复制，链接一直可见。
+  // 非安全上下文先试 execCommand，再不行明确提示手动复制，链接一直可见。
+  if (box && box.dataset && box.dataset.link) t = box.dataset.link;
+  else if (box && box.dataset) box.dataset.link = t;
+  function done(){{
+    // 链接保持可见：按钮图标重画成对勾、链接框扫过一道光、冒出"已复制"（Lucian #008）
+    var nx = box.nextElementSibling;
+    cpFlash(box._cpBtn || (nx && nx.classList.contains('copybtn') ? nx : null), box);
+  }}
   function fail(){{
     box.innerHTML = '<span class="err">浏览器不允许自动复制，请手动复制：</span>'
-      + '<div class="linkbox">' + t + '</div>';
+      + '<div class="linkbox">' + escapeHtml(t) + '</div>';
+  }}
+  function legacy(){{
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false; try {{ ok = document.execCommand('copy'); }} catch (e) {{}}
+    document.body.removeChild(ta);
+    if (ok) done(); else fail();
   }}
   if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {{
-    navigator.clipboard.writeText(t).then(function(){{
-      // 链接保持可见：按钮图标重画成对勾、链接框扫过一道光、冒出"已复制"（Lucian #008）
-      var nx = box.nextElementSibling;
-      cpFlash(box._cpBtn || (nx && nx.classList.contains('copybtn') ? nx : null), box);
-    }}, fail);
-  }} else {{ fail(); }}
+    navigator.clipboard.writeText(t).then(done, legacy);
+  }} else {{ legacy(); }}
 }}
 function cpFlash(btn, box){{
   [btn, box].forEach(function(el){{
@@ -2204,6 +2241,7 @@ function copyLink(id, p, pw){{
   el._cpBtn = document.getElementById('cpb-'+id);
   var t = fullLink(p) + (pw ? ' 提取码: ' + pw : '');
   el.textContent = t;
+  if (el.dataset) el.dataset.link = t;
   copyText(t, el);
 }}
 function delShare(id){{
@@ -2309,7 +2347,7 @@ function bindXhr(fid, url, resId, progId, okText){{
     xhr.onload=function(){{
       if(prog)prog.style.display='none';
       try{{var j=JSON.parse(xhr.responseText);
-        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+fullLink(j.link)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
+        if(j.ok){{res.innerHTML="<div class='ok'>"+okText+"</div><div class='linkbox'>"+escapeHtml(fullLink(j.link))+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
           setTimeout(()=>location.reload(), 1500);
         }}else{{res.innerHTML="<div class='err'>"+escapeHtml(j.error||'失败')+"</div>";}}
       }}catch(e){{res.innerHTML="<div class='err'>请求失败("+xhr.status+")</div>";}}
@@ -2358,7 +2396,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
   .then(function(link){{
     prog.value=100; pct.textContent='100%';
     stat.innerHTML="<b style='color:var(--ok)'>上传完成 ✅</b>";
-    res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+fullLink(link)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
+    res.innerHTML="<div class='ok'>上传成功，分享链接：</div><div class='linkbox'>"+escapeHtml(fullLink(link))+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
     setTimeout(()=>location.reload(), 1500);
   }})
   .catch(function(err){{
@@ -2367,7 +2405,7 @@ document.getElementById('sendForm').addEventListener('submit', function(ev){{
     var html="<div class='err'>"+escapeHtml(err.message||'失败')+"</div>";
     if(createdLink){{
       html+="<div class='ok'>已上传的文件已保留，分享链接：</div><div class='linkbox'>"
-        +fullLink(createdLink)+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
+        +escapeHtml(fullLink(createdLink))+"</div><button class='ghost copybtn' onclick='copyText(this.previousElementSibling.textContent,this.previousElementSibling)'>{COPY_ICON}复制链接</button>";
     }}
     res.innerHTML=html;
   }});
@@ -3532,8 +3570,11 @@ class Handler(BaseHTTPRequestHandler):
         # 调用方不打算读请求体时用：如果客户端发了 body，
         # 关掉这个 keep-alive 连接，否则残留的 body 会被当成
         # 同一连接上的下一个 HTTP 请求来解析（实测曾因此返回 501）。
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return
         try:
-            pending = int(self.headers.get("Content-Length") or 0) > 0
+            pending = int(self.headers.get("Content-Length") or 0) != 0
         except (TypeError, ValueError):
             pending = True
         if pending:
@@ -3673,7 +3714,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise BadUpload("truncated")
                     out.write(data)
                     remain -= len(data)
-        except (BadUpload, TimeoutError, ConnectionError) as e:
+        except (BadUpload, TimeoutError, socket.timeout, ConnectionError) as e:
             try:
                 os.unlink(tmp)
             except OSError:
@@ -3753,8 +3794,9 @@ class Handler(BaseHTTPRequestHandler):
         tok = self._cookie().get("sid")
         if tok:
             drop_session(tok)
+        secure = "; Secure" if self._https_request() else ""
         self.send_response(302)
-        self.send_header("Set-Cookie", "sid=; HttpOnly; Path=/; Max-Age=0")
+        self.send_header("Set-Cookie", f"sid=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{secure}")
         self.send_header("Location", "/")
         self.send_header("Content-Length", "0")
         if self.close_connection:
@@ -3771,7 +3813,18 @@ class Handler(BaseHTTPRequestHandler):
             raise BadUpload("bad content length")
         if n < 0 or n > limit:
             raise BadUpload("form too large")
-        raw = self.rfile.read(n) if n > 0 else b""
+        buf = bytearray()
+        remain = n
+        while remain > 0:
+            try:
+                chunk = self.rfile.read(min(CHUNK, remain))
+            except (TimeoutError, socket.timeout):
+                raise BadUpload("truncated form")
+            if not chunk:
+                raise BadUpload("truncated form")
+            buf += chunk
+            remain -= len(chunk)
+        raw = bytes(buf)
         try:
             d = parse_qs(raw.decode("utf-8", "replace"),
                          max_num_fields=_MAX_FORM_FIELDS)
@@ -3797,8 +3850,8 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             # 同 _form：垃圾 Content-Length 应 400 而不是 500
             raise BadUpload("bad content length")
-        if not n:
-            raise BadUpload("empty body")
+        if n <= 0:
+            raise BadUpload("empty body" if n == 0 else "bad content length")
         # 注：BaseHTTPRequestHandler 在收到 Expect: 100-continue 时已自动
         # 回过 100，这里不再手动发，避免重复的 interim 响应。
         # 实际生效的上限默认是 min(配置上限, 磁盘剩余空间)，与接收页面上
@@ -4161,8 +4214,14 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/ext/shares":
                 if not self._ext_auth():
                     return
+                try:
+                    q = parse_qs(urlparse(self.path).query, max_num_fields=10)
+                except TypeError:
+                    q = parse_qs(urlparse(self.path).query)
+                except ValueError:
+                    return self._json({"ok": False, "error": "参数错误"}, 400)
                 shares = ext_list_shares()
-                if "fmt=tsv" in (urlparse(self.path).query or ""):
+                if (q.get("fmt") or [""])[0] == "tsv":
                     # 纯文本格式：一行一个分享，字段用 Tab 隔开。给没有 JSON 模块的
                     # 程序用（比如只装了 perl-base 的 Debian 上的 ytdlp-web）。
                     def cell(v):
@@ -4792,7 +4851,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 f = self._form()
                 if len(f.get("new1", "")) < 4 or f.get("new1") != f.get("new2"):
-                    return self._json({"ok": False, "error": "新密码至少4位且两次一致"})
+                    return self._json({"ok": False, "error": "新密码至少4位且两次一致"}, 400)
                 try:
                     set_user_pw(user["id"], f["new1"])
                 except ValueError as e:
@@ -4825,8 +4884,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 try:
                     f = self._form(NOTE_FORM_MAX if p == "/api/note_save" else 1_000_000)
-                except BadUpload:
-                    return self._fail_close({"ok": False, "error": "笔记太长，保存失败"}, 413)
+                except BadUpload as e:
+                    if str(e) == "form too large":
+                        return self._fail_close({"ok": False, "error": "笔记太长，保存失败"}, 413)
+                    return self._fail_close({"ok": False, "error": "请求不完整或格式错误"}, 400)
                 nid = _small_int(f.get("id", ""))
                 if nid is None:
                     return self._json({"ok": False, "error": "参数错误"}, 400)
@@ -5105,7 +5166,7 @@ class Handler(BaseHTTPRequestHandler):
                 now = time.time()
                 with lock:
                     e = st.get(token)
-                    live = e is not None and e["expires"] > now
+                    live = e is not None and e["expires"] > now and not e.get("finishing")
                     # 正常收片：序号必须等于 next，且不能超出总片数。
                     # 另允许重发上一片：客户端某片成功后若没收到响应会重传
                     # 该片，直接回成功（不重复写盘），否则一次丢包就导致
@@ -5138,12 +5199,12 @@ class Handler(BaseHTTPRequestHandler):
                             raise BadUpload("truncated chunk")
                         buf += data
                         remain -= len(data)
-                except BadUpload:
+                except (BadUpload, TimeoutError, socket.timeout):
                     return self._fail_close(
                         {"ok": False, "error": "分片接收失败，请重试"}, 400)
                 with lock:
                     e2 = st.get(token)
-                    if e2 is None or e2["expires"] <= time.time():
+                    if e2 is None or e2["expires"] <= time.time() or e2.get("finishing"):
                         return self._json(
                             {"ok": False, "error": "分片已失效，请重新上传"}, 400)
                     redup = (idx >= 0 and e2["next"] > 0

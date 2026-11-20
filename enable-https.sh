@@ -75,7 +75,22 @@ DOMAIN=""
 while [ -z "$DOMAIN" ]; do
   printf "你的域名是什么？（例如：file.example.com）\n> "
   read -r DOMAIN || { echo ""; echo "输入已取消。"; exit 1; }
-  DOMAIN="$(printf '%s' "$DOMAIN" | tr -d '[:space:]')"
+  DOMAIN="$(printf '%s' "$DOMAIN" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+  DOMAIN="${DOMAIN#https://}"
+  DOMAIN="${DOMAIN#http://}"
+  DOMAIN="${DOMAIN%%/*}"
+  DOMAIN="${DOMAIN%.}"
+  case "$DOMAIN" in
+    ''|*[!a-z0-9.-]*|-*|*-|*..*|.*|*.)
+      echo "域名格式无效，请只填域名本身（例如：file.example.com，不要带端口或路径）。"
+      DOMAIN=""
+      ;;
+    *.*) ;;
+    *)
+      echo "域名格式无效，请输入完整域名（例如：file.example.com）。"
+      DOMAIN=""
+      ;;
+  esac
 done
 echo "域名：$DOMAIN"
 echo ""
@@ -473,6 +488,8 @@ command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
 supervisor=supervise-daemon
 respawn_delay=5
 respawn_max=0
+output_log="/var/log/caddy.log"
+error_log="/var/log/caddy.log"
 depend() {
 	use net
 	after minishare
@@ -492,10 +509,10 @@ CADDY_OK=0
 CADDY_MANAGED=1
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   sleep 3
-  systemctl is-active --quiet caddy && CADDY_OK=1
+  if systemctl is-active --quiet caddy; then CADDY_OK=1; fi
 elif command -v rc-service >/dev/null 2>&1; then
   sleep 3
-  rc-service caddy status >/dev/null 2>&1 && CADDY_OK=1
+  if rc-service caddy status >/dev/null 2>&1; then CADDY_OK=1; fi
 else
   CADDY_MANAGED=0
 fi
@@ -504,7 +521,7 @@ if [ "$CADDY_MANAGED" = "1" ] && [ "$CADDY_OK" != "1" ]; then
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     journalctl -u caddy -n 30 --no-pager || true
   else
-    tail -n 30 /var/log/messages 2>/dev/null || true
+    tail -n 30 /var/log/caddy.log /var/log/messages 2>/dev/null || true
   fi
   exit 1
 fi
@@ -724,15 +741,22 @@ elif command -v rc-update >/dev/null 2>&1; then
   if [ -f /etc/init.d/caddy ]; then
     # 同上：每次运行都重新备份，防第二次失败恢复过时文件
     cp /etc/init.d/caddy /etc/caddy/caddy.service.bak
+    # 先用旧启动脚本停掉旧 caddy：切换到 supervise-daemon 后找不到旧进程，
+    # 旧 caddy 会一直占着端口，新的起不来。
+    rc-service caddy stop >/dev/null 2>&1 || true
   fi
+  # supervise-daemon：caddy 意外退出 5 秒后自动拉起（等同 systemd 版的 Restart=on-failure）
   cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
 name="caddy"
 description="Caddy Web Server (minishare HTTPS)"
 command="/usr/local/bin/caddy"
 command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
-command_background=true
-pidfile="/run/caddy.pid"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/caddy.log"
+error_log="/var/log/caddy.log"
 depend() {
 	use net
 	after minishare
@@ -755,10 +779,10 @@ CADDY_OK=0
 CADDY_CHECKABLE=1
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   sleep 3
-  systemctl is-active --quiet caddy && CADDY_OK=1
+  if systemctl is-active --quiet caddy; then CADDY_OK=1; fi
 elif command -v rc-update >/dev/null 2>&1; then
   sleep 3
-  rc-service caddy status >/dev/null 2>&1 && CADDY_OK=1
+  if rc-service caddy status >/dev/null 2>&1; then CADDY_OK=1; fi
 else
   CADDY_CHECKABLE=0
 fi
@@ -767,7 +791,7 @@ if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     journalctl -u caddy -n 30 --no-pager || true
   else
-    tail -n 30 /var/log/messages 2>/dev/null || true
+    tail -n 30 /var/log/caddy.log /var/log/messages 2>/dev/null || true
   fi
   if [ -f /etc/caddy/Caddyfile.bak ]; then
     # [4] 已经把 Caddyfile 覆盖了：如果这台机器之前 Caddy 跑的是别的配置
@@ -780,8 +804,11 @@ if [ "$CADDY_CHECKABLE" = "1" ] && [ "$CADDY_OK" != "1" ]; then
       # [5] 覆盖了 caddy 的服务单元：有备份就恢复回来
       if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         cp /etc/caddy/caddy.service.bak /etc/systemd/system/caddy.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
       elif command -v rc-update >/dev/null 2>&1; then
+        rc-service caddy stop >/dev/null 2>&1 || true
         cp /etc/caddy/caddy.service.bak /etc/init.d/caddy
+        chmod +x /etc/init.d/caddy
       fi
     fi
     RESTORED=0

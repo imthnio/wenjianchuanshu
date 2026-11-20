@@ -250,6 +250,90 @@ class SecurityTest(unittest.TestCase):
             s, _, _ = self.req("POST", url, {"Cookie": "sid=tok1"}, form)
             self.assertIn(s, (200, 400, 404), url)
 
+    def test_negative_content_length_multipart_rejected(self):
+        # 回归：负数 Content-Length 曾绕过 if not n 检查，传入 rfile.read(-1) 导致无上限读入内存
+        import socket
+        now = int(time.time())
+        with app.db() as c:
+            c.execute("INSERT INTO shares(id,type,title,created,expires,owner_id) VALUES('rneg','receive','t',?,0,1)", (now,))
+        sock = socket.create_connection(('127.0.0.1', self.server.server_port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /r/rneg/upload HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: multipart/form-data; boundary=abc\r\n"
+                b"Content-Length: -1\r\n\r\n"
+                b"--abc--\r\n"
+            )
+            resp = sock.recv(4096)
+        finally:
+            sock.close()
+        self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp[:80])
+
+    def test_truncated_form_rejected_and_preserves_note(self):
+        # 回归：POST 表单在读满 Content-Length 前断开时，不能静默按截断内容写入（会截断笔记）
+        import socket
+        nid = app.create_note({"id": 1, "is_admin": True}, "原标")
+        app.save_note(nid, {"id": 1, "is_admin": True}, "原标", "完整内容不能丢", 1)
+        payload = urlencode({"id": nid, "ver": 2, "title": "新标", "content": "完整新内容" * 50}).encode()
+        sock = socket.create_connection(('127.0.0.1', self.server.server_port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /api/note_save HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Cookie: sid=tok1\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\n"
+                + ("Content-Length: %d\r\n\r\n" % len(payload)).encode()
+                + payload[:30]
+            )
+            sock.shutdown(socket.SHUT_WR)
+            resp = sock.recv(4096)
+        finally:
+            sock.close()
+        self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp[:80])
+        note = app.get_note(nid)
+        self.assertEqual(note["content"], "完整内容不能丢")
+        self.assertEqual(note["ver"], 2)
+
+    def test_disp_param_prefers_filename_star(self):
+        # 回归：RFC 6266 中 filename= 在前、filename*= 在后时必须优先采用 filename*=
+        disp = 'form-data; name="file"; filename="____.txt"; filename*=UTF-8\'\'%E4%B8%AD%E6%96%87.txt'
+        self.assertEqual(app._disp_param(disp, "filename"), "中文.txt")
+        disp2 = 'form-data; name="file"; filename="a\\"b;c.txt"'
+        self.assertEqual(app._disp_param(disp2, "filename"), 'a\\"b;c.txt')
+
+    def test_chunk_rejected_while_finishing(self):
+        tok = "a" * 32
+        self.server._chunk[tok] = {
+            "sid": "share", "kind": "add", "filename": "x.bin",
+            "size": 0, "chunks": 1, "next": 0, "recvd": 0,
+            "tmp": os.path.join(app.FILES_DIR, "chunk_" + tok),
+            "expires": time.time() + 3600, "finishing": True,
+        }
+        s, _, _ = self.req("POST", "/api/chunk?up=%s&i=0" % tok, {"Content-Length": "0"})
+        self.assertEqual(s, 400)
+        self.assertFalse(os.path.exists(os.path.join(app.FILES_DIR, "chunk_" + tok)))
+
+    def test_chpw_validation_error_returns_400(self):
+        s, _, body = self.req("POST", "/api/chpw", {"Cookie": "sid=tok1"},
+                              {"new1": "123", "new2": "123"})
+        self.assertEqual(s, 400)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_ext_shares_fmt_tsv_exact_param(self):
+        key = app.ext_key()
+        s, h, body = self.req("GET", "/api/ext/shares?x=fmt=tsv",
+                              {"Authorization": "Bearer " + key})
+        self.assertEqual(s, 200)
+        self.assertIn("application/json", h["content-type"])
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_no_raw_bidi_controls_in_source(self):
+        src = Path(__file__).with_name('fileshare.py').read_text(encoding='utf-8')
+        for ch in ("\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+                   "\u2066", "\u2067", "\u2068", "\u2069"):
+            self.assertNotIn(ch, src)
+
 
 if __name__ == '__main__':
     unittest.main()

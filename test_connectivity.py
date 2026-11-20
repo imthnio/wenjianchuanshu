@@ -1769,6 +1769,8 @@ class Connectivity(unittest.TestCase):
         # _apipost_js 直接 FAIL，是真回归测试。
         js = self._apipost_js()
         self.assertIn(".catch(function", js)
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
         script = js + """
 var alerts=[], reloaded=false;
 var location={reload:function(){reloaded=true;}};
@@ -3812,8 +3814,101 @@ class HTTPSConfig(unittest.TestCase):
         # 并发跑两次也会互相覆盖。现在必须用 mktemp 独占创建+trap 清理。
         repair = (ROOT / 'repair.sh').read_text()
         self.assertNotIn('/tmp/minishare-install.sh', repair)
-        self.assertIn('mktemp', repair)
+        self.assertIn('mktemp /tmp/minishare-install.XXXXXX', repair)
+        self.assertNotIn('XXXXXX.sh', repair)
         self.assertIn("trap 'rm -f", repair)
+
+    def test_repair_sh_fallback_survives_set_e(self):
+        # 回归：repair.sh 开了 set -eu，以前 curl 失败直接终止脚本，不会试第二个镜像
+        with tempfile.TemporaryDirectory() as folder:
+            bindir = Path(folder) / 'bin'
+            bindir.mkdir()
+            (bindir / 'id').write_text('#!/bin/sh\necho 0\n')
+            (bindir / 'id').chmod(0o755)
+            log = Path(folder) / 'curl.log'
+            (bindir / 'curl').write_text(
+                '#!/bin/sh\n'
+                'out=""; url=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "-o" ]; then out="$2"; shift 2; else url="$1"; shift; fi\n'
+                'done\n'
+                'echo "$url" >> "$CURL_LOG"\n'
+                'case "$url" in\n'
+                '  *raw.githubusercontent.com*) exit 7 ;;\n'
+                '  *cdn.jsdelivr.net*) printf "#!/bin/sh\\necho FALLBACK_OK\\n" > "$out"; exit 0 ;;\n'
+                'esac\nexit 1\n'
+            )
+            (bindir / 'curl').chmod(0o755)
+            r = subprocess.run(['sh', str(ROOT / 'repair.sh')],
+                               env={**os.environ,
+                                    'PATH': str(bindir) + ':/usr/bin:/bin',
+                                    'CURL_LOG': str(log)},
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('FALLBACK_OK', r.stdout)
+            urls = log.read_text().splitlines()
+            self.assertEqual(len(urls), 2)
+            self.assertIn('raw.githubusercontent.com', urls[0])
+            self.assertIn('cdn.jsdelivr.net', urls[1])
+
+    def test_normal_mode_openrc_uses_supervise_daemon_and_daemon_reload_on_rollback(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        five = text.index('# ---- [5] 设置开机自启并启动')
+        fiveb = text.index('# ---- [5b] 确认 Caddy 真的在跑')
+        normal_openrc = text[five:fiveb]
+        self.assertIn('supervisor=supervise-daemon', normal_openrc)
+        self.assertNotIn('command_background=true', normal_openrc)
+        self.assertIn('rc-service caddy stop', normal_openrc)
+        self.assertIn('output_log="/var/log/caddy.log"', normal_openrc)
+        # 完整运行 [5b]（包含 is-active 检查和回滚），确保 set -eu 下回滚和 daemon-reload 都能执行
+        end = text.index('exit 1\nfi', fiveb) + len('exit 1\nfi')
+        block = text[fiveb:end]
+        with tempfile.TemporaryDirectory() as folder:
+            caddy_dir = Path(folder) / 'caddy'
+            sysd_dir = Path(folder) / 'systemd'
+            caddy_dir.mkdir()
+            sysd_dir.mkdir()
+            (caddy_dir / 'Caddyfile').write_text('broken\n')
+            (caddy_dir / 'Caddyfile.bak').write_text('good\n')
+            (caddy_dir / 'caddy.service.bak').write_text('old unit\n')
+            (sysd_dir / 'caddy.service').write_text('new unit\n')
+            bindir = Path(folder) / 'bin'
+            bindir.mkdir()
+            (bindir / 'sleep').write_text('#!/bin/sh\nexit 0\n')
+            (bindir / 'sleep').chmod(0o755)
+            (bindir / 'journalctl').write_text('#!/bin/sh\nexit 0\n')
+            (bindir / 'journalctl').chmod(0o755)
+            (bindir / 'systemctl').write_text(
+                '#!/bin/sh\necho "$@" >> "$RC_LOG"\n'
+                'if [ "$1" = "is-active" ]; then exit 3; fi\nexit 0\n'
+            )
+            (bindir / 'systemctl').chmod(0o755)
+            block2 = (block.replace('/etc/caddy', str(caddy_dir))
+                      .replace('/etc/systemd/system', str(sysd_dir))
+                      .replace('[ -d /run/systemd/system ]', 'true'))
+            r = subprocess.run(['sh', '-c', 'set -eu\n' + block2],
+                               env={**os.environ,
+                                    'PATH': str(bindir) + ':/usr/bin:/bin',
+                                    'RC_LOG': str(Path(folder) / 'rc.log')},
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertEqual((caddy_dir / 'Caddyfile').read_text(), 'good\n')
+            self.assertEqual((sysd_dir / 'caddy.service').read_text(), 'old unit\n')
+            rc_log = (Path(folder) / 'rc.log').read_text()
+            self.assertIn('daemon-reload', rc_log)
+            self.assertIn('restart caddy', rc_log)
+
+    def test_enable_https_validates_and_sanitizes_domain(self):
+        text = (ROOT / 'enable-https.sh').read_text()
+        start = text.index('DOMAIN=""')
+        end = text.index('echo "域名：$DOMAIN"', start) + len('echo "域名：$DOMAIN"')
+        block = text[start:end]
+        r = subprocess.run(['sh', '-c', 'set -eu\n' + block],
+                           input='bad{host}\nlocalhost\nhttps://File.Example.COM/path\n',
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('域名格式无效', r.stdout)
+        self.assertIn('域名：file.example.com', r.stdout)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

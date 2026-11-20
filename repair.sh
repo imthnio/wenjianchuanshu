@@ -10,14 +10,14 @@ ok=0
 TS="$(date +%s)"
 # 临时文件用 mktemp 独占创建（0600），不用固定路径：
 # 固定路径下，别人预先放一个同名符号链接就能把下载内容写到任意文件，
-# 两次修复并发跑也会互相覆盖。
-TMPF="$(mktemp /tmp/minishare-install.XXXXXX.sh)" || exit 1
+# 两次修复并发跑也会互相覆盖。模板末尾不加后缀以兼容 BusyBox/Alpine 的 mktemp。
+TMPF="$(mktemp /tmp/minishare-install.XXXXXX)" || exit 1
 trap 'rm -f "$TMPF"' EXIT INT TERM
 for u in "https://raw.githubusercontent.com/imthnio/wenjianchuanshu/main/install.sh?t=$TS" "https://cdn.jsdelivr.net/gh/imthnio/wenjianchuanshu@main/install.sh?t=$TS"; do
   if command -v curl >/dev/null 2>&1; then
-    curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$TMPF" "$u" 2>/dev/null
+    curl -fSL --connect-timeout 15 --max-time 120 --retry 2 -o "$TMPF" "$u" 2>/dev/null || continue
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 120 -O "$TMPF" "$u" 2>/dev/null
+    wget -q -T 120 -O "$TMPF" "$u" 2>/dev/null || continue
   fi
   # 代理/缓存可能返回 200 的错误页面：确认是安装脚本才执行
   if [ -f "$TMPF" ] && head -c 11 "$TMPF" 2>/dev/null | grep -q "^#!/bin/sh"; then

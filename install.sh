@@ -196,16 +196,33 @@ PY
   # 旧版 OpenRC 服务文件没有自动重启（command_background），程序一挂就一直挂着。
   # 修复时顺手升级成 supervise-daemon。必须先用旧服务文件把进程停掉再改：
   # 改完后 OpenRC 按新方式去找进程，找不到旧的，旧进程会占着端口让新的起不来。
+  SERVICE_BACKUP=""
   if [ "$INIT" = openrc ] && ! grep -q '^supervisor=supervise-daemon' "$SERVICE"; then
     rc-service minishare stop || true
-    cp "$SERVICE" "$SERVICE.backup.$(date +%Y%m%d%H%M%S).$$"
-    sed -i -e '/^command_background=/d' -e '/^pidfile=/d' \
-      -e 's|^command_args=.*|&\nsupervisor=supervise-daemon\nrespawn_delay=3\nrespawn_max=0|' "$SERVICE"
+    SERVICE_BACKUP="$SERVICE.backup.$(date +%Y%m%d%H%M%S).$$"
+    cp "$SERVICE" "$SERVICE_BACKUP"
+    "$PYTHON" - "$SERVICE" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = []
+for line in p.read_text(encoding="utf-8").splitlines(True):
+    if line.startswith(("command_background=", "pidfile=")):
+        continue
+    lines.append(line)
+    if line.startswith("command_args="):
+        lines.append("supervisor=supervise-daemon\nrespawn_delay=3\nrespawn_max=0\n")
+p.write_text("".join(lines), encoding="utf-8")
+PY
     echo "已为 OpenRC 服务开启自动重启（程序意外退出后 3 秒自动拉起）。"
   fi
   if ! restart || ! "$PYTHON" "$APP_DIR/fileshare.py" --check "$BIND" "$PORT"; then
     echo "更新后检查未通过，恢复原程序。"
     cp "$BACKUP" "$APP_DIR/fileshare.py"
+    if [ -n "$SERVICE_BACKUP" ] && [ -f "$SERVICE_BACKUP" ]; then
+      rc-service minishare stop >/dev/null 2>&1 || true
+      cp "$SERVICE_BACKUP" "$SERVICE"
+      chmod +x "$SERVICE"
+    fi
     restart || true
     if [ "$INIT" = systemd ]; then journalctl -u minishare -n 30 --no-pager || true; else tail -n 30 /var/log/minishare.log /var/log/messages 2>/dev/null || true; fi
     exit 1
@@ -345,6 +362,10 @@ if [ "$INIT" = "systemd" ]; then
   systemctl restart minishare || { journalctl -u minishare -n 30 --no-pager; exit 1; }
   echo "已设为开机自启并启动（systemd）"
 elif [ "$INIT" = "openrc" ]; then
+  if [ -f /etc/init.d/minishare ]; then
+    # 重装前先用旧启动脚本停掉旧进程，避免从 command_background 切到 supervise-daemon 时旧进程占着端口
+    rc-service minishare stop >/dev/null 2>&1 || true
+  fi
   sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@BIND@|$BIND|g" \
       -e "s|@PORT@|$PORT|g" -e "s|@PYTHON@|$PYTHON|g" \
       minishare.openrc > /etc/init.d/minishare
@@ -443,7 +464,7 @@ print("安装完成，本机 HTTP 检查通过；外网连通性尚未验证。"
 if public_host:
     host = public_host.strip().strip("[]")
     parsed = urlsplit(url(host, public_port))
-    if parsed.hostname != host or parsed.username or parsed.path or parsed.query or parsed.fragment:
+    if parsed.hostname != host.lower() or parsed.username or parsed.path or parsed.query or parsed.fragment:
         sys.exit("PUBLIC_HOST 必须是纯 IP 或域名，不含协议、端口或路径。")
     print("使用你指定的入站地址：" + url(host, public_port))
 elif ips:

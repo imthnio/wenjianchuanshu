@@ -94,9 +94,9 @@ class FileRenameTest(unittest.TestCase):
         self.rename(2, 'LICENSE')
         self.assertEqual(self.name(2), 'LICENSE')
         # 双向文本控制符、控制字符被去掉，防止伪装扩展名
-        self.rename(1, 'a‮gpj\r\n')
+        self.rename(1, 'a\u202egpj\r\n')
         self.assertEqual(self.name(1), 'agpj.mov')
-        for bad in ('', '   ', 'a/b', 'a\\b', '‮', 'x' * 200):
+        for bad in ('', '   ', 'a/b', 'a\\b', '\u202e', 'x' * 200):
             self.rename(1, bad, expected=400)
         self.assertEqual(self.name(1), 'agpj.mov')
 
